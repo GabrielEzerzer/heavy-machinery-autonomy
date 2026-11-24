@@ -1,0 +1,5 @@
+{
+ "instruction": "dig a trench 8 m deep at the far marker",
+ "source": "recorded",
+ "output": "{\"status\":\"plan\",\"message\":\"Dig a trench 8 m deep at the far marker.\",\"task_type\":\"trench\",\"marker_id\":\"M3\",\"depth_m\":8,\"length_m\":null,\"width_m\":null,\"heading\":null,\"spoil_side\":null,\"soil_class\":\"unknown\"}"
+}
