@@ -31,7 +31,7 @@ class Limits:
     depth_m: tuple[float, float] = (0.1, 10.0)
     length_m: tuple[float, float] = (0.5, 10.0)
     width_max_m: float = 3.0
-    machine_clearance_m: float = 2.0
+    machine_clearance_m: float = 2.7
     default_length_m: float = 2.0
     default_heading: Heading = Heading.toward_machine
     default_spoil_side: SpoilSide = SpoilSide.right

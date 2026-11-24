@@ -28,7 +28,7 @@ A feature is **done** when it runs from a clean checkout and its checks pass.
 | Training | One command that trains the controller in stages of rising difficulty | Planned |
 | Evaluation | Scores a controller on machines it never saw in training | Planned |
 | Language to task | A GPT model fills a task specification from a plain-English instruction | Done |
-| Plan checks | Refuses a specification that is malformed, out of reach or against trench safety rules, and asks a person to confirm | Done, with a simplified arm for the reach check until the machine model is connected |
+| Plan checks | Refuses a specification that is malformed, out of reach or against trench safety rules, and asks a person to confirm | Done |
 | Demo screen | The plan, the drawn machine's card, both controllers side by side and the results chart | Planned |
 | Balance on rough ground | The machine can slide and tip, and the controller learns to dig without unsettling it | Planned, after the first working demo |
 
