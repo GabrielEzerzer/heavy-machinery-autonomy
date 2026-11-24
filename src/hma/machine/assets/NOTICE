@@ -1,0 +1,35 @@
+12 t class excavator model
+
+The meshes (crawler.stl, body.stl, boom.stl, arm.stl, bucket.stl) and the kinematic chain in
+excavator.xml are derived from the zx120_description package in the zx120_ros repository by the
+Public Works Research Institute (PWRI), Japan:
+
+    https://github.com/pwri-opera/zx120_ros
+    commit 952ce99bf86991a6d3cfd351b12e1ab2686850fd
+
+That work is licensed under the Apache License, Version 2.0; a copy is in the file LICENSE next
+to this notice. The source describes a Hitachi ZX120 hydraulic excavator. Hitachi and ZX120 are
+trademarks of their owners; this model is not endorsed by them.
+
+Changes made to the source:
+
+- Format conversion: the COLLADA (.dae) meshes for the track, body, boom, arm and bucket links
+  were converted to binary STL, with each link's URDF visual origin applied to the vertices.
+  The texture image and texture coordinates were dropped; links use plain colours instead.
+- The URDF was converted to MuJoCo MJCF. Joint origins, axes and the boom, arm and bucket
+  limits are taken unchanged from zx120.urdf; the bucket tip site comes from bucket_end_joint.
+- Not used: the cylinder and bucket linkage meshes (zx120-*-cyl*.dae, zx120-p1.dae,
+  zx120-p2.dae), the URDF collision meshes and the Gazebo, ROS control and MoveIt files.
+- Added: a free-floating base with two box-shaped track contact geoms sized from the bottom of
+  the track mesh, a box geom carrying the counterweight mass at the rear of the upper structure,
+  and a site at the bucket tip.
+- Masses: the source gives a placeholder mass of 0.03 kg per link. The link masses used here are
+  set in hma/machine/model.py. Boom (1,220 kg, with arm cylinder), arm (600 kg, with bucket
+  cylinder), bucket (400 kg) and counterweight (2,450 kg) follow the manufacturer's published
+  component weights; the split of the rest between undercarriage and upper structure is an
+  estimate. Inertias are computed by MuJoCo from the convex hull of each mesh at uniform
+  density, so centres of mass and inertias are estimates too.
+- Joint force caps standing in for hydraulic relief limits are added in hma/machine/model.py;
+  they are estimates derived from published digging forces and swing torque.
+
+The conversion is reproducible with: python -I -m hma.machine.convert <path to zx120_ros>
