@@ -218,7 +218,7 @@ def test_ridge_across_the_middle_of_the_tracks_lifts_the_machine():
     model = load_scene(1)
     xs, _ = ground_axes()
     heights = np.zeros(ground_shape())
-    heights[:, np.abs(xs) <= 0.3] = 0.25
+    heights[:, np.abs(xs) < 0.35] = 0.25
     write_ground(model, 0, heights)
     data = home_data(model)
     data.qpos[2] = 0.3

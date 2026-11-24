@@ -20,7 +20,7 @@ Changes made to the source:
   limits are taken unchanged from zx120.urdf; the bucket tip site comes from bucket_end_joint.
 - Not used: the cylinder and bucket linkage meshes (zx120-*-cyl*.dae, zx120-p1.dae,
   zx120-p2.dae), the URDF collision meshes and the Gazebo, ROS control and MoveIt files.
-- Added: a free-floating base with sixteen sphere-shaped track contact geoms, four along the
+- Added: a free-floating base with twenty-four sphere-shaped track contact geoms, six along the
   inner and outer edge of each track at the bottom of the track mesh, a box geom carrying the
   counterweight mass in the lower 1 m of the rear of the upper structure, and a site at the
   bucket tip.
