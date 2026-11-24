@@ -21,6 +21,7 @@ from hma.machine import BODY_NAMES, HOME_KEY, JOINT_NAMES, VALVE, load_scene, ma
 from hma.machine.model import COUNTERWEIGHT_MASS
 
 CONTROL_HZ = 10.0
+FORCE_FILTER = 0.05
 JOINTS = len(JOINT_NAMES)
 COUNTERWEIGHT = "counterweight"
 UPPER = BODY_NAMES.index("upper")
@@ -143,7 +144,11 @@ class Hydraulics:
         self._slope = np.zeros(self.n * JOINTS * CURVE_SEGMENTS)
         self._gain = np.ones(shape)
         self._speed_limit = np.ones(shape)
+        self._force_limit = np.ones(shape)
         self._inv_force_limit = np.ones(shape)
+        self._force = np.zeros(shape)
+        self._force_alpha = 1.0 - np.exp(-self.dt / FORCE_FILTER)
+        self._power = np.ones(self.n)
         self._half_play = np.zeros(shape)
         self._flow = np.ones(self.n)
         self._latency_steps = np.zeros(self.n, np.intp)
@@ -172,8 +177,8 @@ class Hydraulics:
             raise ValueError("lag and flow must be positive and deadband below 1")
         if np.any(machine.speed_limit > self.model.actuator_ctrlrange[self._actuators[index], 1]):
             raise ValueError("a speed limit exceeds what the joint's actuator accepts")
-        if np.any(machine.force_limit <= 0):
-            raise ValueError("force limits must be positive")
+        if np.any(machine.force_limit <= 0) or machine.power <= 0:
+            raise ValueError("force limits and power must be positive")
         if machine.curve.shape != (JOINTS, CURVE_SEGMENTS + 1):
             raise ValueError(f"curve must have shape {(JOINTS, CURVE_SEGMENTS + 1)}")
         self.machines[index] = machine
@@ -191,7 +196,9 @@ class Hydraulics:
                                      - np.arange(CURVE_SEGMENTS) * slope).ravel()
         self._gain[index] = machine.gain
         self._speed_limit[index] = machine.speed_limit
+        self._force_limit[index] = machine.force_limit
         self._inv_force_limit[index] = 1.0 / machine.force_limit
+        self._power[index] = machine.power
         self._half_play[index] = machine.backlash / 2.0
         self._flow[index] = machine.flow * NOMINAL_SUPPLY
         self._latency_steps[index] = round(machine.sensor_latency / self.dt)
@@ -258,6 +265,7 @@ class Hydraulics:
         self._play[index] = 0.0
         mujoco.mj_forward(model, data)
         first = np.stack(self.true_state())[:, index]
+        self._force[index] = first[2] * self._force_limit[index]
         first += self._rngs[index].uniform(-1.0, 1.0, first.shape) * self._noise[:, index]
         self._sensors[:, :, index] = first
 
@@ -284,6 +292,8 @@ class Hydraulics:
         demand = (speed * self._inv_nominal_speed).sum(axis=1)
         speed *= np.minimum(1.0, self._flow / np.maximum(demand, 1e-12))[:, None]
         np.copysign(speed, spool, out=speed)
+        power = np.maximum(self._force * speed, 0.0).sum(axis=1)
+        speed *= np.minimum(1.0, self._power / np.maximum(power, 1e-12))[:, None]
         drive = speed * self.dt
         drive += self._play
         self._play = np.minimum(np.maximum(drive, -self._half_play), self._half_play)
@@ -297,6 +307,7 @@ class Hydraulics:
         self._sensor_head = (self._sensor_head + 1) % self._sensor_len
         reading = self._sensors[self._sensor_head]
         self._read_into(reading)
+        self._force += self._force_alpha * (reading[2] * self._force_limit - self._force)
         cursor = self._noise_cursor
         if cursor == 0:
             for i in range(self.n):

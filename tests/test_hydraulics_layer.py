@@ -309,7 +309,7 @@ def test_every_draw_lies_in_its_range():
                      "counterweight", "sensor_latency"):
             assert np.all((lo_hi[name][0] <= getattr(m, name))
                           & (getattr(m, name) <= lo_hi[name][1]))
-        for name in ("speed_limit", "force_limit"):
+        for name in ("speed_limit", "force_limit", "power"):
             ratio = getattr(m, name) / getattr(NOMINAL, name)
             assert np.all((lo_hi[name][0] <= ratio) & (ratio <= lo_hi[name][1]))
         assert np.all(np.linalg.norm(m.com_shift, axis=1) <= RANGES["com_shift"][1])
@@ -481,3 +481,57 @@ def test_each_reading_carries_one_noise_draw_however_often_it_is_observed():
     rarely, often = run(0), run(3)
     assert np.array_equal(rarely[0], often[0])
     assert np.array_equal(rarely[1], often[1])
+
+
+ARM = JOINT_NAMES.index("arm")
+
+
+def pushed_arm(machine, load, command, seconds):
+    layer = layer_for(machine)
+    data = layer.data
+    dof = layer.model.joint(machine_prefix(0) + "arm").dofadr[0]
+    u = np.zeros((1, 4))
+    u[0, ARM] = command
+    layer.act(u)
+    trace = []
+    for _ in range(round(seconds / DT)):
+        data.qfrc_applied[dof] = load(data.qvel[dof])
+        layer.step()
+        trace.append((data.ctrl[layer._actuators[0, ARM]], data.qvel[dof]))
+    return layer, np.array(trace).T
+
+
+@pytest.mark.parametrize("kind", ["steady", "viscous"])
+def test_a_joint_pushing_near_its_cap_moves_at_the_power_limited_speed(kind):
+    cap = NOMINAL.force_limit[ARM]
+    drag = 2.0 * NOMINAL.power / NOMINAL.speed_limit[ARM] ** 2
+    load = (lambda v: -0.9 * cap) if kind == "steady" else (lambda v: -drag * v)
+    layer, (commands, _) = pushed_arm(NOMINAL, load, 1.0, 1.5)
+    state = layer.true_state()
+    power = state.loads[0, ARM] * cap * state.velocities[0, ARM]
+    assert power == pytest.approx(NOMINAL.power, rel=1e-2)
+    assert state.velocities[0, ARM] < 0.75 * NOMINAL.speed_limit[ARM]
+    assert np.abs(np.diff(commands[-100:], 2)).max() < 1e-4
+
+
+def test_power_limit_holds_still_at_a_stall_and_at_rest():
+    cap = NOMINAL.force_limit[ARM]
+    for load, command in ((lambda v: -1.2 * cap, 1.0), (lambda v: 0.0, -1.0),
+                          (lambda v: 0.0, 0.0)):
+        layer, (commands, speeds) = pushed_arm(NOMINAL, load, command, 4.0)
+        assert np.ptp(commands[-200:]) < 1e-9
+        assert np.ptp(speeds[-200:]) < 1e-4
+        if command:
+            assert abs(layer.true_state().loads[0, ARM]) == pytest.approx(1.0)
+            assert abs(commands[-1]) == pytest.approx(NOMINAL.power / NOMINAL.force_limit[ARM])
+    assert commands[-1] == 0.0
+
+
+def test_free_air_motion_never_reaches_the_power_limit():
+    unlimited = replace(NOMINAL, power=1e12)
+    for u in ([0, 1, -1, 1], [1, -1, 1, 1], [-1, -1, 1, -1]):
+        for machine in (NOMINAL, draw_machine(9)):
+            runs = [steady_speeds(m, u, 1.5) for m in (machine, replace(machine, power=1e12))]
+            assert np.array_equal(*runs)
+    assert np.array_equal(steady_speeds(NOMINAL, [0, -1, 1, 1]),
+                          steady_speeds(unlimited, [0, -1, 1, 1]))

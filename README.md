@@ -15,7 +15,7 @@ The physics is [MuJoCo](https://mujoco.org). The soil is a grid of heights with 
 
 ### Hydraulics model
 
-`hma.hydraulics` sits between the controller and the joints. The controller sends four valve commands in [-1, 1] at the control rate (10 Hz by default; 20 Hz also works). At every 5 ms physics step, each command passes through a pure delay, a first-order lag, a dead zone, a command-to-speed curve with a gain, the joint's speed limit, a shared pump flow limit and joint play, and reaches the joint as a speed. A joint's force limit is the friction cap of its valve in the MuJoCo model, so the joint stalls when its load exceeds the cap. The controller sees joint angles, joint speeds and a load signal (the force the valve passes to the joint, as a fraction of the cap). The load is positive when the valve pushes the joint in its positive direction, and reads exactly +1 or -1 while a joint is driven into an end stop or stalled. It falls to about 0 once a load above the cap has pushed the joint onto its end stop, because the stop then carries the load. All three readings arrive late and with noise added. One seed draws one machine, and the same seed always gives the same machine. Effects switch on in groups (`delay`, `valve`, `flow`, `limits`, `backlash`, `mass`, `sensors`) so that training can add them one step at a time. `NOMINAL` has a 0.05 s delay, a 0.1 s lag, no dead zone, a straight curve, full flow, nominal limits and no noise.
+`hma.hydraulics` sits between the controller and the joints. The controller sends four valve commands in [-1, 1] at the control rate (10 Hz by default; 20 Hz also works). At every 5 ms physics step, each command passes through a pure delay, a first-order lag, a dead zone, a command-to-speed curve with a gain, the joint's speed limit, a shared pump flow limit, a pump power limit and joint play, and reaches the joint as a speed. A joint's force limit is the friction cap of its valve in the MuJoCo model, so the joint stalls when its load exceeds the cap. The controller sees joint angles, joint speeds and a load signal (the force the valve passes to the joint, as a fraction of the cap). The load is positive when the valve pushes the joint in its positive direction, and reads exactly +1 or -1 while a joint is driven into an end stop or stalled. It falls to about 0 once a load above the cap has pushed the joint onto its end stop, because the stop then carries the load. All three readings arrive late and with noise added. One seed draws one machine, and the same seed always gives the same machine. Effects switch on in groups (`delay`, `valve`, `flow`, `limits`, `backlash`, `mass`, `sensors`) so that training can add them one step at a time; `flow` draws both pump flow and pump power. `NOMINAL` has a 0.05 s delay, a 0.1 s lag, no dead zone, a straight curve, full flow and power, nominal limits and no noise.
 
 | Effect | Range per machine | Basis |
 |---|---|---|
@@ -25,6 +25,7 @@ The physics is [MuJoCo](https://mujoco.org). The soil is a grid of heights with 
 | Command-to-speed curve | four segments with random positive slopes; gain ±10% | Random piecewise-linear curves with positive slopes in [Nan and Hutter][nh]; ±10% action scaling in [Egli and Hutter][eh] |
 | Joint speed limit | nominal ±20%. Nominal: boom 0.3, arm 0.6, bucket 0.8, swing 0.8 rad/s | Boom, arm and bucket from Fig. 5 of [Egli et al.][e22], a 12 t machine. That paper does not drive swing, so the swing nominal is assumed, chosen so that the top of its range (0.96 rad/s) stays under the model's 1.0 rad/s actuator limit. The ±20% is assumed |
 | Pump flow | 60–100% of a nominal supply that runs 2.5 joints at nominal full speed at once | Assumed. A real excavator slows its functions when two or three run together. With this supply, three joints at full command share flow on 99.9% of drawn machines, and two share on a machine whose flow is near the bottom of the range. The nominal machine peaks at 1.6 joints' worth on the line path below, so it never shares there |
+| Pump power | 85–100% of 56 kW delivered at the joints: a 70 kW engine times an assumed hydraulic efficiency of 0.8 | Hitachi lists 66.0 kW for the [ZX130-5G][zx5g] and 73.4 kW net for the [ZX130-5B][zx5b], 12–13 t machines of the class this model is converted from (unverified: the pages refuse automated reading). The efficiency and the range are assumed |
 | Joint force limit | the model's cap ±15% | Assumed |
 | Joint play | 0–0.5° | Assumed. [HEAP][heap] reports joint play but gives no size |
 | Link masses, centres of mass, counterweight | ±10%; shifted by up to 5 cm; ±10% | Assumed |
@@ -34,6 +35,7 @@ The physics is [MuJoCo](https://mujoco.org). The soil is a grid of heights with 
 Limits of the hydraulics model:
 
 - Flow demand counts every joint alike: a joint at its nominal full speed uses one unit of flow, though real cylinders differ in size. When demand exceeds the pump, every moving joint slows by the same ratio.
+- Power demand is each joint's force, smoothed over 0.05 s, times its commanded speed, summed over the joints that push against their load. When it exceeds the machine's power, every moving joint slows by the same ratio, after flow sharing. Free-air motion stays far below it: on the nominal machine the line and circle paths below peak at 3.6 and 9.7 kW. A joint pushing near its force cap is held to the power, and a joint driven into an end stop keeps commanding the speed the power allows at full force, which slows the other joints as a pump at relief pressure would.
 - Joint play is lost motion when the command reverses. A link does not drop through the gap when its load reverses with no command.
 - Delays and latency are rounded to the 5 ms physics step. The load reading is taken at the start of each step.
 - Masses and force caps are written into the shared MuJoCo model for each machine by name, so a model cannot be shared by scenes that need different machines. Within one scene, repeatability is bit for bit only when the same machines are in it, because one constraint solve covers every machine.
@@ -49,6 +51,8 @@ Limits of the hydraulics model:
 [e22]: https://www.research-collection.ethz.ch/server/api/core/bitstreams/95ef5691-11e8-4a86-b02d-6f0e2501de9b/content
 [heap]: https://arxiv.org/abs/2106.05059
 [sp]: https://arxiv.org/abs/2410.05093
+[zx5g]: https://www.hitachicm.com/ae/en/machinery/excavators/medium-excavators/product.zx130-5g
+[zx5b]: https://www.hitachicm.com/us/en/products/excavators/medium-large/product.zx130-5b-la
 
 ## Feature map
 

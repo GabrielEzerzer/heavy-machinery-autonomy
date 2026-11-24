@@ -13,6 +13,8 @@ from hma.machine import BODY_NAMES, FORCE_CAPS, JOINT_NAMES
 NOMINAL_SPEEDS = {"swing": 0.8, "boom": 0.3, "arm": 0.6, "bucket": 0.8}
 CURVE_SEGMENTS = 4
 NOMINAL_SUPPLY = 2.5
+ENGINE_POWER = 70e3
+HYDRAULIC_EFFICIENCY = 0.8
 
 RANGES = {
     "delay": (0.05, 0.6),
@@ -21,6 +23,7 @@ RANGES = {
     "curve_weight": (0.5, 1.5),
     "gain": (0.9, 1.1),
     "flow": (0.6, 1.0),
+    "power": (0.85, 1.0),
     "speed_limit": (0.8, 1.2),
     "force_limit": (0.85, 1.15),
     "backlash": (0.0, math.radians(0.5)),
@@ -35,7 +38,7 @@ EFFECTS = ("delay", "valve", "flow", "limits", "backlash", "mass", "sensors")
 GROUPS = {
     "delay": ("delay", "lag"),
     "valve": ("deadband", "curve", "gain"),
-    "flow": ("flow",),
+    "flow": ("flow", "power"),
     "limits": ("speed_limit", "force_limit"),
     "backlash": ("backlash",),
     "mass": ("link_mass", "com_shift", "counterweight"),
@@ -52,6 +55,7 @@ class Machine:
     curve: np.ndarray
     gain: np.ndarray
     flow: float
+    power: float
     speed_limit: np.ndarray
     force_limit: np.ndarray
     backlash: np.ndarray
@@ -83,6 +87,7 @@ NOMINAL = Machine(
     curve=np.tile(np.linspace(0.0, 1.0, CURVE_SEGMENTS + 1), (len(JOINT_NAMES), 1)),
     gain=np.ones(len(JOINT_NAMES)),
     flow=1.0,
+    power=ENGINE_POWER * HYDRAULIC_EFFICIENCY,
     speed_limit=_per_joint(NOMINAL_SPEEDS),
     force_limit=_per_joint(FORCE_CAPS),
     backlash=np.zeros(len(JOINT_NAMES)),
@@ -130,6 +135,7 @@ def draw_machine(seed: int, effects: tuple[str, ...] = EFFECTS) -> Machine:
         "com_shift": _com_shift(rng),
         "counterweight": float(rng.uniform(*RANGES["counterweight"])),
         "sensor_latency": float(rng.uniform(*RANGES["sensor_latency"])),
+        "power": NOMINAL.power * float(rng.uniform(*RANGES["power"])),
         "position_noise": NOISE["position"],
         "velocity_noise": NOISE["velocity"],
         "load_noise": NOISE["load"],
