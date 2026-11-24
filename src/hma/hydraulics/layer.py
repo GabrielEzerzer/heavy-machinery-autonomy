@@ -1,0 +1,295 @@
+"""The hydraulics layer: valve commands in [-1, 1] at the control rate become joint speed commands
+at the physics rate, and the true joint state becomes delayed, noisy sensor readings. One layer
+serves every machine in a scene; machine i is the one named with machine_prefix(i)."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import NamedTuple
+
+import mujoco
+import numpy as np
+
+from hma.hydraulics.params import CURVE_SEGMENTS, NOMINAL_SPEEDS, RANGES, Machine
+from hma.machine import BODY_NAMES, HOME_KEY, JOINT_NAMES, VALVE, machine_prefix
+from hma.machine.model import COUNTERWEIGHT_MASS
+
+CONTROL_HZ = 10.0
+JOINTS = len(JOINT_NAMES)
+COUNTERWEIGHT = "counterweight"
+UPPER = BODY_NAMES.index("upper")
+JOINT_SIZES = {int(mujoco.mjtJoint.mjJNT_FREE): (7, 6), int(mujoco.mjtJoint.mjJNT_BALL): (4, 3)}
+
+
+class Observation(NamedTuple):
+    positions: np.ndarray
+    velocities: np.ndarray
+    loads: np.ndarray
+
+
+class _Solid(NamedTuple):
+    mass: float
+    com: np.ndarray
+    inertia: np.ndarray
+
+
+def _quat_matrix(quat: np.ndarray) -> np.ndarray:
+    mat = np.zeros(9)
+    mujoco.mju_quat2Mat(mat, np.asarray(quat, float))
+    return mat.reshape(3, 3)
+
+
+def _about(solid: _Solid, point: np.ndarray) -> np.ndarray:
+    d = solid.com - point
+    return solid.inertia + solid.mass * (d @ d * np.eye(3) - np.outer(d, d))
+
+
+def _combine(a: _Solid, b: _Solid) -> _Solid:
+    mass = a.mass + b.mass
+    com = (a.mass * a.com + b.mass * b.com) / mass
+    return _Solid(mass, com, _about(a, com) + _about(b, com))
+
+
+def _scaled(solid: _Solid, factor: float) -> _Solid:
+    return _Solid(solid.mass * factor, solid.com, solid.inertia * factor)
+
+
+class Hydraulics:
+    def __init__(self, model: mujoco.MjModel, data: mujoco.MjData, machines: Sequence[Machine],
+                 control_hz: float = CONTROL_HZ):
+        self.model, self.data = model, data
+        self.n = len(machines)
+        self.dt = float(model.opt.timestep)
+        steps = 1.0 / (control_hz * self.dt)
+        if control_hz <= 0 or abs(steps - round(steps)) > 1e-9:
+            raise ValueError(f"control_hz must divide the physics rate {1 / self.dt:g} Hz")
+        self.steps_per_decision = round(steps)
+        self.control_hz = control_hz
+
+        def ids(kind, suffix=""):
+            return np.array([[kind(machine_prefix(i) + j + suffix).id for j in JOINT_NAMES]
+                             for i in range(self.n)])
+
+        self._qpos = np.array([[model.joint(machine_prefix(i) + j).qposadr[0]
+                                for j in JOINT_NAMES] for i in range(self.n)])
+        self._qvel = np.array([[model.joint(machine_prefix(i) + j).dofadr[0]
+                                for j in JOINT_NAMES] for i in range(self.n)])
+        self._actuators = ids(model.actuator)
+        self._tendons = ids(model.tendon, VALVE)
+        self._bodies = np.array([[model.body(machine_prefix(i) + b).id for b in BODY_NAMES]
+                                 for i in range(self.n)])
+        self._own_joints = [[j for j in range(model.njnt)
+                             if model.joint(j).name.startswith(machine_prefix(i))]
+                            for i in range(self.n)]
+        self._nominal_bodies = {int(b): self._body_solid(int(b)) for b in self._bodies.ravel()}
+        self._nominal_body_fields = {
+            int(b): (model.body_mass[b].copy(), model.body_ipos[b].copy(),
+                     model.body_inertia[b].copy(), model.body_iquat[b].copy())
+            for b in self._bodies.ravel()
+        }
+        self._counterweights = [self._counterweight_solid(i) for i in range(self.n)]
+        self._scratch = mujoco.MjData(model)
+        self._friction_rows = self._find_friction_rows()
+
+        delay_cap = max([RANGES["delay"][1], *(float(np.max(m.delay)) for m in machines)])
+        latency_cap = max([RANGES["sensor_latency"][1], *(m.sensor_latency for m in machines)])
+        self._command_len = round(delay_cap / self.dt) + 1
+        self._sensor_len = round(latency_cap / self.dt) + 1
+        shape = (self.n, JOINTS)
+        self._commands = np.zeros((self._command_len, *shape))
+        self._command_flat = self._commands.reshape(-1)
+        self._delay_index = np.zeros((self._command_len, *shape), np.intp)
+        self._sensors = np.zeros((self._sensor_len, 3, *shape))
+        self._command_head = 0
+        self._sensor_head = 0
+        self._held = np.zeros(shape)
+        self._spool = np.zeros(shape)
+        self._play = np.zeros(shape)
+        self._segment_base = np.arange(self.n * JOINTS).reshape(shape) * CURVE_SEGMENTS
+        self._inv_nominal_speed = 1.0 / np.array([NOMINAL_SPEEDS[j] for j in JOINT_NAMES])
+
+        self.machines = list(machines)
+        self._alpha = np.ones(shape)
+        self._deadband = np.zeros(shape)
+        self._open_scale = np.ones(shape)
+        self._intercept = np.zeros(self.n * JOINTS * CURVE_SEGMENTS)
+        self._slope = np.zeros(self.n * JOINTS * CURVE_SEGMENTS)
+        self._gain = np.ones(shape)
+        self._speed_limit = np.ones(shape)
+        self._inv_force_limit = np.ones(shape)
+        self._half_play = np.zeros(shape)
+        self._flow = np.ones(self.n)
+        self._latency_steps = np.zeros(self.n, np.intp)
+        self._noise = np.zeros((self.n, 3))
+        self._rngs: list[np.random.Generator | None] = [None] * self.n
+        for i, machine in enumerate(machines):
+            self.reset(i, machine)
+
+    def _body_solid(self, body: int) -> _Solid:
+        rot = _quat_matrix(self.model.body_iquat[body])
+        inertia = rot @ np.diag(self.model.body_inertia[body]) @ rot.T
+        return _Solid(float(self.model.body_mass[body]), self.model.body_ipos[body].copy(), inertia)
+
+    def _counterweight_solid(self, index: int) -> _Solid:
+        geom = self.model.geom(machine_prefix(index) + COUNTERWEIGHT).id
+        if self.model.geom_type[geom] != mujoco.mjtGeom.mjGEOM_BOX:
+            raise ValueError("the counterweight must be a box")
+        a, b, c = self.model.geom_size[geom]
+        local = COUNTERWEIGHT_MASS / 3.0 * np.diag([b * b + c * c, a * a + c * c, a * a + b * b])
+        rot = _quat_matrix(self.model.geom_quat[geom])
+        return _Solid(COUNTERWEIGHT_MASS, self.model.geom_pos[geom].copy(), rot @ local @ rot.T)
+
+    def _find_friction_rows(self) -> np.ndarray:
+        mujoco.mj_forward(self.model, self._scratch)
+        rows = {}
+        for row in range(self._scratch.nefc):
+            if self._scratch.efc_type[row] == mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON:
+                rows[int(self._scratch.efc_id[row])] = row - self._scratch.ne
+        return np.array([[rows[int(t)] for t in machine] for machine in self._tendons])
+
+    def reset(self, index: int, machine: Machine, pose: Sequence[float] | None = None) -> None:
+        if np.max(machine.delay) > (self._command_len - 1) * self.dt + 1e-12:
+            raise ValueError("delay longer than this layer's command buffer")
+        if machine.sensor_latency > (self._sensor_len - 1) * self.dt + 1e-12:
+            raise ValueError("sensor latency longer than this layer's sensor buffer")
+        if np.any(machine.lag <= 0) or np.any(machine.deadband >= 1) or machine.flow <= 0:
+            raise ValueError("lag and flow must be positive and deadband below 1")
+        if np.any(machine.speed_limit > self.model.actuator_ctrlrange[self._actuators[index], 1]):
+            raise ValueError("a speed limit exceeds what the joint's actuator accepts")
+        if np.any(machine.force_limit <= 0):
+            raise ValueError("force limits must be positive")
+        if machine.curve.shape != (JOINTS, CURVE_SEGMENTS + 1):
+            raise ValueError(f"curve must have shape {(JOINTS, CURVE_SEGMENTS + 1)}")
+        self.machines[index] = machine
+        delay_steps = np.round(machine.delay / self.dt).astype(np.intp)
+        heads = np.arange(self._command_len)[:, None]
+        self._delay_index[:, index] = (((heads - delay_steps) % self._command_len) * self.n
+                                       + index) * JOINTS + np.arange(JOINTS)
+        self._alpha[index] = 1.0 - np.exp(-self.dt / machine.lag)
+        self._deadband[index] = machine.deadband
+        self._open_scale[index] = CURVE_SEGMENTS / (1.0 - machine.deadband)
+        slope = np.diff(machine.curve, axis=1)
+        segments = slice(index * JOINTS * CURVE_SEGMENTS, (index + 1) * JOINTS * CURVE_SEGMENTS)
+        self._slope[segments] = slope.ravel()
+        self._intercept[segments] = (machine.curve[:, :-1]
+                                     - np.arange(CURVE_SEGMENTS) * slope).ravel()
+        self._gain[index] = machine.gain
+        self._speed_limit[index] = machine.speed_limit
+        self._inv_force_limit[index] = 1.0 / machine.force_limit
+        self._half_play[index] = machine.backlash / 2.0
+        self._flow[index] = machine.flow * JOINTS
+        self._latency_steps[index] = round(machine.sensor_latency / self.dt)
+        self._noise[index] = (machine.position_noise, machine.velocity_noise, machine.load_noise)
+        self._rngs[index] = np.random.default_rng((machine.seed, 1))
+
+        self.model.tendon_frictionloss[self._tendons[index]] = machine.force_limit
+        self._apply_mass(index, machine)
+        mujoco.mj_setConst(self.model, self._scratch)
+        self._reset_state(index, pose)
+
+    def _apply_mass(self, index: int, machine: Machine) -> None:
+        for k, body in enumerate(self._bodies[index]):
+            body = int(body)
+            nominal = self._nominal_bodies[body]
+            cw_factor = machine.counterweight if k == UPPER else 1.0
+            if machine.link_mass[k] == 1.0 and cw_factor == 1.0 and not machine.com_shift[k].any():
+                mass, ipos, inertia, iquat = self._nominal_body_fields[body]
+                self.model.body_mass[body] = mass
+                self.model.body_ipos[body] = ipos
+                self.model.body_inertia[body] = inertia
+                self.model.body_iquat[body] = iquat
+                continue
+            solid = _scaled(nominal, machine.link_mass[k])
+            if k == UPPER:
+                cw = self._counterweights[index]
+                rest = _combine(nominal, _scaled(cw, -1.0))
+                solid = _combine(_scaled(rest, machine.link_mass[k]), _scaled(cw, cw_factor))
+            com = solid.com + machine.com_shift[k]
+            values, axes = np.linalg.eigh(solid.inertia)
+            if np.linalg.det(axes) < 0:
+                axes[:, 0] = -axes[:, 0]
+            quat = np.zeros(4)
+            mujoco.mju_mat2Quat(quat, axes.ravel())
+            self.model.body_mass[body] = solid.mass
+            self.model.body_ipos[body] = com
+            self.model.body_inertia[body] = values
+            self.model.body_iquat[body] = quat
+
+    def _reset_state(self, index: int, pose: Sequence[float] | None) -> None:
+        model, data = self.model, self.data
+        key = model.key(HOME_KEY).id
+        for joint in self._own_joints[index]:
+            q0 = model.jnt_qposadr[joint]
+            v0 = model.jnt_dofadr[joint]
+            nq, nv = JOINT_SIZES.get(int(model.jnt_type[joint]), (1, 1))
+            data.qpos[q0:q0 + nq] = model.key_qpos[key, q0:q0 + nq]
+            data.qvel[v0:v0 + nv] = 0.0
+            data.qacc_warmstart[v0:v0 + nv] = 0.0
+            data.qfrc_applied[v0:v0 + nv] = 0.0
+        data.xfrc_applied[self._bodies[index]] = 0.0
+        if pose is not None:
+            pose = np.asarray(pose, float)
+            if pose.shape != (JOINTS,) or not np.all(np.isfinite(pose)):
+                raise ValueError("pose must be four finite joint angles")
+            data.qpos[self._qpos[index]] = pose
+        data.ctrl[self._actuators[index]] = 0.0
+        self._commands[:, index] = 0.0
+        self._held[index] = 0.0
+        self._spool[index] = 0.0
+        self._play[index] = 0.0
+        mujoco.mj_forward(model, data)
+        self._sensors[:, :, index] = np.stack(self.true_state())[:, index]
+
+    def act(self, commands: np.ndarray) -> None:
+        commands = np.asarray(commands, float)
+        if commands.shape != (self.n, JOINTS) or not np.all(np.isfinite(commands)):
+            raise ValueError(f"commands must be finite with shape {(self.n, JOINTS)}")
+        self._held = np.clip(commands, -1.0, 1.0)
+
+    def joint_speed_commands(self) -> np.ndarray:
+        head = self._command_head = (self._command_head + 1) % self._command_len
+        self._commands[head] = self._held
+        spool = self._spool
+        spool += self._alpha * (self._command_flat[self._delay_index[head]] - spool)
+        opening = np.maximum(np.abs(spool) - self._deadband, 0.0)
+        opening *= self._open_scale
+        segment = np.minimum(opening.astype(np.intp), CURVE_SEGMENTS - 1)
+        segment += self._segment_base
+        speed = self._slope[segment] * opening
+        speed += self._intercept[segment]
+        speed *= self._gain
+        np.minimum(speed, 1.0, out=speed)
+        speed *= self._speed_limit
+        demand = (speed * self._inv_nominal_speed).sum(axis=1)
+        speed *= np.minimum(1.0, self._flow / np.maximum(demand, 1e-12))[:, None]
+        np.copysign(speed, spool, out=speed)
+        drive = speed * self.dt
+        drive += self._play
+        self._play = np.minimum(np.maximum(drive, -self._half_play), self._half_play)
+        drive -= self._play
+        drive /= self.dt
+        return drive
+
+    def step(self) -> None:
+        self.data.ctrl[self._actuators] = self.joint_speed_commands()
+        mujoco.mj_step(self.model, self.data)
+        self._sensor_head = (self._sensor_head + 1) % self._sensor_len
+        self._read_into(self._sensors[self._sensor_head])
+
+    def _read_into(self, out: np.ndarray) -> None:
+        data = self.data
+        out[0] = data.qpos[self._qpos]
+        out[1] = data.qvel[self._qvel]
+        out[2] = data.efc_force[self._friction_rows + data.ne] * self._inv_force_limit
+
+    def true_state(self) -> Observation:
+        out = np.empty((3, self.n, JOINTS))
+        self._read_into(out)
+        return Observation(*out)
+
+    def observe(self) -> Observation:
+        sample = self._sensors[(self._sensor_head - self._latency_steps) % self._sensor_len,
+                               :, np.arange(self.n)]
+        noise = np.stack([rng.uniform(-1.0, 1.0, size=(3, JOINTS)) for rng in self._rngs])
+        noisy = sample + noise * self._noise[:, :, None]
+        return Observation(*np.moveaxis(noisy, 1, 0))
