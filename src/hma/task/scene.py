@@ -41,7 +41,7 @@ class Scene:
 
 DEMO_SCENE = Scene(
     markers=(
-        Marker("M1", "near marker", 2.5, -20.0),
+        Marker("M1", "near marker", 3.5, -20.0),
         Marker("M2", "middle marker", 4.0, 15.0),
         Marker("M3", "far marker", 5.5, 0.0),
         Marker("H1", "buried cable", 4.5, 35.0, hazard=True, keep_out_m=1.0),

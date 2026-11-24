@@ -10,7 +10,7 @@ from hma.task.cache import PlanCache
 from hma.task.checks import CheckReport, Plan
 from hma.task.model import CodexCliSource, ModelUnavailable, PlanSource
 from hma.task.pipeline import plan_task
-from hma.task.reach import StandInArm
+from hma.task.reach import MachineArm
 from hma.task.scene import DEMO_SCENE
 
 
@@ -54,7 +54,7 @@ def main(
             scene=DEMO_SCENE,
             source=source or CodexCliSource(model=args.model),
             cache=PlanCache(args.cache),
-            reach=StandInArm(),
+            reach=MachineArm(),
             confirm=confirm,
             on_validated=print_report,
         )
