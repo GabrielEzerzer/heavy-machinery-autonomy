@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "heavy-machinery-autonomy"
+version = "0.0.1"
+description = "A simulation demo: an excavator digs from a plain-English instruction, with one controller for every randomised machine"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE.md"]
+dependencies = [
+    "mujoco>=4.0",
+    "numpy>=2.0",
+    "pydantic>=2.9",
+]
+
+[project.optional-dependencies]
+train = [
+    "gymnasium>=1.0",
+    "stable-baselines3>=2.9",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hma"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

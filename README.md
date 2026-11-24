@@ -44,4 +44,4 @@ Not planned: other makes, sizes or arm geometries; soil simulated as grains; bur
 
 The code is under the [PolyForm Noncommercial License 1.0.0](LICENSE.md): you may read, run and change it for noncommercial purposes. Third-party files keep their own licences and are credited where they are added.
 
-Required Notice: Copyright 2026 the heavy-machinery-autonomy authors
+Required Notice: Copyright 2026 Gabriel Ezerzer
