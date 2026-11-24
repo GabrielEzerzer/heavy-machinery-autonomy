@@ -4,7 +4,7 @@ import mujoco
 import numpy as np
 import pytest
 
-from hma.hydraulics import EFFECTS, NOMINAL, RANGES, Hydraulics, draw_machine
+from hma.hydraulics import EFFECTS, NOMINAL, NOMINAL_SUPPLY, RANGES, Hydraulics, draw_machine
 from hma.machine import (
     BODY_NAMES,
     FORCE_CAPS,
@@ -105,12 +105,12 @@ def test_flow_above_the_drawn_limit_is_shared_in_proportion(seed):
     machine = replace(only("flow", seed), flow=0.6)
     for commands in ([0, 1, -1, 0], [0, 1, -1, 1]):
         speeds = steady_speeds(machine, commands, 1.2)
-        share = min(1.0, 0.6 * 4 / np.abs(commands).sum())
+        share = min(1.0, 0.6 * NOMINAL_SUPPLY / np.abs(commands).sum())
         np.testing.assert_allclose(speeds, share * NOMINAL.speed_limit * commands,
                                    rtol=2e-3, atol=1e-3)
     drawn = only("flow", seed)
     speeds = steady_speeds(drawn, [0, 1, -1, 1], 1.2)
-    share = min(1.0, drawn.flow * 4 / 3)
+    share = min(1.0, drawn.flow * NOMINAL_SUPPLY / 3)
     np.testing.assert_allclose(speeds, share * NOMINAL.speed_limit * [0, 1, -1, 1],
                                rtol=2e-3, atol=1e-3)
 

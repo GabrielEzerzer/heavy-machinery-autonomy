@@ -24,7 +24,7 @@ The physics is [MuJoCo](https://mujoco.org). The soil is a grid of heights with 
 | Dead zone | 0–25% of full command | [Nan and Hutter][nh] |
 | Command-to-speed curve | four segments with random positive slopes; gain ±10% | Random piecewise-linear curves with positive slopes in [Nan and Hutter][nh]; ±10% action scaling in [Egli and Hutter][eh] |
 | Joint speed limit | nominal ±20%. Nominal: boom 0.3, arm 0.6, bucket 0.8, swing 0.8 rad/s | Boom, arm and bucket from Fig. 5 of [Egli et al.][e22], a 12 t machine. That paper does not drive swing, so the swing nominal is assumed, chosen so that the top of its range (0.96 rad/s) stays under the model's 1.0 rad/s actuator limit. The ±20% is assumed |
-| Pump flow | 60–100% of the flow that runs all four joints at nominal full speed at once | Assumed |
+| Pump flow | 60–100% of a nominal supply that runs 2.5 joints at nominal full speed at once | Assumed. A real excavator slows its functions when two or three run together. With this supply, three joints at full command share flow on 99.9% of drawn machines, and two share on a machine whose flow is near the bottom of the range. The nominal machine peaks at 1.6 joints' worth on the line path below, so it never shares there |
 | Joint force limit | the model's cap ±15% | Assumed |
 | Joint play | 0–0.5° | Assumed. [HEAP][heap] reports joint play but gives no size |
 | Link masses, centres of mass, counterweight | ±10%; shifted by up to 5 cm; ±10% | Assumed |

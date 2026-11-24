@@ -10,7 +10,13 @@ from typing import NamedTuple
 import mujoco
 import numpy as np
 
-from hma.hydraulics.params import CURVE_SEGMENTS, NOMINAL_SPEEDS, RANGES, Machine
+from hma.hydraulics.params import (
+    CURVE_SEGMENTS,
+    NOMINAL_SPEEDS,
+    NOMINAL_SUPPLY,
+    RANGES,
+    Machine,
+)
 from hma.machine import BODY_NAMES, HOME_KEY, JOINT_NAMES, VALVE, load_scene, machine_prefix
 from hma.machine.model import COUNTERWEIGHT_MASS
 
@@ -187,7 +193,7 @@ class Hydraulics:
         self._speed_limit[index] = machine.speed_limit
         self._inv_force_limit[index] = 1.0 / machine.force_limit
         self._half_play[index] = machine.backlash / 2.0
-        self._flow[index] = machine.flow * JOINTS
+        self._flow[index] = machine.flow * NOMINAL_SUPPLY
         self._latency_steps[index] = round(machine.sensor_latency / self.dt)
         self._noise[:, index, 0] = (machine.position_noise, machine.velocity_noise,
                                     machine.load_noise)

@@ -12,6 +12,7 @@ from hma.machine import BODY_NAMES, FORCE_CAPS, JOINT_NAMES
 
 NOMINAL_SPEEDS = {"swing": 0.8, "boom": 0.3, "arm": 0.6, "bucket": 0.8}
 CURVE_SEGMENTS = 4
+NOMINAL_SUPPLY = 2.5
 
 RANGES = {
     "delay": (0.05, 0.6),
