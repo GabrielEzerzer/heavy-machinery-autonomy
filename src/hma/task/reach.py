@@ -11,6 +11,7 @@ import numpy as np
 from hma.machine import inverse_kinematics
 
 COARSE_PITCH_DEG = 15
+PITCHES_DEG = tuple(sorted(range(-180, 180), key=lambda d: d % COARSE_PITCH_DEG != 0))
 
 
 class Reach(Protocol):
@@ -21,5 +22,4 @@ class Reach(Protocol):
 class MachineArm:
     def reachable(self, x: float, y: float, z: float) -> bool:
         point = np.array([x, y, z], float)
-        degrees = sorted(range(-180, 180), key=lambda d: d % COARSE_PITCH_DEG != 0)
-        return any(inverse_kinematics(point, math.radians(d)) is not None for d in degrees)
+        return any(inverse_kinematics(point, math.radians(d)) is not None for d in PITCHES_DEG)
