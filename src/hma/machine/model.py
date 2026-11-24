@@ -1,6 +1,6 @@
-"""Scenes with one or more 12 t class excavators, each standing on its own heightfield ground.
-Every body, joint, actuator, site and ground name is prefixed per machine by machine_prefix(i).
-Ground heights are (rows, columns) = (y, x) arrays of ground_shape(); ground_axes() is (xs, ys)."""
+"""Scenes of 12 t class excavators, each on its own ground of (y, x) heights; names start with
+machine_prefix(i). ctrl is a joint speed in rad/s, sent through a "<joint>_valve" joint: read
+joints by name; actuator_force is not joint load. set_weld(off) leaves track contacts on."""
 
 from __future__ import annotations
 
@@ -77,6 +77,8 @@ def _machine_spec(index: int, weld: bool) -> mujoco.MjSpec:
     for name, home in zip(JOINT_NAMES, HOME_POSE, strict=True):
         joint = spec.joint(name)
         _turn_reference_to_home(joint, home)
+        joint.solref_limit = [2 * TIMESTEP, 1.0]
+        joint.solimp_limit = [*VALVE_SOLIMP, 0.5, 2.0]
         valve = spec.worldbody.add_body(name=name + VALVE, mass=1.0, inertia=[1.0, 1.0, 1.0],
                                         explicitinertial=True)
         valve.add_joint(name=name + VALVE, axis=[0.0, 0.0, 1.0], armature=VALVE_INERTIA)

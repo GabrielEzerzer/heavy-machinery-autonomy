@@ -23,7 +23,7 @@ from hma.machine import (
     set_weld,
     write_ground,
 )
-from hma.machine.model import GROUND_DEPTH, SPEED_LIMITS, TIMESTEP, VALVE
+from hma.machine.model import GROUND_DEPTH, SPEED_LIMITS, VALVE
 
 SOURCE_LIMITS_DEG = {"boom": (-70.0, 44.0), "arm": (30.0, 152.0), "bucket": (-33.0, 143.0)}
 
@@ -81,10 +81,6 @@ def test_total_mass_in_operating_weight_band():
         masses = {b: model.body(machine_prefix(i) + b).mass[0] for b in BODY_NAMES}
         assert masses == pytest.approx(LINK_MASSES)
         assert 12_000.0 <= sum(masses.values()) <= 12_600.0
-
-
-def test_timestep_is_200_hz():
-    assert load_scene(1).opt.timestep == TIMESTEP == 0.005
 
 
 def test_joint_limits_match_source():

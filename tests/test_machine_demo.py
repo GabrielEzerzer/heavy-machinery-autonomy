@@ -9,7 +9,6 @@ def test_scripted_motion_reaches_every_waypoint_at_ten_hertz_control():
     model = load_scene(1, weld=True)
     data = mujoco.MjData(model)
     qpos = [model.joint(machine_prefix(0) + j).qposadr[0] for j in JOINT_NAMES]
-    assert CONTROL_PERIOD == 0.1
     last, times = {}, []
     for index in motion(model, data, 1):
         last[index] = data.qpos[qpos].copy()

@@ -156,3 +156,14 @@ def test_joint_motion_below_the_force_cap_does_not_depend_on_link_mass():
     nominal = boom_arm_bucket_motion(1.0)
     for scale in (0.9, 1.1):
         np.testing.assert_allclose(boom_arm_bucket_motion(scale), nominal, atol=2e-3)
+
+
+@pytest.mark.parametrize("direction", [-1.0, 1.0])
+@pytest.mark.parametrize("name", ["boom", "arm", "bucket"])
+def test_full_speed_into_a_joint_limit_stops_at_the_limit(name, direction):
+    machine = Machine()
+    machine.command(name, direction * SPEED_LIMITS[name])
+    machine.run(5.0)
+    lo, hi = JOINT_LIMITS[name]
+    assert lo - 5e-4 <= machine.q(name) <= hi + 5e-4
+    assert abs(machine.q(name) - (hi if direction > 0 else lo)) < 5e-3
