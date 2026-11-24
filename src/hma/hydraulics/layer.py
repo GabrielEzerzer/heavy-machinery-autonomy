@@ -11,7 +11,7 @@ import mujoco
 import numpy as np
 
 from hma.hydraulics.params import CURVE_SEGMENTS, NOMINAL_SPEEDS, RANGES, Machine
-from hma.machine import BODY_NAMES, HOME_KEY, JOINT_NAMES, VALVE, machine_prefix
+from hma.machine import BODY_NAMES, HOME_KEY, JOINT_NAMES, VALVE, load_scene, machine_prefix
 from hma.machine.model import COUNTERWEIGHT_MASS
 
 CONTROL_HZ = 10.0
@@ -54,14 +54,32 @@ def _scaled(solid: _Solid, factor: float) -> _Solid:
     return _Solid(solid.mass * factor, solid.com, solid.inertia * factor)
 
 
+def _body_solid(model: mujoco.MjModel, body: int) -> _Solid:
+    rot = _quat_matrix(model.body_iquat[body])
+    inertia = rot @ np.diag(model.body_inertia[body]) @ rot.T
+    return _Solid(float(model.body_mass[body]), model.body_ipos[body].copy(), inertia)
+
+
+def _counterweight_solid(model: mujoco.MjModel) -> _Solid:
+    geom = model.geom(machine_prefix(0) + COUNTERWEIGHT).id
+    if model.geom_type[geom] != mujoco.mjtGeom.mjGEOM_BOX:
+        raise ValueError("the counterweight must be a box")
+    a, b, c = model.geom_size[geom]
+    local = COUNTERWEIGHT_MASS / 3.0 * np.diag([b * b + c * c, a * a + c * c, a * a + b * b])
+    rot = _quat_matrix(model.geom_quat[geom])
+    return _Solid(COUNTERWEIGHT_MASS, model.geom_pos[geom].copy(), rot @ local @ rot.T)
+
+
 class Hydraulics:
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData, machines: Sequence[Machine],
                  control_hz: float = CONTROL_HZ):
         self.model, self.data = model, data
         self.n = len(machines)
         self.dt = float(model.opt.timestep)
+        if not (np.isfinite(control_hz) and control_hz > 0):
+            raise ValueError("control_hz must be a finite positive rate")
         steps = 1.0 / (control_hz * self.dt)
-        if control_hz <= 0 or abs(steps - round(steps)) > 1e-9:
+        if round(steps) < 1 or abs(steps - round(steps)) > 1e-9:
             raise ValueError(f"control_hz must divide the physics rate {1 / self.dt:g} Hz")
         self.steps_per_decision = round(steps)
         self.control_hz = control_hz
@@ -81,13 +99,15 @@ class Hydraulics:
         self._own_joints = [[j for j in range(model.njnt)
                              if model.joint(j).name.startswith(machine_prefix(i))]
                             for i in range(self.n)]
-        self._nominal_bodies = {int(b): self._body_solid(int(b)) for b in self._bodies.ravel()}
-        self._nominal_body_fields = {
-            int(b): (model.body_mass[b].copy(), model.body_ipos[b].copy(),
-                     model.body_inertia[b].copy(), model.body_iquat[b].copy())
-            for b in self._bodies.ravel()
-        }
-        self._counterweights = [self._counterweight_solid(i) for i in range(self.n)]
+        reference = load_scene(1, weld=True)
+        nominal_ids = [reference.body(machine_prefix(0) + b).id for b in BODY_NAMES]
+        self._nominal_bodies = [_body_solid(reference, b) for b in nominal_ids]
+        self._nominal_body_fields = [
+            (reference.body_mass[b].copy(), reference.body_ipos[b].copy(),
+             reference.body_inertia[b].copy(), reference.body_iquat[b].copy())
+            for b in nominal_ids
+        ]
+        self._counterweight = _counterweight_solid(reference)
         self._scratch = mujoco.MjData(model)
         self._friction_rows = self._find_friction_rows()
 
@@ -125,20 +145,6 @@ class Hydraulics:
         for i, machine in enumerate(machines):
             self.reset(i, machine)
 
-    def _body_solid(self, body: int) -> _Solid:
-        rot = _quat_matrix(self.model.body_iquat[body])
-        inertia = rot @ np.diag(self.model.body_inertia[body]) @ rot.T
-        return _Solid(float(self.model.body_mass[body]), self.model.body_ipos[body].copy(), inertia)
-
-    def _counterweight_solid(self, index: int) -> _Solid:
-        geom = self.model.geom(machine_prefix(index) + COUNTERWEIGHT).id
-        if self.model.geom_type[geom] != mujoco.mjtGeom.mjGEOM_BOX:
-            raise ValueError("the counterweight must be a box")
-        a, b, c = self.model.geom_size[geom]
-        local = COUNTERWEIGHT_MASS / 3.0 * np.diag([b * b + c * c, a * a + c * c, a * a + b * b])
-        rot = _quat_matrix(self.model.geom_quat[geom])
-        return _Solid(COUNTERWEIGHT_MASS, self.model.geom_pos[geom].copy(), rot @ local @ rot.T)
-
     def _find_friction_rows(self) -> np.ndarray:
         mujoco.mj_forward(self.model, self._scratch)
         rows = {}
@@ -148,6 +154,15 @@ class Hydraulics:
         return np.array([[rows[int(t)] for t in machine] for machine in self._tendons])
 
     def reset(self, index: int, machine: Machine, pose: Sequence[float] | None = None) -> None:
+        if pose is not None:
+            pose = np.asarray(pose, float)
+            if pose.shape != (JOINTS,) or not np.all(np.isfinite(pose)):
+                raise ValueError("pose must be four finite joint angles")
+        values = [np.asarray(v, float) for k, v in vars(machine).items() if k != "seed"]
+        if not all(np.all(np.isfinite(v)) for v in values):
+            raise ValueError("every machine parameter must be finite")
+        if np.any(machine.delay < 0) or machine.sensor_latency < 0:
+            raise ValueError("delay and sensor latency must not be negative")
         if np.max(machine.delay) > (self._command_len - 1) * self.dt + 1e-12:
             raise ValueError("delay longer than this layer's command buffer")
         if machine.sensor_latency > (self._sensor_len - 1) * self.dt + 1e-12:
@@ -190,10 +205,10 @@ class Hydraulics:
     def _apply_mass(self, index: int, machine: Machine) -> None:
         for k, body in enumerate(self._bodies[index]):
             body = int(body)
-            nominal = self._nominal_bodies[body]
+            nominal = self._nominal_bodies[k]
             cw_factor = machine.counterweight if k == UPPER else 1.0
             if machine.link_mass[k] == 1.0 and cw_factor == 1.0 and not machine.com_shift[k].any():
-                mass, ipos, inertia, iquat = self._nominal_body_fields[body]
+                mass, ipos, inertia, iquat = self._nominal_body_fields[k]
                 self.model.body_mass[body] = mass
                 self.model.body_ipos[body] = ipos
                 self.model.body_inertia[body] = inertia
@@ -201,7 +216,7 @@ class Hydraulics:
                 continue
             solid = _scaled(nominal, machine.link_mass[k])
             if k == UPPER:
-                cw = self._counterweights[index]
+                cw = self._counterweight
                 rest = _combine(nominal, _scaled(cw, -1.0))
                 solid = _combine(_scaled(rest, machine.link_mass[k]), _scaled(cw, cw_factor))
             com = solid.com + machine.com_shift[k]
@@ -228,9 +243,6 @@ class Hydraulics:
             data.qfrc_applied[v0:v0 + nv] = 0.0
         data.xfrc_applied[self._bodies[index]] = 0.0
         if pose is not None:
-            pose = np.asarray(pose, float)
-            if pose.shape != (JOINTS,) or not np.all(np.isfinite(pose)):
-                raise ValueError("pose must be four finite joint angles")
             data.qpos[self._qpos[index]] = pose
         data.ctrl[self._actuators[index]] = 0.0
         self._commands[:, index] = 0.0

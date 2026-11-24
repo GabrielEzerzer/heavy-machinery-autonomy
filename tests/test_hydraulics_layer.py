@@ -17,6 +17,7 @@ from hma.machine import (
 from hma.machine.model import COUNTERWEIGHT_MASS, VALVE_GAIN, VALVE_INERTIA, _machine_spec
 
 DT = 0.005
+SOLVER_TOLERANCE_WITHOUT_NEIGHBOUR_COUPLING = 1e-12
 BUCKET = JOINT_NAMES.index("bucket")
 SWING = JOINT_NAMES.index("swing")
 
@@ -361,3 +362,76 @@ def test_mass_changes_match_the_compiler_for_the_same_masses():
                                    atol=1e-9)
         np.testing.assert_allclose(tensor(layer.model, ours), tensor(compiled, theirs),
                                    rtol=1e-7, atol=1e-6)
+
+
+def quiet(machine):
+    return replace(machine, position_noise=0.0, velocity_noise=0.0, load_noise=0.0)
+
+
+def readings(machines, commands):
+    model = load_scene(len(machines), weld=True)
+    model.opt.tolerance = SOLVER_TOLERANCE_WITHOUT_NEIGHBOUR_COUPLING
+    layer = Hydraulics(model, mujoco.MjData(model), machines)
+    seen = []
+    for u in commands:
+        layer.act(u)
+        for _ in range(layer.steps_per_decision):
+            layer.step()
+        seen.append([np.stack(layer.true_state()), np.stack(layer.observe())])
+    return np.array(seen)
+
+
+def test_each_machine_in_a_scene_gets_its_own_commands_and_readings():
+    machines = [quiet(draw_machine(21)), quiet(draw_machine(22))]
+    commands = np.random.default_rng(5).uniform(-1.0, 1.0, size=(15, 2, 4))
+    together = readings(machines, commands)
+    for i, machine in enumerate(machines):
+        alone = readings([machine], commands[:, i:i + 1])
+        np.testing.assert_allclose(together[..., i, :], alone[..., 0, :], rtol=0, atol=1e-9)
+    assert np.abs(together[..., 0, :] - together[..., 1, :]).max() > 1e-2
+
+
+def test_a_second_layer_on_the_same_model_starts_from_the_nominal_masses():
+    machine = draw_machine(4, ("mass",))
+    model = load_scene(1, weld=True)
+    data = mujoco.MjData(model)
+    Hydraulics(model, data, [machine])
+    once = model.body_mass.copy(), model.body_ipos.copy(), model.body_inertia.copy()
+    Hydraulics(model, data, [machine])
+    for before, after in zip(once, (model.body_mass, model.body_ipos, model.body_inertia),
+                             strict=True):
+        np.testing.assert_array_equal(after, before)
+
+
+@pytest.mark.parametrize("control_hz", [0.0, -10.0, np.inf, np.nan, 400.0])
+def test_control_rate_must_be_finite_positive_and_divide_the_physics_rate(control_hz):
+    model = load_scene(1, weld=True)
+    with pytest.raises(ValueError):
+        Hydraulics(model, mujoco.MjData(model), [NOMINAL], control_hz=control_hz)
+
+
+@pytest.mark.parametrize("change", [
+    {"delay": np.array([-0.05, 0.05, 0.05, 0.05])},
+    {"sensor_latency": -0.01},
+    {"lag": np.array([np.nan, 0.1, 0.1, 0.1])},
+    {"gain": np.array([1.0, np.inf, 1.0, 1.0])},
+])
+def test_reset_refuses_a_machine_with_impossible_values(change):
+    layer = layer_for(NOMINAL)
+    with pytest.raises(ValueError):
+        layer.reset(0, replace(NOMINAL, **change))
+    assert layer.machines[0] is NOMINAL
+
+
+def test_a_bad_pose_is_refused_before_anything_is_reset():
+    layer = layer_for(NOMINAL)
+    layer.act(np.array([[0.0, 0.0, 0.0, 0.5]]))
+    for _ in range(40):
+        layer.step()
+    before = np.stack(layer.true_state()), layer.model.body_mass.copy(), layer._spool.copy()
+    with pytest.raises(ValueError):
+        layer.reset(0, only("mass"), pose=[0.0, 0.0, np.nan, 0.4])
+    assert layer.machines[0] is NOMINAL
+    after = np.stack(layer.true_state()), layer.model.body_mass, layer._spool
+    for x, y in zip(before, after, strict=True):
+        np.testing.assert_array_equal(x, y)
