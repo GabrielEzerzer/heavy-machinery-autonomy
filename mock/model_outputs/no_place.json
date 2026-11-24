@@ -1,0 +1,5 @@
+{
+ "instruction": "dig a hole 1 m deep",
+ "source": "recorded",
+ "output": "{\"status\":\"clarify\",\"message\":\"At which marker should I dig?\",\"task_type\":null,\"marker_id\":null,\"depth_m\":null,\"length_m\":null,\"width_m\":null,\"heading\":null,\"spoil_side\":null,\"soil_class\":null}"
+}
