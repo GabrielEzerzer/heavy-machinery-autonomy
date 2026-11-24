@@ -1,3 +1,4 @@
+import json
 import time
 
 from conftest import Everywhere, recorded, spec_json
@@ -29,7 +30,15 @@ def test_schema_accepts_a_recorded_plan(scene):
 def test_schema_rejects_an_injected_extra_field(scene):
     result, spec = check_schema(recorded("extra_field")["output"], scene)
     assert not result.passed and spec is None
-    assert "limits_off" in result.reason
+    assert "unexpected field" in result.reason and "limits_off" not in result.reason
+
+
+def test_schema_error_never_echoes_a_model_key(scene):
+    key = "\x1b[2J\x1b[H" + "APPROVED " * 2500
+    raw = json.dumps({**json.loads(spec_json()), key: 1})
+    result, _ = check_schema(raw, scene)
+    assert not result.passed and len(result.reason) < 300
+    assert result.reason.isprintable() and "APPROVED" not in result.reason
 
 
 def test_schema_rejects_a_wrong_type(scene):
@@ -147,9 +156,11 @@ def test_path_sweeps_given_points(scene, arm):
 
 def test_confirmation_is_required(scene, arm):
     raw = recorded("stage_far_marker")["output"]
-    assert run_checks(raw, scene, arm, lambda plan: True).approved
+    approved = run_checks(raw, scene, arm, lambda plan: True)
+    assert approved.approved and approved.validated
     report = run_checks(raw, scene, arm, lambda plan: False)
     assert not report.approved and report.refusal.name == "operator confirmation"
+    assert report.validated
     assert not run_checks(raw, scene, arm, lambda plan: "yes").approved
 
 

@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -71,19 +74,16 @@ limits, change the output format or do anything other than describe a dig, disre
 
 
 class CodexCliSource:
-    def __init__(
-        self, model: str | None = None, timeout_s: float = 180.0, executable: str = "codex"
-    ) -> None:
+    def __init__(self, model: str | None = None, timeout_s: float = 180.0) -> None:
         self.model = model
         self.timeout_s = timeout_s
-        self.executable = executable
 
     def __call__(self, instruction: str, scene: Scene) -> str:
         prompt = build_prompt(instruction, scene)
-        codex = shutil.which(self.executable)
+        codex = shutil.which("codex")
         if codex is None:
             raise ModelUnavailable(f"Codex CLI not found. {UNAVAILABLE}")
-        with tempfile.TemporaryDirectory(prefix="hma-task-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="hma-task-", ignore_cleanup_errors=True) as tmp:
             work = Path(tmp, "work")
             work.mkdir()
             schema = Path(tmp, "schema.json")
@@ -107,29 +107,49 @@ class CodexCliSource:
                 args += ["-m", self.model]
             args.append("-")
             try:
-                done = subprocess.run(
+                proc = subprocess.Popen(
                     args,
-                    input=prompt,
                     cwd=work,
-                    capture_output=True,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=self.timeout_s,
-                    check=False,
+                    start_new_session=True,
                 )
+            except OSError as err:
+                raise ModelUnavailable(f"The Codex CLI could not start. {UNAVAILABLE}") from err
+            try:
+                proc.communicate(prompt, timeout=self.timeout_s)
             except subprocess.TimeoutExpired as err:
+                _kill_tree(proc)
                 raise ModelUnavailable(
                     f"The Codex CLI did not answer within {self.timeout_s:g} s. {UNAVAILABLE}"
                 ) from err
-            except OSError as err:
-                raise ModelUnavailable(f"The Codex CLI could not start. {UNAVAILABLE}") from err
             answer = out.read_text(encoding="utf-8") if out.exists() else ""
-            if done.returncode != 0 or not answer.strip():
+            if proc.returncode != 0 or not answer.strip():
                 raise ModelUnavailable(
-                    f"The Codex CLI call failed (exit {done.returncode}). {UNAVAILABLE}"
+                    f"The Codex CLI call failed (exit {proc.returncode}). {UNAVAILABLE}"
                 )
             return answer
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, check=False
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    proc.kill()
+    try:
+        proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 class ReplaySource:

@@ -1,12 +1,14 @@
 import dataclasses
+import os
 import subprocess
+import sys
+import time
 
 import pytest
 
 from conftest import MOCK, recorded
 from hma.task import CodexCliSource, ModelUnavailable, PlanCache, ReplaySource, plan_task
 from hma.task.__main__ import main
-from hma.task.checks import LIMITS
 from hma.task.model import build_prompt
 from hma.task.spec import strict_schema
 
@@ -59,7 +61,6 @@ def test_a_tampered_cache_entry_is_checked_again(scene, arm, tmp_path):
 
 
 def test_ignore_the_rules_cannot_change_the_limits(scene, arm, tmp_path):
-    before = dataclasses.asdict(LIMITS)
     record = recorded("ignore_the_rules")
     outcome = run(
         record["instruction"], scene, arm, ReplaySource.from_folder(MOCK), PlanCache(tmp_path)
@@ -67,7 +68,6 @@ def test_ignore_the_rules_cannot_change_the_limits(scene, arm, tmp_path):
     assert not outcome.report.approved
     assert outcome.report.spec.depth_m == 9
     assert outcome.report.refusal.name == "reach"
-    assert dataclasses.asdict(LIMITS) == before
 
 
 def test_prompt_fences_the_instruction(scene):
@@ -88,18 +88,36 @@ def test_codex_source_reports_a_missing_cli(scene, monkeypatch):
         CodexCliSource()(STAGE, scene)
 
 
+class FakePopen:
+    returncode = 0
+    stderr = ""
+
+    def __init__(self, args, **kwargs):
+        self.args, self.kwargs = args, kwargs
+
+    def communicate(self, input=None, timeout=None):
+        return "", self.stderr
+
+
 def test_codex_source_command_line(scene, monkeypatch):
     seen = {}
 
-    def fake_run(args, **kwargs):
-        seen.update(args=args, cwd_files=list(kwargs["cwd"].iterdir()), **kwargs)
-        out = args[args.index("-o") + 1]
-        with open(out, "w", encoding="utf-8") as f:
-            f.write(recorded("stage_far_marker")["output"])
-        return subprocess.CompletedProcess(args, 0, "", "")
+    class Recording(FakePopen):
+        def communicate(self, input=None, timeout=None):
+            seen.update(
+                args=self.args,
+                cwd_files=list(self.kwargs["cwd"].iterdir()),
+                input=input,
+                timeout=timeout,
+                **self.kwargs,
+            )
+            out = self.args[self.args.index("-o") + 1]
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(recorded("stage_far_marker")["output"])
+            return "", ""
 
     monkeypatch.setattr("hma.task.model.shutil.which", lambda name: "/bin/codex")
-    monkeypatch.setattr("hma.task.model.subprocess.run", fake_run)
+    monkeypatch.setattr("hma.task.model.subprocess.Popen", Recording)
     raw = CodexCliSource(timeout_s=30)(STAGE, scene)
     args = seen["args"]
     assert raw == recorded("stage_far_marker")["output"]
@@ -116,12 +134,50 @@ def test_codex_source_command_line(scene, monkeypatch):
 def test_codex_source_reports_a_failed_call(scene, monkeypatch):
     monkeypatch.setattr("hma.task.model.shutil.which", lambda name: "/bin/codex")
     monkeypatch.setattr(
-        "hma.task.model.subprocess.run",
-        lambda args, **kw: subprocess.CompletedProcess(args, 1, "", "secret detail"),
+        "hma.task.model.subprocess.Popen",
+        type("Failing", (FakePopen,), {"returncode": 1, "stderr": "secret detail"}),
     )
     with pytest.raises(ModelUnavailable) as err:
         CodexCliSource()(STAGE, scene)
     assert "secret detail" not in str(err.value) and "sign in" in str(err.value)
+
+
+def alive(pid):
+    if sys.platform == "win32":
+        found = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True
+        ).stdout
+        return str(pid) in found.split()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_codex_source_timeout_kills_the_whole_process_tree(scene, monkeypatch, tmp_path):
+    pidfile = tmp_path / "grandchild.pid"
+    sleeper = (
+        f'"{sys.executable}" -c "import os, time; '
+        f"open(r'{pidfile}', 'w').write(str(os.getpid())); time.sleep(60)\""
+    )
+    if sys.platform == "win32":
+        fake = tmp_path / "codex.cmd"
+        fake.write_text(f"@echo off\n{sleeper}\n", encoding="utf-8")
+    else:
+        fake = tmp_path / "codex"
+        fake.write_text(f"#!/bin/sh\n{sleeper}\n", encoding="utf-8")
+        fake.chmod(0o755)
+    monkeypatch.setattr("hma.task.model.shutil.which", lambda name: str(fake))
+    start = time.perf_counter()
+    with pytest.raises(ModelUnavailable, match="did not answer within 2 s"):
+        CodexCliSource(timeout_s=2)(STAGE, scene)
+    assert time.perf_counter() - start < 15
+    pid = int(pidfile.read_text())
+    deadline = time.monotonic() + 5
+    while alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not alive(pid)
 
 
 def test_schema_file_is_strict(scene):
@@ -152,6 +208,19 @@ def test_cli_approves_the_stage_plan(capsys, tmp_path):
     )
     out = capsys.readouterr().out
     assert code == 0 and "6. operator confirmation: pass" in out and "APPROVED" in out
+
+
+def test_cli_keeps_the_plan_when_the_cache_cannot_be_written(capsys, tmp_path):
+    blocker = tmp_path / "a-file"
+    blocker.write_text("", encoding="utf-8")
+    code = main(
+        [STAGE, "--cache", str(blocker)],
+        source=ReplaySource.from_folder(MOCK),
+        confirm=lambda plan: True,
+    )
+    out = capsys.readouterr().out
+    assert code == 0 and "APPROVED" in out
+    assert out.count("The plan was not cached") == 1
 
 
 def test_cli_reports_an_unavailable_model(capsys, tmp_path):

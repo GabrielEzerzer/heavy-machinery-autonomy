@@ -13,8 +13,6 @@ from hma.task.scene import Scene
 
 
 def default_cache_dir() -> Path:
-    if override := os.environ.get("HMA_CACHE_DIR"):
-        return Path(override)
     if sys.platform == "win32" and (local := os.environ.get("LOCALAPPDATA")):
         return Path(local, "hma", "plans")
     base = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"

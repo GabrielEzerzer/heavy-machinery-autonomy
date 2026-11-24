@@ -38,7 +38,10 @@ def plan_task(
         seconds = time.perf_counter() - start
     report = validate(raw, scene, reach)
     if report.validated and not from_cache:
-        cache.put(instruction, scene, raw)
+        try:
+            cache.put(instruction, scene, raw)
+        except OSError:
+            report.warnings.append("The plan was not cached: the cache folder cannot be written.")
     if on_validated is not None:
         on_validated(report, from_cache, seconds)
     return Outcome(confirm_plan(report, confirm), from_cache, seconds)

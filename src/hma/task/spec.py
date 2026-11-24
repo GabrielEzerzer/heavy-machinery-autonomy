@@ -41,10 +41,14 @@ class SoilClass(StrEnum):
     unknown = "unknown"
 
 
+def printable(text: str) -> str:
+    return "".join(c if c.isprintable() else " " for c in text)
+
+
 def _printable(text: str) -> str:
     if len(text) > MESSAGE_MAX_CHARS:
         raise ValueError(f"message is longer than {MESSAGE_MAX_CHARS} characters")
-    return "".join(c if c.isprintable() else " " for c in text)
+    return printable(text)
 
 
 Metres = Annotated[float, Field(ge=0, le=50, allow_inf_nan=False)]

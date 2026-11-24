@@ -13,7 +13,15 @@ from pydantic import ValidationError
 
 from hma.task.reach import Reach
 from hma.task.scene import Scene
-from hma.task.spec import Heading, SoilClass, SpoilSide, Status, TaskSpec, spec_model
+from hma.task.spec import (
+    Heading,
+    SoilClass,
+    SpoilSide,
+    Status,
+    TaskSpec,
+    printable,
+    spec_model,
+)
 
 Point = tuple[float, float, float]
 
@@ -105,7 +113,7 @@ class CheckReport:
 
     @property
     def validated(self) -> bool:
-        return len(self.results) == 5 and all(r.passed for r in self.results)
+        return len(self.results) >= 5 and all(r.passed for r in self.results[:5])
 
     @property
     def refusal(self) -> CheckResult | None:
@@ -122,14 +130,20 @@ def _rect_gap(
 
 
 def check_schema(raw: str, scene: Scene) -> tuple[CheckResult, TaskSpec | None]:
+    model = spec_model(scene)
     try:
-        spec = spec_model(scene).model_validate_json(raw)
+        spec = model.model_validate_json(raw)
     except ValidationError as err:
         first = err.errors()[0]
-        where = ".".join(str(p) for p in first["loc"]) or "output"
-        return CheckResult(
-            "schema", False, f"Model output rejected: {where}: {first['msg']}."
-        ), None
+        loc = first["loc"]
+        if not loc:
+            where = "output"
+        elif loc[0] in model.model_fields:
+            where = loc[0]
+        else:
+            where = "an unexpected field"
+        msg = printable(first["msg"])[:200]
+        return CheckResult("schema", False, f"Model output rejected: {where}: {msg}."), None
     if spec.status is not Status.plan:
         return CheckResult(
             "schema",
