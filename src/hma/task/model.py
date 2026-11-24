@@ -127,6 +127,9 @@ class CodexCliSource:
                 raise ModelUnavailable(
                     f"The Codex CLI did not answer within {self.timeout_s:g} s. {UNAVAILABLE}"
                 ) from err
+            except BaseException:
+                _kill_tree(proc)
+                raise
             answer = out.read_text(encoding="utf-8") if out.exists() else ""
             if proc.returncode != 0 or not answer.strip():
                 raise ModelUnavailable(

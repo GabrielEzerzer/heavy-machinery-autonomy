@@ -142,6 +142,21 @@ def test_codex_source_reports_a_failed_call(scene, monkeypatch):
     assert "secret detail" not in str(err.value) and "sign in" in str(err.value)
 
 
+def test_codex_source_stops_the_cli_when_interrupted(scene, monkeypatch):
+    killed = []
+
+    class Interrupted(FakePopen):
+        def communicate(self, input=None, timeout=None):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr("hma.task.model.shutil.which", lambda name: "/bin/codex")
+    monkeypatch.setattr("hma.task.model.subprocess.Popen", Interrupted)
+    monkeypatch.setattr("hma.task.model._kill_tree", killed.append)
+    with pytest.raises(KeyboardInterrupt):
+        CodexCliSource()(STAGE, scene)
+    assert len(killed) == 1
+
+
 def alive(pid):
     if sys.platform == "win32":
         found = subprocess.run(
