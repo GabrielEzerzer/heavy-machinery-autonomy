@@ -20,9 +20,10 @@ Changes made to the source:
   limits are taken unchanged from zx120.urdf; the bucket tip site comes from bucket_end_joint.
 - Not used: the cylinder and bucket linkage meshes (zx120-*-cyl*.dae, zx120-p1.dae,
   zx120-p2.dae), the URDF collision meshes and the Gazebo, ROS control and MoveIt files.
-- Added: a free-floating base with two box-shaped track contact geoms sized from the bottom of
-  the track mesh, a box geom carrying the counterweight mass at the rear of the upper structure,
-  and a site at the bucket tip.
+- Added: a free-floating base with sixteen sphere-shaped track contact geoms, four along the
+  inner and outer edge of each track at the bottom of the track mesh, a box geom carrying the
+  counterweight mass in the lower 1 m of the rear of the upper structure, and a site at the
+  bucket tip.
 - Masses: the source gives a placeholder mass of 0.03 kg per link. The link masses used here are
   set in hma/machine/model.py. Boom (1,220 kg, with arm cylinder), arm (600 kg, with bucket
   cylinder), bucket (400 kg) and counterweight (2,450 kg) follow the manufacturer's published

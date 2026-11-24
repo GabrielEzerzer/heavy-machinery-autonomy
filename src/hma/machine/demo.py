@@ -33,7 +33,7 @@ WAYPOINTS = np.array([
 SPEEDS = np.array([0.6, 0.3, 0.6, 0.8])
 GAIN = 2.0
 TOLERANCE = 0.01
-CONTROL_STEPS = 10
+CONTROL_PERIOD = 0.1
 WAYPOINT_TIMEOUT = 20.0
 
 
@@ -42,6 +42,7 @@ def motion(model: mujoco.MjModel, data: mujoco.MjData, n_machines: int) -> Itera
                      for i in range(n_machines)])
     qpos = np.array([[model.joint(machine_prefix(i) + j).qposadr[0] for j in JOINT_NAMES]
                      for i in range(n_machines)])
+    control_steps = round(CONTROL_PERIOD / model.opt.timestep)
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
     mujoco.mj_forward(model, data)
     for index, target in enumerate(WAYPOINTS[1:], start=1):
@@ -49,7 +50,7 @@ def motion(model: mujoco.MjModel, data: mujoco.MjData, n_machines: int) -> Itera
         while np.abs(data.qpos[qpos] - target).max() > TOLERANCE and data.time < deadline:
             error = target - data.qpos[qpos]
             data.ctrl[acts] = np.clip(GAIN * error, -SPEEDS, SPEEDS)
-            mujoco.mj_step(model, data, CONTROL_STEPS)
+            mujoco.mj_step(model, data, control_steps)
             yield index
     data.ctrl[:] = 0.0
 

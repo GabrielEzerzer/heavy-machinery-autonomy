@@ -20,6 +20,7 @@ JOINT_LIMITS = {
     "bucket": (-0.575958653158, 2.49582083035),
 }
 LIMIT_TOLERANCE = 1e-9
+RADIAL_TOLERANCE = 1e-9
 
 
 def forward_kinematics(q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -48,11 +49,18 @@ def _wrap(angle: float) -> float:
 
 
 def inverse_kinematics(position: np.ndarray, pitch: float) -> np.ndarray | None:
+    position = np.asarray(position, float)
+    if position.shape != (3,) or np.ndim(pitch) != 0:
+        raise ValueError("inverse_kinematics takes one point of shape (3,) and one scalar pitch")
     x, y, z = (float(v) for v in position)
+    pitch = float(pitch)
+    if not all(math.isfinite(v) for v in (x, y, z, pitch)):
+        return None
     side = float(BOOM_PIVOT[1])
     radial_sq = x * x + y * y - side * side
-    if radial_sq < 0.0:
+    if radial_sq < -RADIAL_TOLERANCE:
         return None
+    radial_sq = max(radial_sq, 0.0)
     for radial in (math.sqrt(radial_sq), -math.sqrt(radial_sq)):
         q = _solve_plane(radial, z, pitch)
         if q is not None:
