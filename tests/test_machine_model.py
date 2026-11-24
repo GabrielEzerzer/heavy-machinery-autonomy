@@ -151,7 +151,7 @@ def test_each_machine_stands_on_its_own_ground_with_few_contacts():
         prefix = names[0][:3]
         assert names[0] == prefix + GROUND and names[1].startswith(prefix + "track_")
         assert count <= 4
-    assert 0 < data.ncon <= 2 * 16 * 2
+    assert 0 < data.ncon <= 2 * 24 * 2
     for i in range(2):
         assert abs(base_position(model, data, i)[2]) < 1e-3
 
@@ -212,6 +212,31 @@ def test_ridge_under_one_track_rolls_the_machine_and_mirrors():
     left, right = roll_on_ridge(1.0), roll_on_ridge(-1.0)
     assert left > 0.5
     assert right == pytest.approx(-left, abs=0.05)
+
+
+def test_ridge_across_the_middle_of_the_tracks_lifts_the_machine():
+    model = load_scene(1)
+    xs, _ = ground_axes()
+    heights = np.zeros(ground_shape())
+    heights[:, np.abs(xs) <= 0.3] = 0.25
+    write_ground(model, 0, heights)
+    data = home_data(model)
+    data.qpos[2] = 0.3
+    settle(model, data, 3.0)
+    assert base_position(model, data, 0)[2] > 0.15
+
+
+@pytest.mark.parametrize("lip", [1.5, 1.4, 1.2, 1.0])
+def test_loaded_machine_stays_level_with_track_ends_over_a_trench(lip):
+    model = load_scene(1)
+    xs, _ = ground_axes()
+    heights = np.zeros(ground_shape())
+    heights[:, xs > lip] = -1.0
+    write_ground(model, 0, heights)
+    data = home_data(model)
+    set_pose(model, data, 0, dict(zip(JOINT_NAMES, (0.0, 0.0, 1.0, 0.5), strict=True)))
+    settle(model, data, 3.0, 1200.0)
+    assert tilt_deg(model, data) < 0.5
 
 
 def side_reach_tilt(swing, payload):

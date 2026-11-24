@@ -82,6 +82,43 @@ def test_inverse_kinematics_refuses_points_out_of_reach(position, pitch):
     assert inverse_kinematics(np.array(position), pitch) is None
 
 
+def test_round_trip_with_the_tip_over_the_swing_axis():
+    boom, arm = JOINT_LIMITS["boom"][1], 2.38673775
+    lo, hi = JOINT_LIMITS["bucket"]
+
+    def forward_x(bucket):
+        return forward_kinematics(np.array([0.0, boom, arm, bucket]))[0][0]
+
+    assert forward_x(lo) * forward_x(hi) < 0.0
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if forward_x(lo) * forward_x(mid) > 0.0 else (lo, mid)
+    position, pitch = forward_kinematics(np.array([0.0, boom, arm, lo]))
+    assert abs(position[0]) < 1e-12
+    solved = inverse_kinematics(position, pitch)
+    assert solved is not None
+    again, again_pitch = forward_kinematics(solved)
+    np.testing.assert_allclose(again, position, atol=1e-9)
+    assert abs(again_pitch - pitch) < 1e-9
+
+
+@pytest.mark.parametrize(
+    ("position", "pitch"),
+    [((math.nan, 0.0, 0.0), 0.0), ((3.0, math.inf, 0.0), 0.0), ((3.0, 0.0, 0.0), math.nan)],
+)
+def test_inverse_kinematics_refuses_values_that_are_not_finite(position, pitch):
+    assert inverse_kinematics(np.array(position), pitch) is None
+
+
+@pytest.mark.parametrize(
+    ("position", "pitch"),
+    [(np.zeros(2), 0.0), (np.zeros((2, 3)), 0.0), (np.zeros(3), np.zeros(2))],
+)
+def test_inverse_kinematics_takes_one_point_only(position, pitch):
+    with pytest.raises(ValueError):
+        inverse_kinematics(position, pitch)
+
+
 @pytest.mark.parametrize(
     "q",
     [
