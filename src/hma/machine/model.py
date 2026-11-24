@@ -16,6 +16,8 @@ JOINT_NAMES = ("swing", "boom", "arm", "bucket")
 BODY_NAMES = ("base", "upper", "boom", "arm", "bucket")
 BASE_JOINT = "base_free"
 TIP_SITE = "bucket_tip"
+EDGE_SITES = ("bucket_edge_right", "bucket_edge_left")
+SOIL_AXES = ("soil_0", "soil_1", "soil_2")
 TRACK_FEET = "track_"
 ANCHOR = "anchor"
 WELD = "base_weld"
@@ -91,6 +93,12 @@ def _machine_spec(index: int, weld: bool) -> mujoco.MjSpec:
         act.set_to_velocity(kv=VALVE_GAIN)
         act.ctrllimited = mujoco.mjtLimited.mjLIMITED_TRUE
         act.ctrlrange = [-SPEED_LIMITS[name], SPEED_LIMITS[name]]
+    for name in SOIL_AXES:
+        spec.worldbody.add_body(name=name, mocap=True).add_site(name=name)
+        soil = spec.add_tendon(name=name, frictionloss=0.0, solref_friction=[2 * TIMESTEP, 1.0],
+                               solimp_friction=[*VALVE_SOLIMP, 0.5, 2.0])
+        soil.wrap_site(name)
+        soil.wrap_site(TIP_SITE)
     return spec
 
 

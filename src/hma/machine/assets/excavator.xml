@@ -54,6 +54,8 @@
               <joint name="bucket" axis="0 1 0" range="-0.575958653158 2.49582083035" />
               <geom name="bucket" type="mesh" mesh="bucket" material="bucket_paint" contype="0" conaffinity="0" group="1" />
               <site name="bucket_tip" pos="0 0 1.23" quat="0.906308 0 0.422618 0" size="0.04" rgba="1 0 0 1" group="2" />
+              <site name="bucket_edge_right" pos="0 -0.302377 1.23" quat="0.906308 0 0.422618 0" size="0.03" rgba="1 0 0 1" group="2" />
+              <site name="bucket_edge_left" pos="0 0.307646 1.23" quat="0.906308 0 0.422618 0" size="0.03" rgba="1 0 0 1" group="2" />
             </body>
           </body>
         </body>
