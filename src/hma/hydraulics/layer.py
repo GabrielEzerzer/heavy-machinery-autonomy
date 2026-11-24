@@ -18,6 +18,7 @@ CONTROL_HZ = 10.0
 JOINTS = len(JOINT_NAMES)
 COUNTERWEIGHT = "counterweight"
 UPPER = BODY_NAMES.index("upper")
+FRICTION_TENDON = int(mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON)
 JOINT_SIZES = {int(mujoco.mjtJoint.mjJNT_FREE): (7, 6), int(mujoco.mjtJoint.mjJNT_BALL): (4, 3)}
 
 
@@ -109,7 +110,7 @@ class Hydraulics:
         ]
         self._counterweight = _counterweight_solid(reference)
         self._scratch = mujoco.MjData(model)
-        self._friction_rows = self._find_friction_rows()
+        self._tendon_forces = np.zeros(model.ntendon)
 
         delay_cap = max([RANGES["delay"][1], *(float(np.max(m.delay)) for m in machines)])
         latency_cap = max([RANGES["sensor_latency"][1], *(m.sensor_latency for m in machines)])
@@ -144,14 +145,6 @@ class Hydraulics:
         self._rngs: list[np.random.Generator | None] = [None] * self.n
         for i, machine in enumerate(machines):
             self.reset(i, machine)
-
-    def _find_friction_rows(self) -> np.ndarray:
-        mujoco.mj_forward(self.model, self._scratch)
-        rows = {}
-        for row in range(self._scratch.nefc):
-            if self._scratch.efc_type[row] == mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON:
-                rows[int(self._scratch.efc_id[row])] = row - self._scratch.ne
-        return np.array([[rows[int(t)] for t in machine] for machine in self._tendons])
 
     def reset(self, index: int, machine: Machine, pose: Sequence[float] | None = None) -> None:
         if pose is not None:
@@ -292,7 +285,11 @@ class Hydraulics:
         data = self.data
         out[0] = data.qpos[self._qpos]
         out[1] = data.qvel[self._qvel]
-        out[2] = data.efc_force[self._friction_rows + data.ne] * self._inv_force_limit
+        rows = np.flatnonzero(data.efc_type == FRICTION_TENDON)
+        forces = self._tendon_forces
+        forces[:] = 0.0
+        forces[data.efc_id[rows]] = data.efc_force[rows]
+        out[2] = forces[self._tendons] * self._inv_force_limit
 
     def true_state(self) -> Observation:
         out = np.empty((3, self.n, JOINTS))

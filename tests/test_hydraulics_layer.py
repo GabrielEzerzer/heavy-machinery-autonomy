@@ -435,3 +435,27 @@ def test_a_bad_pose_is_refused_before_anything_is_reset():
     after = np.stack(layer.true_state()), layer.model.body_mass, layer._spool
     for x, y in zip(before, after, strict=True):
         np.testing.assert_array_equal(x, y)
+
+
+def test_load_readings_follow_friction_rows_that_appear_and_vanish():
+    machines = [draw_machine(31, ("limits",)), draw_machine(32, ("limits",))]
+    model = load_scene(2, weld=True)
+    data = mujoco.MjData(model)
+    layer = Hydraulics(model, data, machines)
+    dofs = np.array([[model.joint(machine_prefix(i) + j).dofadr[0] for j in JOINT_NAMES]
+                     for i in range(2)])
+    caps = np.array([m.force_limit for m in machines])
+    toggled = model.tendon(machine_prefix(0) + "swing_valve").id
+    rows_seen = set()
+    for k in range(120):
+        model.tendon_frictionloss[toggled] = 0.0 if 30 <= k < 90 else caps[0, SWING]
+        data.qfrc_applied[dofs[:, SWING]] = 0.5 * caps[:, SWING]
+        layer.step()
+        rows_seen.add(int(np.sum(data.efc_type == mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON)))
+        loads = layer.true_state().loads
+        np.testing.assert_allclose(loads * caps, data.qfrc_constraint[dofs], rtol=1e-9, atol=1e-6)
+        if 30 <= k < 90:
+            assert loads[0, SWING] == 0.0
+        if k >= 25:
+            assert loads[1, SWING] == pytest.approx(-0.5, rel=1e-3)
+    assert rows_seen == {7, 8}
