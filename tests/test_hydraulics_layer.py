@@ -459,3 +459,25 @@ def test_load_readings_follow_friction_rows_that_appear_and_vanish():
         if k >= 25:
             assert loads[1, SWING] == pytest.approx(-0.5, rel=1e-3)
     assert rows_seen == {7, 8}
+
+
+def test_each_reading_carries_one_noise_draw_however_often_it_is_observed():
+    machine = draw_machine(7)
+    commands = np.random.default_rng(8).uniform(-1.0, 1.0, size=(12, 1, 4))
+
+    def run(extra_calls):
+        layer = layer_for(machine)
+        seen = []
+        for u in commands:
+            layer.act(u)
+            for _ in range(layer.steps_per_decision):
+                layer.step()
+                for _ in range(extra_calls):
+                    first, again = np.stack(layer.observe()), np.stack(layer.observe())
+                    assert np.array_equal(first, again)
+            seen.append(np.stack(layer.observe()))
+        return np.array(seen), layer.data.qpos.copy()
+
+    rarely, often = run(0), run(3)
+    assert np.array_equal(rarely[0], often[0])
+    assert np.array_equal(rarely[1], often[1])

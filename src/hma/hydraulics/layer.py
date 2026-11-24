@@ -141,7 +141,9 @@ class Hydraulics:
         self._half_play = np.zeros(shape)
         self._flow = np.ones(self.n)
         self._latency_steps = np.zeros(self.n, np.intp)
-        self._noise = np.zeros((self.n, 3))
+        self._noise = np.zeros((3, self.n, 1))
+        self._noise_draws = np.zeros((self.steps_per_decision, 3, *shape))
+        self._noise_cursor = 0
         self._rngs: list[np.random.Generator | None] = [None] * self.n
         for i, machine in enumerate(machines):
             self.reset(i, machine)
@@ -187,13 +189,19 @@ class Hydraulics:
         self._half_play[index] = machine.backlash / 2.0
         self._flow[index] = machine.flow * JOINTS
         self._latency_steps[index] = round(machine.sensor_latency / self.dt)
-        self._noise[index] = (machine.position_noise, machine.velocity_noise, machine.load_noise)
+        self._noise[:, index, 0] = (machine.position_noise, machine.velocity_noise,
+                                    machine.load_noise)
         self._rngs[index] = np.random.default_rng((machine.seed, 1))
+        self._draw_noise(index)
 
         self.model.tendon_frictionloss[self._tendons[index]] = machine.force_limit
         self._apply_mass(index, machine)
         mujoco.mj_setConst(self.model, self._scratch)
         self._reset_state(index, pose)
+
+    def _draw_noise(self, index: int) -> None:
+        shape = (self.steps_per_decision, 3, JOINTS)
+        self._noise_draws[:, :, index] = self._rngs[index].uniform(-1.0, 1.0, shape)
 
     def _apply_mass(self, index: int, machine: Machine) -> None:
         for k, body in enumerate(self._bodies[index]):
@@ -243,7 +251,9 @@ class Hydraulics:
         self._spool[index] = 0.0
         self._play[index] = 0.0
         mujoco.mj_forward(model, data)
-        self._sensors[:, :, index] = np.stack(self.true_state())[:, index]
+        first = np.stack(self.true_state())[:, index]
+        first += self._rngs[index].uniform(-1.0, 1.0, first.shape) * self._noise[:, index]
+        self._sensors[:, :, index] = first
 
     def act(self, commands: np.ndarray) -> None:
         commands = np.asarray(commands, float)
@@ -279,7 +289,14 @@ class Hydraulics:
         self.data.ctrl[self._actuators] = self.joint_speed_commands()
         mujoco.mj_step(self.model, self.data)
         self._sensor_head = (self._sensor_head + 1) % self._sensor_len
-        self._read_into(self._sensors[self._sensor_head])
+        reading = self._sensors[self._sensor_head]
+        self._read_into(reading)
+        cursor = self._noise_cursor
+        if cursor == 0:
+            for i in range(self.n):
+                self._draw_noise(i)
+        reading += self._noise_draws[cursor] * self._noise
+        self._noise_cursor = (cursor + 1) % self.steps_per_decision
 
     def _read_into(self, out: np.ndarray) -> None:
         data = self.data
@@ -299,6 +316,4 @@ class Hydraulics:
     def observe(self) -> Observation:
         sample = self._sensors[(self._sensor_head - self._latency_steps) % self._sensor_len,
                                :, np.arange(self.n)]
-        noise = np.stack([rng.uniform(-1.0, 1.0, size=(3, JOINTS)) for rng in self._rngs])
-        noisy = sample + noise * self._noise[:, :, None]
-        return Observation(*np.moveaxis(noisy, 1, 0))
+        return Observation(*np.moveaxis(sample, 1, 0))
