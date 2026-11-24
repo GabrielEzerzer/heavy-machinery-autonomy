@@ -4,6 +4,7 @@ Usage: python -m hma.machine.demo [--machines N]"""
 from __future__ import annotations
 
 import argparse
+import threading
 import time
 from collections.abc import Iterator
 
@@ -64,6 +65,7 @@ def main() -> None:
     model = load_scene(n_machines, weld=True)
     data = mujoco.MjData(model)
     steps = motion(model, data, n_machines)
+    before = set(threading.enumerate())
     with mujoco.viewer.launch_passive(model, data) as viewer:
         with viewer.lock():
             viewer.cam.lookat[:] = [3.0, (n_machines - 1) * MACHINE_SPACING / 2, 1.5]
@@ -77,6 +79,8 @@ def main() -> None:
             ahead = data.time - (time.perf_counter() - start)
             if ahead > 0:
                 time.sleep(ahead)
+    for thread in set(threading.enumerate()) - before:
+        thread.join()
 
 
 if __name__ == "__main__":
