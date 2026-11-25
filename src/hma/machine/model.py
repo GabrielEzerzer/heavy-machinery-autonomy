@@ -77,13 +77,14 @@ def _turn_reference_to_home(joint: mujoco.MjsJoint, angle: float) -> None:
     joint.ref = angle
 
 
-def _valve(spec: mujoco.MjSpec, name: str, joint: str, cap: float, limit: float) -> None:
+def _valve(spec: mujoco.MjSpec, name: str, joint: str, cap: float, limit: float,
+           solimp: tuple[float, float, float] = VALVE_SOLIMP) -> None:
     valve = spec.worldbody.add_body(name=name + VALVE, mass=1.0, inertia=[1.0, 1.0, 1.0],
                                     explicitinertial=True)
     valve.add_joint(name=name + VALVE, axis=[0.0, 0.0, 1.0], armature=VALVE_INERTIA)
     tendon = spec.add_tendon(name=name + VALVE, frictionloss=cap,
                              solref_friction=[2 * TIMESTEP, 1.0],
-                             solimp_friction=[*VALVE_SOLIMP, 0.5, 2.0])
+                             solimp_friction=[*solimp, 0.5, 2.0])
     tendon.wrap_joint(joint, 1.0)
     tendon.wrap_joint(name + VALVE, -1.0)
     act = spec.add_actuator(name=name, target=name + VALVE, trntype=mujoco.mjtTrn.mjTRN_JOINT)
@@ -97,13 +98,14 @@ def _add_belt(spec: mujoco.MjSpec, side: str) -> None:
     name = tracks.BELT + side
     belt = spec.body("base").add_body(name=name, mass=1e-3, inertia=[1e-6] * 3,
                                       explicitinertial=True)
-    belt.add_joint(name=name, type=mujoco.mjtJoint.mjJNT_SLIDE, axis=[1.0, 0.0, 0.0],
+    belt.add_joint(name=name, type=mujoco.mjtJoint.mjJNT_SLIDE, axis=[-1.0, 0.0, 0.0],
                    armature=tracks.BELT_ARMATURE)
     half_height = tracks.IDLER_RADIUS
     belt.add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_BOX, pos=[0.0, y, half_height],
                   size=[tracks.TUMBLER + tracks.IDLER_RADIUS, tracks.SHOE_WIDTH / 2, half_height],
                   contype=0, conaffinity=0, group=3, rgba=[0.2, 0.6, 0.9, 0.3])
-    _valve(spec, tracks.TRAVEL + side, name, tracks.TRACTION, tracks.TRAVEL_SPEED)
+    _valve(spec, tracks.TRAVEL + side, name, tracks.TRACTION, tracks.TRAVEL_SPEED,
+           tracks.BRAKE_SOLIMP)
 
 
 def _machine_spec(index: int, weld: bool) -> mujoco.MjSpec:
