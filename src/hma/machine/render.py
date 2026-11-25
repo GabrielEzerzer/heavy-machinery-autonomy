@@ -14,7 +14,6 @@ import numpy as np
 from hma.machine.cylinders import PINS, coupler
 from hma.machine.model import machine_prefix
 
-WIDTH, HEIGHT = 1280, 720
 CYLINDERS = {"boom": ("boom_foot", "boom_rod"), "arm": ("arm_head", "arm_rod"),
              "bucket": ("bucket_head", "coupler")}
 
@@ -34,7 +33,6 @@ ALONG_Z = {f"{name}_{piece}" for name in CYLINDERS for piece in ("barrel", "rod"
 
 
 def pin_positions(model: mujoco.MjModel, data: mujoco.MjData, prefix: str) -> dict[str, np.ndarray]:
-    """World positions of the cylinder and linkage pins; the coupler follows the bucket angle."""
     out = {}
     for name, (body, local) in PINS.items():
         b = model.body(prefix + body).id
@@ -70,7 +68,7 @@ def draw_hydraulics(model: mujoco.MjModel, data: mujoco.MjData, scene: mujoco.Mj
             if scene.ngeom >= scene.maxgeom:
                 return
             mesh = model.mesh(prefix + mesh_name).id
-            mat = model.material(prefix + material).id
+            mat = model.material(material).id
             frame = _frame(pins[end] - pins[start], pin_axis, mesh_name in ALONG_Z)
             offset = np.zeros(9)
             mujoco.mju_quat2Mat(offset, model.mesh_quat[mesh])
@@ -115,24 +113,6 @@ def default_camera(model: mujoco.MjModel, data: mujoco.MjData) -> mujoco.MjvCame
     cam.distance = 13.0 + float(np.linalg.norm(last - first))
     cam.azimuth, cam.elevation = -135.0, -18.0
     return cam
-
-
-def render_frame(model: mujoco.MjModel, data: mujoco.MjData,
-                 camera: mujoco.MjvCamera | None = None,
-                 renderer: mujoco.Renderer | None = None) -> np.ndarray:
-    """An RGB frame (height, width, 3) of the scene as last computed into data. Pass a renderer
-    made once with mujoco.Renderer(model, height, width) when drawing many frames."""
-    own = renderer is None
-    if own:
-        renderer = mujoco.Renderer(model, HEIGHT, WIDTH)
-    try:
-        renderer.update_scene(data, camera or default_camera(model, data), view_option())
-        apply_look(renderer.scene)
-        draw_hydraulics(model, data, renderer.scene)
-        return renderer.render()
-    finally:
-        if own:
-            renderer.close()
 
 
 def write_png(path: Path, rgb: np.ndarray) -> None:
