@@ -11,15 +11,17 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from hma.machine.cylinders import CYLINDER_PINS, PINS, coupler
+from hma.machine.cylinders import PINS, coupler
 from hma.machine.model import machine_prefix
 
 WIDTH, HEIGHT = 1280, 720
+CYLINDERS = {"boom": ("boom_foot", "boom_rod"), "arm": ("arm_head", "arm_rod"),
+             "bucket": ("bucket_head", "coupler")}
 
 
 def _parts() -> list[tuple[str, str, str, str, str]]:
     out = []
-    for name, (base, rod) in CYLINDER_PINS.items():
+    for name, (base, rod) in CYLINDERS.items():
         out.append((f"{name}_barrel", base, base, rod, "paint"))
         out.append((f"{name}_rod", rod, base, rod, "steel"))
     out.append(("side_link", "side_link", "side_link", "coupler", "paint"))
@@ -28,7 +30,7 @@ def _parts() -> list[tuple[str, str, str, str, str]]:
 
 
 PARTS = _parts()
-ALONG_Z = {f"{name}_{piece}" for name in CYLINDER_PINS for piece in ("barrel", "rod")}
+ALONG_Z = {f"{name}_{piece}" for name in CYLINDERS for piece in ("barrel", "rod")}
 
 
 def pin_positions(model: mujoco.MjModel, data: mujoco.MjData, prefix: str) -> dict[str, np.ndarray]:

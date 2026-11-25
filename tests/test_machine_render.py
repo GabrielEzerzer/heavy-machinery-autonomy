@@ -6,9 +6,9 @@ import mujoco
 import numpy as np
 
 from hma.machine import load_scene
-from hma.machine.cylinders import CYLINDER_PINS, H_LINK, SIDE_LINK, cylinder_length
+from hma.machine.cylinders import H_LINK, SIDE_LINK, cylinder_length
 from hma.machine.model import JOINT_NAMES, machine_prefix
-from hma.machine.render import PARTS, draw_hydraulics, pin_positions, view_option
+from hma.machine.render import CYLINDERS, PARTS, draw_hydraulics, pin_positions, view_option
 
 BOOM_PAIR_OFFSET = 0.273
 
@@ -36,7 +36,7 @@ def test_drawn_pins_match_the_cylinder_model():
                 gap = pins[b] - pins[a]
                 return np.linalg.norm(gap - (gap @ axis) * axis)
 
-            for joint, (base, rod) in CYLINDER_PINS.items():
+            for joint, (base, rod) in CYLINDERS.items():
                 q = data.qpos[model.joint(prefix + joint).qposadr[0]]
                 np.testing.assert_allclose(planar(base, rod), cylinder_length(joint, q)[0],
                                            atol=1e-9)
