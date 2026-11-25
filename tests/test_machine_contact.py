@@ -43,8 +43,10 @@ from hma.machine.model import (
     LOAD,
     LOAD_DENSITY,
     MACHINE_SPACING,
+    TRACK_FEET,
     VALVE,
 )
+from hma.machine.render import PARTS
 
 P = machine_prefix(0)
 G = 9.81
@@ -538,6 +540,22 @@ def test_machines_in_one_scene_never_collide_with_each_other():
             if None not in (owner[a], owner[b]) and owner[a] != owner[b]:
                 assert not (model.geom_contype[a] & model.geom_conaffinity[b]
                             or model.geom_contype[b] & model.geom_conaffinity[a])
+
+
+def test_only_contact_shapes_collide_and_drawn_parts_are_no_geom():
+    model = load_scene(2)
+    expected = set()
+    for i in range(2):
+        p = machine_prefix(i)
+        expected |= {f"{p}{link}_{name}" for link, names in PIECES.items() for name in names}
+        expected |= {model.geom(g).name for g in ground_geoms(model, i)}
+        expected |= {model.geom(g).name for g in range(model.ngeom)
+                     if model.geom(g).name.startswith((p + TRACK_FEET, p + LOAD))}
+    colliding = np.flatnonzero((model.geom_contype != 0) | (model.geom_conaffinity != 0))
+    assert {model.geom(g).name for g in colliding} == expected
+    drawn = [model.mesh(machine_prefix(i) + part[0]).id for i in range(2) for part in PARTS]
+    assert not np.isin(model.geom_dataid[model.geom_type == mujoco.mjtGeom.mjGEOM_MESH],
+                       drawn).any()
 
 
 def test_one_machine_working_in_contact_does_not_change_its_neighbour():

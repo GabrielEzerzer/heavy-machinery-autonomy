@@ -110,11 +110,15 @@ GROUND_PIECES = {("base", "belly"), *(("upper", name) for name in PIECES["upper"
 
 @cache
 def link_triangles(link: str) -> np.ndarray:
-    raw = (ASSETS / f"{LINK_MESH[link]}.stl").read_bytes()
-    count = int.from_bytes(raw[80:84], "little")
-    rec = np.frombuffer(raw[84:84 + 50 * count],
-                        dtype=[("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")])
-    return rec["v"].astype(float)
+    verts, faces = [], []
+    for line in (ASSETS / f"{LINK_MESH[link]}.obj").read_text(encoding="ascii").splitlines():
+        kind, *fields = line.split() or [""]
+        if kind == "v":
+            verts.append([float(x) for x in fields[:3]])
+        elif kind == "f":
+            corners = [int(f.split("/")[0]) - 1 for f in fields]
+            faces += [(corners[0], a, b) for a, b in zip(corners[1:], corners[2:], strict=False)]
+    return np.array(verts)[np.array(faces)]
 
 
 def _inside(points: np.ndarray, region: list, tol: float = 1e-7) -> np.ndarray:
