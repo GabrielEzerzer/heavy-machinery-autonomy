@@ -1,34 +1,40 @@
 <mujoco model="excavator_12t">
   <compiler angle="radian" discardvisual="false" />
   <asset>
-    <mesh name="crawler" file="crawler.stl" inertia="convex" />
-    <material name="crawler_paint" rgba="0.18 0.18 0.19 1" />
-    <mesh name="body" file="body.stl" inertia="convex" />
-    <material name="body_paint" rgba="0.93 0.62 0.12 1" />
-    <mesh name="boom" file="boom.stl" inertia="convex" />
-    <material name="boom_paint" rgba="0.93 0.62 0.12 1" />
-    <mesh name="arm" file="arm.stl" inertia="convex" />
-    <material name="arm_paint" rgba="0.93 0.62 0.12 1" />
-    <mesh name="bucket" file="bucket.stl" inertia="convex" />
-    <material name="bucket_paint" rgba="0.30 0.30 0.32 1" />
+    <texture name="zx120" type="2d" file="zx120.png" />
+    <material name="paint" texture="zx120" specular="0.3" shininess="0.35" />
+    <material name="steel" rgba="0.78 0.8 0.82 1" specular="0.9" shininess="0.9" reflectance="0.15" />
+    <mesh name="crawler" file="crawler.obj" inertia="convex" />
+    <mesh name="body" file="body.obj" inertia="convex" />
+    <mesh name="boom" file="boom.obj" inertia="convex" />
+    <mesh name="arm" file="arm.obj" inertia="convex" />
+    <mesh name="bucket" file="bucket.obj" inertia="convex" />
+    <mesh name="boom_barrel" file="boom_barrel.obj" inertia="shell" />
+    <mesh name="boom_rod" file="boom_rod.obj" inertia="shell" />
+    <mesh name="arm_barrel" file="arm_barrel.obj" inertia="shell" />
+    <mesh name="arm_rod" file="arm_rod.obj" inertia="shell" />
+    <mesh name="bucket_barrel" file="bucket_barrel.obj" inertia="shell" />
+    <mesh name="bucket_rod" file="bucket_rod.obj" inertia="shell" />
+    <mesh name="side_link" file="side_link.obj" inertia="shell" />
+    <mesh name="bucket_link" file="bucket_link.obj" inertia="shell" />
   </asset>
   <worldbody>
     <body name="base">
       <freejoint name="base_free" />
-      <geom name="crawler" type="mesh" mesh="crawler" material="crawler_paint" contype="0" conaffinity="0" group="1" />
+      <geom name="crawler" type="mesh" mesh="crawler" material="paint" contype="0" conaffinity="0" group="1" />
       <body name="upper" pos="0 0 1" quat="1 0 0 0">
         <joint name="swing" axis="0 0 1" />
-        <geom name="body" type="mesh" mesh="body" material="body_paint" contype="0" conaffinity="0" group="1" />
+        <geom name="body" type="mesh" mesh="body" material="paint" contype="0" conaffinity="0" group="1" />
         <geom name="counterweight" type="box" pos="-1.91227 -0.0003785 0.381216" size="0.297132 1.3 0.5" contype="0" conaffinity="0" group="3" rgba="0.5 0.5 0.5 0.3" />
         <body name="boom" pos="0.14 -0.16443 0.424" quat="0.707107 0 0.707107 0">
           <joint name="boom" axis="0 1 0" range="-1.2217304764 0.767944870878" />
-          <geom name="boom" type="mesh" mesh="boom" material="boom_paint" contype="0" conaffinity="0" group="1" />
+          <geom name="boom" type="mesh" mesh="boom" material="paint" contype="0" conaffinity="0" group="1" />
           <body name="arm" pos="0 0 4.6" quat="1 0 0 0">
             <joint name="arm" axis="0 1 0" range="0.523598775598 2.65290046303" />
-            <geom name="arm" type="mesh" mesh="arm" material="arm_paint" contype="0" conaffinity="0" group="1" />
+            <geom name="arm" type="mesh" mesh="arm" material="paint" contype="0" conaffinity="0" group="1" />
             <body name="bucket" pos="0 0 2.519" quat="1 0 0 0">
               <joint name="bucket" axis="0 1 0" range="-0.575958653158 2.49582083035" />
-              <geom name="bucket" type="mesh" mesh="bucket" material="bucket_paint" contype="0" conaffinity="0" group="1" />
+              <geom name="bucket" type="mesh" mesh="bucket" material="paint" contype="0" conaffinity="0" group="1" />
               <site name="bucket_tip" pos="0 0 1.23" quat="0.906308 0 0.422618 0" size="0.04" rgba="1 0 0 1" group="2" />
               <site name="bucket_edge_right" pos="0 -0.302377 1.23" quat="0.906308 0 0.422618 0" size="0.03" rgba="1 0 0 1" group="2" />
               <site name="bucket_edge_left" pos="0 0.307646 1.23" quat="0.906308 0 0.422618 0" size="0.03" rgba="1 0 0 1" group="2" />

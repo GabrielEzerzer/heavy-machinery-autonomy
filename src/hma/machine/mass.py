@@ -118,15 +118,18 @@ def track_loop(mass: float, y: float) -> Solid:
 
 
 def _triangles(path: Path) -> np.ndarray:
-    raw = path.read_bytes()
-    count = int.from_bytes(raw[80:84], "little")
-    record = np.dtype([("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")])
-    return np.frombuffer(raw, record, count, 84)["v"].astype(float)
+    verts, faces = [], []
+    for line in path.read_text(encoding="ascii").splitlines():
+        if line.startswith("v "):
+            verts.append([float(v) for v in line.split()[1:4]])
+        elif line.startswith("f "):
+            faces.append([int(c.split("/")[0]) - 1 for c in line.split()[1:4]])
+    return np.asarray(verts)[np.asarray(faces)]
 
 
 @cache
 def _unit_shell(mesh: str) -> Solid:
-    tri = _triangles(ASSETS / f"{mesh}.stl")
+    tri = _triangles(ASSETS / f"{mesh}.obj")
     area = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
     total = area.sum()
     com = (tri.sum(axis=1) * area[:, None]).sum(axis=0) / (3 * total)
