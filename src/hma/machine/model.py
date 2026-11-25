@@ -4,10 +4,13 @@ joints by name; actuator_force is not joint load. set_weld(off) leaves track con
 
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 
 import mujoco
 import numpy as np
+
+from hma.machine.collision import add_collision_geoms
 
 ASSETS = Path(__file__).parent / "assets"
 MACHINE_XML = ASSETS / "excavator.xml"
@@ -43,6 +46,25 @@ MAX_MACHINES = 31
 
 TIMESTEP = 0.005
 SOLVER_TOLERANCE = 1e-14
+CONTACT_SOLREF = (2 * TIMESTEP, 1.0)
+CONTACT_SOLIMP = (0.99, 0.999, 0.001, 0.5, 2.0)
+IMPRATIO = 10.0
+CONTACT_MARGIN = 0.005
+STEEL_FRICTION = (0.5, 0.005, 1e-4)
+LOAD_FRICTION = (0.55, 0.005, 1e-4)
+
+GRAVITY_BODIES = ("boom", "arm", "bucket")
+HOOK = "hook"
+HOOK_POS = (-0.373, 0.0, -0.130)
+LOAD = "load"
+LOAD_CORNER = "load_corner_"
+SLING = "sling_"
+LOAD_DENSITY = 2400.0
+NOMINAL_LOAD_SIZE = (0.535, 0.382, 0.306)
+NOMINAL_LEG_ANGLE = 0.5236
+LOAD_HOME = (7.0, 0.0)
+LOAD_POINTS = "load_point_"
+LOAD_POINT_RADIUS = 0.05
 FRICTION_TENDON = int(mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON)
 
 
@@ -74,7 +96,7 @@ def _turn_reference_to_home(joint: mujoco.MjsJoint, angle: float) -> None:
     joint.ref = angle
 
 
-def _machine_spec(index: int, weld: bool) -> mujoco.MjSpec:
+def _machine_spec(index: int) -> mujoco.MjSpec:
     spec = mujoco.MjSpec.from_file(str(MACHINE_XML))
     for body, mass in LINK_MASSES.items():
         mesh_geom = next(g for g in spec.body(body).geoms if g.type == mujoco.mjtGeom.mjGEOM_MESH)
@@ -82,7 +104,7 @@ def _machine_spec(index: int, weld: bool) -> mujoco.MjSpec:
     spec.geom("counterweight").mass = COUNTERWEIGHT_MASS
     for geom in spec.body("base").geoms:
         if geom.name.startswith(TRACK_FEET):
-            geom.contype = 0 if weld else 1 << index
+            geom.contype = 1 << index
             geom.conaffinity = 0
     for name, home in zip(JOINT_NAMES, HOME_POSE, strict=True):
         joint = spec.joint(name)
@@ -101,7 +123,59 @@ def _machine_spec(index: int, weld: bool) -> mujoco.MjSpec:
         act.set_to_velocity(kv=VALVE_GAIN)
         act.ctrllimited = mujoco.mjtLimited.mjLIMITED_TRUE
         act.ctrlrange = [-SPEED_LIMITS[name], SPEED_LIMITS[name]]
+    add_collision_geoms(spec, 1 << index, CONTACT_SOLREF, CONTACT_SOLIMP, STEEL_FRICTION,
+                        CONTACT_MARGIN)
+    spec.body("bucket").add_site(name=HOOK, pos=list(HOOK_POS), size=[0.04],
+                                 rgba=[0.1, 0.8, 0.1, 1], group=2)
     return spec
+
+
+def box_inertia(mass: float, half: np.ndarray) -> np.ndarray:
+    a, b, c = (2.0 * np.asarray(half, float)) ** 2
+    return mass / 12.0 * np.array([b + c, a + c, a + b])
+
+
+def leg_length(half: np.ndarray, angle: float) -> float:
+    return float(np.hypot(half[0], half[1]) / np.sin(angle))
+
+
+def load_points(half: np.ndarray) -> np.ndarray:
+    inset = np.asarray(half, float) - LOAD_POINT_RADIUS
+    return np.array([np.array(k) * inset for k in itertools.product((-1, 0, 1), repeat=3)
+                     if any(k)])
+
+
+def _add_load(scene: mujoco.MjSpec, index: int, prefix: str, offset: np.ndarray) -> None:
+    half = np.array(NOMINAL_LOAD_SIZE)
+    mass = LOAD_DENSITY * float(np.prod(2.0 * half))
+    body = scene.worldbody.add_body(name=prefix + LOAD, pos=offset + [*LOAD_HOME, half[2]],
+                                    mass=mass, ipos=[0.0, 0.0, 0.0],
+                                    inertia=box_inertia(mass, half).tolist(),
+                                    explicitinertial=True)
+    body.add_freejoint(name=prefix + LOAD)
+    body.add_geom(name=prefix + LOAD, type=mujoco.mjtGeom.mjGEOM_BOX, size=half.tolist(),
+                  mass=0.0, contype=1 << index, conaffinity=1 << index, priority=1,
+                  friction=list(LOAD_FRICTION), solref=list(CONTACT_SOLREF),
+                  solimp=list(CONTACT_SOLIMP), margin=CONTACT_MARGIN, rgba=[0.62, 0.62, 0.6, 1.0])
+    points = body.add_body(name=prefix + LOAD_POINTS)
+    for k, pos in enumerate(load_points(half)):
+        points.add_geom(name=f"{prefix}{LOAD_POINTS}{k}", type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                        size=[LOAD_POINT_RADIUS, 0.0, 0.0], pos=pos.tolist(), mass=0.0,
+                        contype=1 << index, conaffinity=0, priority=1, group=3,
+                        friction=list(LOAD_FRICTION), solref=list(CONTACT_SOLREF),
+                        solimp=list(CONTACT_SOLIMP), margin=CONTACT_MARGIN)
+    scene.add_exclude(bodyname1="world", bodyname2=prefix + LOAD)
+    length = leg_length(half, NOMINAL_LEG_ANGLE)
+    for k, (sx, sy) in enumerate(((1, 1), (-1, 1), (-1, -1), (1, -1))):
+        body.add_site(name=f"{prefix}{LOAD_CORNER}{k}", pos=[sx * half[0], sy * half[1], half[2]],
+                      size=[0.03], group=2)
+        tendon = scene.add_tendon(name=f"{prefix}{SLING}{k}",
+                                  limited=mujoco.mjtLimited.mjLIMITED_FALSE,
+                                  range=[0.0, length], solref_limit=list(CONTACT_SOLREF),
+                                  solimp_limit=list(CONTACT_SOLIMP), width=0.012,
+                                  rgba=[0.15, 0.15, 0.15, 1.0])
+        tendon.wrap_site(prefix + HOOK)
+        tendon.wrap_site(f"{prefix}{LOAD_CORNER}{k}")
 
 
 def _add_ground(scene: mujoco.MjSpec, index: int, prefix: str, offset: np.ndarray) -> None:
@@ -127,6 +201,8 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
     scene.option.timestep = TIMESTEP
     scene.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
     scene.option.tolerance = SOLVER_TOLERANCE
+    scene.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
+    scene.option.impratio = IMPRATIO
     scene.visual.global_.offwidth = 1280
     scene.visual.global_.offheight = 720
     scene.visual.quality.shadowsize = 4096
@@ -141,8 +217,9 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
         prefix = machine_prefix(i)
         offset = np.array([0.0, i * MACHINE_SPACING, 0.0])
         frame = scene.worldbody.add_frame(pos=offset)
-        scene.attach(_machine_spec(i, weld), prefix=prefix, frame=frame)
+        scene.attach(_machine_spec(i), prefix=prefix, frame=frame)
         _add_ground(scene, i, prefix, offset)
+        _add_load(scene, i, prefix, offset)
         scene.worldbody.add_body(name=prefix + ANCHOR, pos=offset, mocap=True)
         scene.add_equality(name=prefix + WELD, type=mujoco.mjtEq.mjEQ_WELD,
                            objtype=mujoco.mjtObj.mjOBJ_BODY, name1=prefix + "base",
@@ -153,6 +230,10 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
     flat = np.zeros(ground_shape())
     for i in range(n_machines):
         write_ground(model, i, flat)
+        if weld:
+            tracks = [g for g in range(model.ngeom)
+                      if model.geom(g).name.startswith(machine_prefix(i) + TRACK_FEET)]
+            model.geom_contype[tracks] = 0
     return model
 
 
