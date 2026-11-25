@@ -1,4 +1,5 @@
-"""Scripted motion of the 12 t class excavator through its joint ranges in the interactive viewer.
+"""Scripted motion of the 12 t class excavator through its joint ranges in the interactive viewer,
+driven by valve commands through the nominal hydraulics.
 Usage: python -m hma.machine.demo [--machines N]"""
 
 from __future__ import annotations
@@ -11,14 +12,9 @@ from collections.abc import Iterator
 import mujoco
 import numpy as np
 
-from hma.machine.model import (
-    HOME_KEY,
-    HOME_POSE,
-    JOINT_NAMES,
-    MACHINE_SPACING,
-    load_scene,
-    machine_prefix,
-)
+from hma.hydraulics import NOMINAL, Hydraulics
+from hma.hydraulics.circuit import valve_opening
+from hma.machine.model import HOME_POSE, MACHINE_SPACING, load_scene
 
 WAYPOINTS = np.array([
     HOME_POSE,
@@ -33,27 +29,30 @@ WAYPOINTS = np.array([
 ])
 SPEEDS = np.array([0.6, 0.3, 0.6, 0.8])
 GAIN = 2.0
+RAMP = 0.02
 TOLERANCE = 0.01
 CONTROL_PERIOD = 0.1
-WAYPOINT_TIMEOUT = 20.0
+WAYPOINT_TIMEOUT = 30.0
 
 
 def motion(model: mujoco.MjModel, data: mujoco.MjData, n_machines: int) -> Iterator[int]:
-    acts = np.array([[model.actuator(machine_prefix(i) + j).id for j in JOINT_NAMES]
-                     for i in range(n_machines)])
-    qpos = np.array([[model.joint(machine_prefix(i) + j).qposadr[0] for j in JOINT_NAMES]
-                     for i in range(n_machines)])
-    control_steps = round(CONTROL_PERIOD / model.opt.timestep)
-    mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
-    mujoco.mj_forward(model, data)
+    layer = Hydraulics(model, data, [NOMINAL] * n_machines, control_hz=1.0 / CONTROL_PERIOD)
+    for index in range(n_machines):
+        layer.reset(index, NOMINAL, HOME_POSE)
     for index, target in enumerate(WAYPOINTS[1:], start=1):
         deadline = data.time + WAYPOINT_TIMEOUT
-        while np.abs(data.qpos[qpos] - target).max() > TOLERANCE and data.time < deadline:
-            error = target - data.qpos[qpos]
-            data.ctrl[acts] = np.clip(GAIN * error, -SPEEDS, SPEEDS)
-            mujoco.mj_step(model, data, control_steps)
+        while data.time < deadline:
+            seen = layer.observe()
+            error = target - seen.positions
+            if np.abs(error).max() <= TOLERANCE:
+                break
+            speed = np.clip(GAIN * error, -SPEEDS, SPEEDS)
+            rows = zip(seen.positions, speed, seen.pressures, strict=True)
+            layer.act(np.array([np.sign(s) * valve_opening(q, s, p, RAMP) for q, s, p in rows]))
+            for _ in range(layer.steps_per_decision):
+                layer.step()
             yield index
-    data.ctrl[:] = 0.0
+    layer.act(np.zeros((n_machines, len(HOME_POSE))))
 
 
 def main() -> None:

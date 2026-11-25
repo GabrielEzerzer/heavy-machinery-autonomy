@@ -4,9 +4,9 @@ import mujoco
 import numpy as np
 import pytest
 
+from hma.hydraulics import NOMINAL, Hydraulics
 from hma.machine import (
     BODY_NAMES,
-    FORCE_CAPS,
     GROUND,
     HOME_KEY,
     HOME_POSE,
@@ -23,7 +23,7 @@ from hma.machine import (
     set_weld,
     write_ground,
 )
-from hma.machine.model import GROUND_DEPTH, SPEED_LIMITS, VALVE
+from hma.machine.model import GROUND_DEPTH
 
 SOURCE_LIMITS_DEG = {"boom": (-70.0, 44.0), "arm": (30.0, 152.0), "bucket": (-33.0, 143.0)}
 
@@ -65,14 +65,33 @@ def push_base(model, data, index, force, seconds):
     data.xfrc_applied[body] = 0.0
 
 
+LAYERS = {}
+
+
+def held(model, data):
+    layer = LAYERS.get(id(data))
+    if layer is None or layer.data is not data:
+        count = sum(model.body(i).name.endswith("/base") for i in range(model.nbody))
+        qpos, qvel = data.qpos.copy(), data.qvel.copy()
+        poses = [joint_angles(model, data, index) for index in range(count)]
+        layer = Hydraulics(model, data, [NOMINAL] * count)
+        for index, pose in enumerate(poses):
+            layer.reset(index, NOMINAL, pose)
+        data.qpos[:], data.qvel[:] = qpos, qvel
+        mujoco.mj_forward(model, data)
+        LAYERS[id(data)] = layer
+    return layer
+
+
 def settle(model, data, seconds=1.0, payload=0.0):
+    layer = held(model, data)
     tip, bucket = model.site(machine_prefix(0) + TIP_SITE).id, model.body("m0/bucket").id
     for _ in range(round(seconds / model.opt.timestep)):
         if payload:
             data.qfrc_applied[:] = 0.0
             mujoco.mj_applyFT(model, data, np.array([0.0, 0.0, -9.81 * payload]), np.zeros(3),
                               data.site_xpos[tip].copy(), bucket, data.qfrc_applied)
-        mujoco.mj_step(model, data)
+        layer.step()
 
 
 def test_total_mass_in_operating_weight_band():
@@ -92,17 +111,16 @@ def test_joint_limits_match_source():
     assert not model.joint(machine_prefix(0) + "swing").limited
 
 
-def test_every_driven_joint_has_a_speed_valve_capped_at_its_force_limit():
+def test_every_driven_joint_has_an_unlimited_torque_motor_on_the_joint():
     model = load_scene(1)
     prefix = machine_prefix(0)
     for name in JOINT_NAMES:
         act = model.actuator(prefix + name)
-        assert act.trnid[0] == model.joint(prefix + name + VALVE).id
-        np.testing.assert_allclose(act.ctrlrange, [-SPEED_LIMITS[name], SPEED_LIMITS[name]])
-        tendon = model.tendon(prefix + name + VALVE).id
-        assert model.tendon_frictionloss[tendon] == FORCE_CAPS[name]
-        start, count = model.tendon_adr[tendon], model.tendon_num[tendon]
-        assert model.joint(prefix + name).id in model.wrap_objid[start:start + count]
+        assert act.trntype == mujoco.mjtTrn.mjTRN_JOINT
+        assert act.trnid[0] == model.joint(prefix + name).id
+        assert act.gainprm[0] == 1.0 and not act.biasprm.any()
+        assert not act.ctrllimited and not act.forcelimited
+    assert model.ntendon == 0
 
 
 def test_names_are_prefixed_per_machine():

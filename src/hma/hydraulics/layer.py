@@ -1,6 +1,6 @@
-"""The hydraulics layer: valve commands in [-1, 1] at the control rate become joint speed commands
-at the physics rate, and the true joint state becomes delayed, noisy sensor readings. One layer
-serves every machine in a scene; machine i is the one named with machine_prefix(i)."""
+"""The hydraulics layer: valve commands in [-1, 1] at the control rate move the spools, two pumps
+and the oil in every chamber push the joints, and the true state becomes delayed, noisy sensor
+readings. One layer serves every machine in a scene; machine i is named machine_prefix(i)."""
 
 from __future__ import annotations
 
@@ -10,27 +10,15 @@ from typing import NamedTuple
 import mujoco
 import numpy as np
 
-from hma.hydraulics.params import (
-    CURVE_SEGMENTS,
-    NOMINAL_SPEEDS,
-    NOMINAL_SUPPLY,
-    PUMP_RESPONSE,
-    RANGES,
-    Machine,
-)
-from hma.machine import (
-    BODY_NAMES,
-    HOME_KEY,
-    JOINT_NAMES,
-    VALVE,
-    load_scene,
-    machine_prefix,
-    tendon_friction,
-)
+from hma.hydraulics import circuit as c
+from hma.hydraulics.params import CURVE_SEGMENTS, RANGES, Machine
+from hma.machine import BODY_NAMES, HOME_KEY, JOINT_NAMES, load_scene, machine_prefix
 from hma.machine.model import COUNTERWEIGHT_MASS
 
 CONTROL_HZ = 10.0
 JOINTS = len(JOINT_NAMES)
+NODES = c.PUMPS + 2 * JOINTS
+SWING = JOINT_NAMES.index("swing")
 COUNTERWEIGHT = "counterweight"
 UPPER = BODY_NAMES.index("upper")
 JOINT_SIZES = {int(mujoco.mjtJoint.mjJNT_FREE): (7, 6), int(mujoco.mjtJoint.mjJNT_BALL): (4, 3)}
@@ -39,7 +27,7 @@ JOINT_SIZES = {int(mujoco.mjtJoint.mjJNT_FREE): (7, 6), int(mujoco.mjtJoint.mjJN
 class Observation(NamedTuple):
     positions: np.ndarray
     velocities: np.ndarray
-    loads: np.ndarray
+    pressures: np.ndarray
 
 
 class _Solid(NamedTuple):
@@ -79,10 +67,45 @@ def _counterweight_solid(model: mujoco.MjModel) -> _Solid:
     geom = model.geom(machine_prefix(0) + COUNTERWEIGHT).id
     if model.geom_type[geom] != mujoco.mjtGeom.mjGEOM_BOX:
         raise ValueError("the counterweight must be a box")
-    a, b, c = model.geom_size[geom]
-    local = COUNTERWEIGHT_MASS / 3.0 * np.diag([b * b + c * c, a * a + c * c, a * a + b * b])
+    a, b, c_ = model.geom_size[geom]
+    local = COUNTERWEIGHT_MASS / 3.0 * np.diag([b * b + c_ * c_, a * a + c_ * c_, a * a + b * b])
     rot = _quat_matrix(model.geom_quat[geom])
     return _Solid(COUNTERWEIGHT_MASS, model.geom_pos[geom].copy(), rot @ local @ rot.T)
+
+
+ORIFICES = slice(0, len(c.ORIFICES))
+RELIEFS = slice(len(c.ORIFICES), len(c.ORIFICES) + len(c.RELIEFS))
+LEAKS = slice(len(c.ORIFICES) + len(c.RELIEFS), len(c.INCIDENCE))
+DROPS = c.INCIDENCE.T.copy()
+NODE_INCIDENCE = c.INCIDENCE[:, :NODES].copy()
+NODE_DROPS = NODE_INCIDENCE.T.copy()
+INFLOW = -NODE_INCIDENCE
+DISPLACEMENT = np.zeros((NODES, JOINTS))
+DISPLACEMENT[c.PUMPS::2, :] = -np.diag(c.AREA[:, 0])
+DISPLACEMENT[c.PUMPS + 1::2, :] = np.diag(c.AREA[:, 1])
+DISPLACEMENT_T = DISPLACEMENT.T.copy()
+DEMAND_MAP = np.concatenate([c.TABLES["demand"][0] - c.TABLES["demand"][1],
+                             c.TABLES["demand"][1]])
+SYSTEM_MAP = np.concatenate([
+    np.einsum("ei,ej->eij", NODE_INCIDENCE, NODE_INCIDENCE).reshape(len(c.INCIDENCE), -1),
+    np.eye(NODES * NODES)[::NODES + 1]])
+MASK_EXTEND, MASK_RETRACT = c.DEMAND_MASK
+PLAY_CLOSED = 1.0 - 1e-9
+IDENTITY = np.eye(NODES)
+VOLUME_SLOPE = np.stack([c.STROKE_AREA[:, 0], -c.STROKE_AREA[:, 1]], axis=-1)
+VOLUME_CONSTANT = np.stack([-c.STROKE_AREA[:, 0] * c.STROKE[:, 0],
+                            c.STROKE_AREA[:, 1] * c.STROKE[:, 1]], axis=-1)
+
+
+def _softplus(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    return np.logaddexp(0.0, x), 0.5 * (1.0 + np.tanh(0.5 * x))
+
+
+def _one_way(gain: np.ndarray, drop: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    x = np.maximum(drop, 0.0)
+    shifted = x + c.ROOT_SMOOTHING
+    chord = gain * x / (shifted * np.sqrt(shifted))
+    return chord * x, chord
 
 
 class Hydraulics:
@@ -101,16 +124,15 @@ class Hydraulics:
         self.steps_per_decision = round(steps)
         self.control_hz = control_hz
 
-        def ids(kind, suffix=""):
-            return np.array([[kind(machine_prefix(i) + j + suffix).id for j in JOINT_NAMES]
-                             for i in range(self.n)])
+        def joint_field(field):
+            return np.array([[getattr(model.joint(machine_prefix(i) + j), field)[0]
+                              for j in JOINT_NAMES] for i in range(self.n)])
 
-        self._qpos = np.array([[model.joint(machine_prefix(i) + j).qposadr[0]
-                                for j in JOINT_NAMES] for i in range(self.n)])
-        self._qvel = np.array([[model.joint(machine_prefix(i) + j).dofadr[0]
-                                for j in JOINT_NAMES] for i in range(self.n)])
-        self._actuators = ids(model.actuator)
-        self._tendons = ids(model.tendon, VALVE)
+        self._qpos = joint_field("qposadr")
+        self._qvel = joint_field("dofadr")
+        self._actuators = np.array([[model.actuator(machine_prefix(i) + j).id
+                                     for j in JOINT_NAMES] for i in range(self.n)])
+        self._swing_dofs = self._qvel[:, SWING].copy()
         self._bodies = np.array([[model.body(machine_prefix(i) + b).id for b in BODY_NAMES]
                                  for i in range(self.n)])
         self._own_joints = [[j for j in range(model.njnt)
@@ -126,46 +148,72 @@ class Hydraulics:
         ]
         self._counterweight = _counterweight_solid(reference)
         self._scratch = mujoco.MjData(model)
+        self._base_armature = model.dof_armature[self._qvel].copy()
 
         delay_cap = max([RANGES["delay"][1], *(float(np.max(m.delay)) for m in machines)])
         latency_cap = max([RANGES["sensor_latency"][1], *(m.sensor_latency for m in machines)])
         self._command_len = round(delay_cap / self.dt) + 1
         self._sensor_len = round(latency_cap / self.dt) + 1
-        shape = (self.n, JOINTS)
+        n, shape = self.n, (self.n, JOINTS)
         self._commands = np.zeros((self._command_len, *shape))
         self._command_flat = self._commands.reshape(-1)
         self._delay_index = np.zeros((self._command_len, *shape), np.intp)
-        self._sensors = np.zeros((self._sensor_len, 3, *shape))
+        self._sensors = np.zeros((self._sensor_len, 4, *shape))
         self._command_head = 0
         self._sensor_head = 0
         self._held = np.zeros(shape)
+        self._moving = np.zeros(n, bool)
         self._spool = np.zeros(shape)
-        self._play = np.zeros(shape)
-        self._segment_base = np.arange(self.n * JOINTS).reshape(shape) * CURVE_SEGMENTS
-        self._inv_nominal_speed = 1.0 / np.array([NOMINAL_SPEEDS[j] for j in JOINT_NAMES])
+        self._segment_base = np.arange(n * JOINTS).reshape(shape) * CURVE_SEGMENTS
 
         self.machines = list(machines)
         self._alpha = np.ones(shape)
         self._deadband = np.zeros(shape)
         self._open_scale = np.ones(shape)
-        self._intercept = np.zeros(self.n * JOINTS * CURVE_SEGMENTS)
-        self._slope = np.zeros(self.n * JOINTS * CURVE_SEGMENTS)
+        self._intercept = np.zeros(n * JOINTS * CURVE_SEGMENTS)
+        self._slope = np.zeros(n * JOINTS * CURVE_SEGMENTS)
         self._gain = np.ones(shape)
-        self._speed_limit = np.ones(shape)
-        self._force_limit = np.ones(shape)
-        self._inv_force_limit = np.ones(shape)
-        self._force = np.zeros(shape)
-        self._ratio = np.ones(self.n)
-        self._ratio_rate = self.dt / PUMP_RESPONSE
-        self._power = np.ones(self.n)
+        self._spool_flow = np.ones(shape)
+        self._pump_max = np.ones(n)
+        self._power = np.ones(n)
+        self._relief = np.ones((n, len(c.RELIEFS)))
+        self._volume0 = np.ones((n, JOINTS, 2))
+        self._pump_volume = np.ones(n)
+        self._inv_bulk = np.ones(n)
+        self._inv_bulk_dt = np.ones((n, 1))
+        self._leakage = np.zeros((n, len(c.LEAKS)))
+        self._joint = np.arange(JOINTS)
+        self._valve = np.zeros((n, 2 * c.OPENINGS))
+        self._valve[:, -1] = 1.0
+        self._demand_in = np.zeros((n, 2 * JOINTS))
+        self._nodes = np.full((n, NODES + 1), c.TANK_PRESSURE)
+        self._edge_flow = np.zeros((n, len(c.INCIDENCE)))
+        self._weights = np.ones((n, len(c.INCIDENCE) + NODES))
+        self._edge_slope = self._weights[:, :len(c.INCIDENCE)]
+        self._capacity = self._weights[:, len(c.INCIDENCE):]
+        self._edge_slope[:] = 0.0
+        self._brake = np.zeros(n)
         self._half_play = np.zeros(shape)
-        self._flow = np.ones(self.n)
-        self._latency_steps = np.zeros(self.n, np.intp)
-        self._noise = np.zeros((3, self.n, 1))
-        self._noise_draws = np.zeros((self.n, self.steps_per_decision, 3, JOINTS))
-        self._noise_cursor = np.zeros(self.n, np.intp)
-        self._machine_index = np.arange(self.n)
-        self._rngs: list[np.random.Generator | None] = [None] * self.n
+        self._latency_steps = np.zeros(n, np.intp)
+        self._noise = np.zeros((4, n, 1))
+        self._offset = np.zeros((n, JOINTS, 2))
+        self._noise_draws = np.zeros((n, self.steps_per_decision, 4, JOINTS))
+        self._noise_cursor = np.zeros(n, np.intp)
+        self._machine_index = np.arange(n)
+        self._rngs: list[np.random.Generator | None] = [None] * n
+
+        self._pressure = np.zeros((n, NODES))
+        self._pump = np.zeros((n, c.PUMPS))
+        self._gap = np.zeros(shape)
+        self._rod_speed = np.zeros(shape)
+        self._cavity = np.zeros((n, NODES))
+        self._neutral = np.zeros(n)
+        self._rhs = np.zeros((n, NODES, 1 + JOINTS))
+        self._rhs[:, :, 1:] = DISPLACEMENT
+        self.pump_energy = np.zeros(n)
+        self.lost_energy = np.zeros(n)
+        self.work_energy = np.zeros(n)
+        self.pump_power = np.zeros(n)
         for i, machine in enumerate(machines):
             self.reset(i, machine)
 
@@ -183,26 +231,33 @@ class Hydraulics:
             raise ValueError("delay longer than this layer's command buffer")
         if machine.sensor_latency > (self._sensor_len - 1) * self.dt + 1e-12:
             raise ValueError("sensor latency longer than this layer's sensor buffer")
-        if np.any(machine.lag <= 0) or machine.flow <= 0:
-            raise ValueError("lag and flow must be positive")
+        if np.any(machine.lag <= 0):
+            raise ValueError("lag must be positive")
         if np.any(machine.deadband < 0) or np.any(machine.deadband >= 1):
             raise ValueError("deadband must be at least 0 and below 1")
-        if np.any(machine.gain <= 0) or np.any(machine.speed_limit <= 0):
-            raise ValueError("gain and speed limits must be positive")
+        if np.any(machine.gain <= 0) or np.any(machine.spool_flow <= 0):
+            raise ValueError("gain and spool flow must be positive")
+        if machine.pump_flow <= 0 or machine.power <= 0:
+            raise ValueError("pump flow and power must be positive")
+        if machine.main_relief <= c.STANDBY_PRESSURE or np.any(machine.port_relief <= 0):
+            raise ValueError("relief pressures must be positive and above standby")
+        if machine.bulk_modulus <= 0 or machine.pump_volume <= 0 or np.any(
+                machine.dead_volume <= 0):
+            raise ValueError("bulk modulus and oil volumes must be positive")
+        if np.any(machine.leakage < 0) or machine.brake < 0:
+            raise ValueError("leakage and brake torque must not be negative")
         if np.any(machine.backlash < 0):
             raise ValueError("backlash must not be negative")
         if np.any(machine.link_mass <= 0) or machine.counterweight <= 0:
             raise ValueError("link mass and counterweight factors must be positive")
-        if min(machine.position_noise, machine.velocity_noise, machine.load_noise) < 0:
+        if min(machine.position_noise, machine.velocity_noise, machine.pressure_noise) < 0:
             raise ValueError("sensor noise must not be negative")
-        if np.any(machine.speed_limit > self.model.actuator_ctrlrange[self._actuators[index], 1]):
-            raise ValueError("a speed limit exceeds what the joint's actuator accepts")
-        if np.any(machine.force_limit <= 0) or machine.power <= 0:
-            raise ValueError("force limits and power must be positive")
         if machine.curve.shape != (JOINTS, CURVE_SEGMENTS + 1):
             raise ValueError(f"curve must have shape {(JOINTS, CURVE_SEGMENTS + 1)}")
         if np.any(np.diff(machine.curve, axis=1) < 0):
             raise ValueError("the valve curve must not fall as the spool opens")
+        if machine.port_relief.shape != (JOINTS, 2) or machine.leakage.shape != (JOINTS, 2):
+            raise ValueError(f"port reliefs and leakage must have shape {(JOINTS, 2)}")
         self.machines[index] = machine
         delay_steps = np.round(machine.delay / self.dt).astype(np.intp)
         heads = np.arange(self._command_len)[:, None]
@@ -217,25 +272,36 @@ class Hydraulics:
         self._intercept[segments] = (machine.curve[:, :-1]
                                      - np.arange(CURVE_SEGMENTS) * slope).ravel()
         self._gain[index] = machine.gain
-        self._speed_limit[index] = machine.speed_limit
-        self._force_limit[index] = machine.force_limit
-        self._inv_force_limit[index] = 1.0 / machine.force_limit
-        self._power[index] = machine.power
+        self._spool_flow[index] = machine.spool_flow
+        self._pump_max[index] = c.PUMP_FLOW * machine.pump_flow
+        self._power[index] = machine.power * c.PUMP_EFFICIENCY
+        self._relief[index] = np.r_[machine.port_relief.ravel(),
+                                    np.full(c.PUMPS, machine.main_relief)]
+        self._volume0[index] = machine.dead_volume + VOLUME_CONSTANT
+        self._pump_volume[index] = machine.pump_volume
+        self._inv_bulk[index] = 1.0 / machine.bulk_modulus
+        self._inv_bulk_dt[index] = 1.0 / (machine.bulk_modulus * self.dt)
+        self._capacity[index, :c.PUMPS] = machine.pump_volume * self._inv_bulk_dt[index]
+        self._leakage[index] = machine.leakage.ravel()
+        self._brake[index] = machine.brake
         self._half_play[index] = machine.backlash / 2.0
-        self._flow[index] = machine.flow * NOMINAL_SUPPLY
         self._latency_steps[index] = round(machine.sensor_latency / self.dt)
         self._noise[:, index, 0] = (machine.position_noise, machine.velocity_noise,
-                                    machine.load_noise)
+                                    machine.pressure_noise, machine.pressure_noise)
+        self._offset[index] = machine.pressure_offset
         self._rngs[index] = np.random.default_rng((machine.seed, 1))
         self._noise_cursor[index] = 0
 
-        self.model.tendon_frictionloss[self._tendons[index]] = machine.force_limit
         self._apply_mass(index, machine)
+        armature = self.model.dof_armature[self._qvel]
+        self.model.dof_armature[self._qvel] = self._base_armature
         mujoco.mj_setConst(self.model, self._scratch)
+        self.model.dof_armature[self._qvel] = armature
+        self.model.dof_armature[self._qvel[index]] = self._base_armature[index]
         self._reset_state(index, pose)
 
     def _draw_noise(self, index: int) -> None:
-        shape = (self.steps_per_decision, 3, JOINTS)
+        shape = (self.steps_per_decision, 4, JOINTS)
         self._noise_draws[index] = self._rngs[index].uniform(-1.0, 1.0, shape)
 
     def _apply_mass(self, index: int, machine: Machine) -> None:
@@ -283,13 +349,33 @@ class Hydraulics:
         data.ctrl[self._actuators[index]] = 0.0
         self._commands[:, index] = 0.0
         self._held[index] = 0.0
+        self._moving[index] = False
         self._spool[index] = 0.0
-        self._play[index] = 0.0
         mujoco.mj_forward(model, data)
-        first = np.stack(self.true_state())[:, index]
-        self._force[index] = first[2] * self._force_limit[index]
-        self._ratio[index] = 1.0
+        _, lever = c.geometry(data.qpos[self._qpos[index]])
+        force = data.qfrc_bias[self._qvel[index]] / lever
+        force[SWING] = 0.0
+        area = c.AREA
+        head = np.maximum(force, 0.0) / area[:, 0] + c.TANK_PRESSURE * area[:, 1] / area[:, 0]
+        rod = np.maximum(-force, 0.0) / area[:, 1] + c.TANK_PRESSURE * area[:, 0] / area[:, 1]
+        chambers = np.where(force[:, None] >= 0.0, np.c_[head, np.full(JOINTS, c.TANK_PRESSURE)],
+                            np.c_[np.full(JOINTS, c.TANK_PRESSURE), rod])
+        chambers[SWING] = c.TANK_PRESSURE
+        self._pressure[index, :c.PUMPS] = c.STANDBY_PRESSURE
+        self._pressure[index, c.PUMPS:] = chambers.ravel()
+        self._pump[index] = c.STANDBY_FLOW
+        self._gap[index] = np.where(force >= 0.0, 1.0, -1.0)
+        self._rod_speed[index] = 0.0
+        self._cavity[index] = 0.0
+        self._neutral[index] = c.BRAKE_DELAY
+        self.pump_energy[index] = 0.0
+        self.lost_energy[index] = 0.0
+        self.work_energy[index] = 0.0
+        self.pump_power[index] = 0.0
+        self.model.dof_frictionloss[self._swing_dofs[index]] = self._brake[index]
+        first = self._true_rows()[:, index]
         first += self._rngs[index].uniform(-1.0, 1.0, first.shape) * self._noise[:, index]
+        self._clip_pressure_rows(first)
         self._sensors[:, :, index] = first
 
     def act(self, commands: np.ndarray) -> None:
@@ -297,8 +383,9 @@ class Hydraulics:
         if commands.shape != (self.n, JOINTS) or not np.all(np.isfinite(commands)):
             raise ValueError(f"commands must be finite with shape {(self.n, JOINTS)}")
         self._held = np.clip(commands, -1.0, 1.0)
+        self._moving = np.any(self._held != 0.0, axis=1)
 
-    def joint_speed_commands(self) -> np.ndarray:
+    def _openings(self) -> np.ndarray:
         head = self._command_head = (self._command_head + 1) % self._command_len
         self._commands[head] = self._held
         spool = self._spool
@@ -307,51 +394,170 @@ class Hydraulics:
         opening *= self._open_scale
         segment = np.minimum(opening.astype(np.intp), CURVE_SEGMENTS - 1)
         segment += self._segment_base
-        speed = self._slope[segment] * opening
-        speed += self._intercept[segment]
-        speed *= self._gain
-        np.minimum(speed, 1.0, out=speed)
-        speed *= self._speed_limit
-        demand = (speed * self._inv_nominal_speed).sum(axis=1)
-        speed *= np.minimum(1.0, self._flow / np.maximum(demand, 1e-12))[:, None]
-        np.copysign(speed, spool, out=speed)
-        power = np.maximum(self._force * speed, 0.0).sum(axis=1)
-        error = 1.0 - self._ratio * power / self._power
-        self._ratio = np.minimum(self._ratio + self._ratio_rate * error, 1.0)
-        speed *= self._ratio[:, None]
-        drive = speed * self.dt
-        drive += self._play
-        self._play = np.minimum(np.maximum(drive, -self._half_play), self._half_play)
-        drive -= self._play
-        drive /= self.dt
-        return drive
+        area = self._slope[segment] * opening
+        area += self._intercept[segment]
+        area *= self._gain
+        np.minimum(area, 1.0, out=area)
+        return area
 
     def step(self) -> None:
-        self.data.ctrl[self._actuators] = self.joint_speed_commands()
-        mujoco.mj_step(self.model, self.data)
+        n, dt, data = self.n, self.dt, self.data
+        area = self._openings()
+        extend = self._spool * c.JOINT_SIGN > 0.0
+        wide = extend[..., None]
+        q = data.qpos[self._qpos]
+        qd = data.qvel[self._qvel]
+        length, lever = c.geometry(q)
+        pressure = self._pressure
+
+        self._demand_in[:, :JOINTS] = area * extend
+        self._demand_in[:, JOINTS:] = area
+        demand = self._demand_in @ DEMAND_MAP
+        cap = self._power / np.maximum(pressure[:, :c.PUMPS].sum(1), 1.0)
+        target = np.minimum(np.maximum(demand, c.STANDBY_FLOW),
+                            np.minimum(self._pump_max, cap)[:, None])
+        self._pump += (dt / c.PUMP_RESPONSE) * (target - self._pump)
+
+        valve = self._valve
+        opening = valve[:, c.OPENINGS:]
+        opening[:, :JOINTS] = area * self._spool_flow
+        opening[:, c.OPEN_BYPASS:c.OPEN_ALWAYS] = 1.0 - (
+            np.where(wide, MASK_EXTEND, MASK_RETRACT) * area[..., None]).max(1)
+        valve[:, :JOINTS] = opening[:, :JOINTS] * extend
+        gain = valve @ c.GAIN_MAP
+        self._nodes[:, :NODES] = pressure
+        drop = self._nodes @ DROPS
+        flow, slope = self._edge_flow, self._edge_slope
+        flow[:, ORIFICES], slope[:, ORIFICES] = _one_way(gain, drop[:, ORIFICES])
+        knee, opened = _softplus((drop[:, RELIEFS] - self._relief) * (1.0 / c.RELIEF_KNEE))
+        flow[:, RELIEFS] = knee * (c.RELIEF_SLOPE * c.RELIEF_KNEE)
+        slope[:, RELIEFS] = opened * c.RELIEF_SLOPE
+        flow[:, LEAKS] = self._leakage * drop[:, LEAKS]
+        slope[:, LEAKS] = self._leakage
+
+        inflow = flow @ INFLOW
+        inflow[:, :c.PUMPS] += self._pump
+        volume = np.maximum(self._volume0 + VOLUME_SLOPE * length[..., None], 1e-6)
+        self._capacity[:, c.PUMPS:] = volume.reshape(n, -1) * self._inv_bulk_dt
+        system = (self._weights @ SYSTEM_MAP).reshape(n, NODES, NODES)
+        self._rhs[:, :, 0] = inflow
+        solved = np.linalg.solve(system, self._rhs)
+        response = DISPLACEMENT_T @ solved
+        force_now = -(pressure @ DISPLACEMENT)
+        held = force_now - response[..., 0]
+        coupling = response[..., 1:]
+
+        rod = lever * qd
+        play = self._half_play * np.abs(lever)
+        force_next = held - (coupling @ rod[..., None])[..., 0]
+        contact = (play == 0.0) | ((np.abs(self._gap) >= PLAY_CLOSED)
+                                   & (self._gap * force_next >= 0.0))
+        guess = np.where(contact, rod, self._rod_speed)
+        diag = coupling[:, self._joint, self._joint]
+        others = (coupling @ guess[..., None])[..., 0] - diag * guess
+        free_speed = (held - others) / diag
+        per_play = np.divide(dt, play, out=np.zeros_like(play), where=play > 0.0)
+        reach = self._gap + (free_speed - rod) * per_play
+        closing = ~contact & (np.abs(reach) >= 1.0)
+        contact |= closing
+        self._gap = np.where(closing, np.sign(reach), self._gap)
+
+        stiff = np.where(contact, diag * lever * lever, 0.0)
+        data.ctrl[self._actuators] = np.where(contact, lever * (held - others), 0.0) - stiff * qd
+        self.model.dof_armature[self._qvel] = self._base_armature + stiff * dt
+        self._neutral = np.where(self._moving, 0.0, self._neutral + dt)
+        self.model.dof_frictionloss[self._swing_dofs] = np.where(
+            self._neutral >= c.BRAKE_DELAY, self._brake, 0.0)
+
+        mujoco.mj_step(self.model, data)
+
+        joint_rod = lever * data.qvel[self._qvel]
+        room = play * (1.0 / dt)
+        free_speed = np.minimum(np.maximum(free_speed, joint_rod - room * (1.0 + self._gap)),
+                                joint_rod + room * (1.0 - self._gap))
+        speed = np.where(contact, joint_rod, free_speed)
+        self._rod_speed = free_speed
+        change = solved[..., 0] + (solved[..., 1:] @ speed[..., None])[..., 0]
+        fixed = (pressure + change < c.CAVITATION_PRESSURE) | (self._cavity > 0.0)
+        if fixed.any():
+            self._cavitate(system, inflow, speed, change, fixed)
+        pressure += change
+        used = flow + slope * (change @ NODE_DROPS)
+        self.lost_energy += (used * (pressure @ NODE_DROPS)).sum(1) * dt
+        self.work_energy += (speed * (pressure @ DISPLACEMENT)).sum(1) * -dt
+        gap = self._gap + np.where(contact, 0.0, (free_speed - joint_rod) * per_play)
+        self._gap = np.minimum(np.maximum(gap, -1.0, out=gap), 1.0, out=gap)
+        self.pump_power = (pressure[:, :c.PUMPS] * self._pump).sum(1)
+        self.pump_energy += self.pump_power * dt
+
         self._sensor_head = (self._sensor_head + 1) % self._sensor_len
         reading = self._sensors[self._sensor_head]
-        self._read_into(reading)
-        np.multiply(reading[2], self._force_limit, out=self._force)
+        self._true_rows(reading)
         cursor = self._noise_cursor
-        for i in np.flatnonzero(cursor == 0):
-            self._draw_noise(i)
+        due = cursor == 0
+        if due.any():
+            for i in np.flatnonzero(due):
+                self._draw_noise(i)
         reading += self._noise_draws[self._machine_index, cursor].transpose(1, 0, 2) * self._noise
+        self._clip_pressure_rows(reading)
         cursor += 1
         cursor[cursor == self.steps_per_decision] = 0
 
-    def _read_into(self, out: np.ndarray) -> None:
-        data = self.data
-        out[0] = data.qpos[self._qpos]
-        out[1] = data.qvel[self._qvel]
-        out[2] = tendon_friction(data, self._tendons) * self._inv_force_limit
+    def _cavitate(self, system: np.ndarray, inflow: np.ndarray, speed: np.ndarray,
+                  change: np.ndarray, fixed: np.ndarray) -> None:
+        rows = np.flatnonzero(fixed.any(axis=1))
+        matrix, held = system[rows], fixed[rows]
+        demand = inflow[rows] + speed[rows] @ DISPLACEMENT_T
+        floor = c.CAVITATION_PRESSURE - self._pressure[rows]
+        cavity = self._cavity[rows]
+        for _ in range(NODES):
+            delta = np.linalg.solve(np.where(held[..., None], IDENTITY, matrix),
+                                    np.where(held, floor, demand)[..., None])[..., 0]
+            missing = ((matrix @ delta[..., None])[..., 0] - demand) * self.dt
+            refilled = held & (cavity + missing < 0.0) & (delta > floor)
+            if not refilled.any():
+                break
+            held &= ~refilled
+        grown = np.where(held, cavity + missing, 0.0)
+        self.lost_energy[rows] += (c.CAVITATION_PRESSURE * (grown - cavity)).sum(1)
+        self._cavity[rows] = np.maximum(grown, 0.0)
+        change[rows] = delta
+
+    def _true_rows(self, out: np.ndarray | None = None) -> np.ndarray:
+        if out is None:
+            out = np.empty((4, self.n, JOINTS))
+        out[0] = self.data.qpos[self._qpos]
+        out[1] = self.data.qvel[self._qvel]
+        chambers = self._pressure[:, c.PUMPS:].reshape(self.n, JOINTS, 2)
+        np.add(chambers, self._offset, out=out[2:].transpose(1, 2, 0))
+        return out
+
+    @staticmethod
+    def _clip_pressure_rows(rows: np.ndarray) -> None:
+        np.maximum(rows[2:], 0.0, out=rows[2:])
+
+    def chamber_pressures(self) -> np.ndarray:
+        return self._pressure[:, c.PUMPS:].reshape(self.n, JOINTS, 2).copy()
+
+    def pump_pressures(self) -> np.ndarray:
+        return self._pressure[:, :c.PUMPS].copy()
+
+    def oil_energy(self) -> np.ndarray:
+        q = self.data.qpos[self._qpos]
+        length, _ = c.geometry(q)
+        volume = self._volume0 + VOLUME_SLOPE * length[..., None]
+        chambers = self._pressure[:, c.PUMPS:].reshape(self.n, JOINTS, 2)
+        pumps = self._pressure[:, :c.PUMPS]
+        stored = (chambers ** 2 * volume).sum(axis=(1, 2)) + (pumps ** 2).sum(1) * self._pump_volume
+        return stored * self._inv_bulk / 2.0
 
     def true_state(self) -> Observation:
-        out = np.empty((3, self.n, JOINTS))
-        self._read_into(out)
-        return Observation(*out)
+        q = self.data.qpos[self._qpos].copy()
+        qd = self.data.qvel[self._qvel].copy()
+        return Observation(q, qd, self.chamber_pressures())
 
     def observe(self) -> Observation:
         sample = self._sensors[(self._sensor_head - self._latency_steps) % self._sensor_len,
                                :, np.arange(self.n)]
-        return Observation(*np.moveaxis(sample, 1, 0))
+        rows = np.moveaxis(sample, 1, 0)
+        return Observation(rows[0], rows[1], np.stack([rows[2], rows[3]], axis=-1))
