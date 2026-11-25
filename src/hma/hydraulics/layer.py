@@ -28,8 +28,9 @@ from hma.machine import (
     machine_prefix,
     tendon_friction,
 )
+from hma.machine.ground import settle, stand
 from hma.machine.model import COUNTERWEIGHT_MASS
-from hma.machine.tracks import place, step
+from hma.machine.tracks import step
 
 CONTROL_HZ = 10.0
 JOINTS = len(JOINT_NAMES)
@@ -172,7 +173,12 @@ class Hydraulics:
             self.reset(i, machine)
 
     def reset(self, index: int, machine: Machine, pose: Sequence[float] | None = None,
-              at: Sequence[float] = (0.0, 0.0, 0.0)) -> None:
+              at: Sequence[float] = (0.0, 0.0, 0.0), ground: int | None = None) -> None:
+        at = tuple(float(v) for v in np.asarray(at, float).ravel())
+        if len(at) != 3 or not all(np.isfinite(at)):
+            raise ValueError("at must be a finite x, y and heading")
+        if ground is not None and (int(ground) != ground or ground < 0):
+            raise ValueError("ground must be a non-negative integer seed")
         if pose is not None:
             pose = np.asarray(pose, float)
             if pose.shape != (JOINTS,) or not np.all(np.isfinite(pose)):
@@ -235,7 +241,7 @@ class Hydraulics:
         self.model.tendon_frictionloss[self._tendons[index]] = machine.force_limit
         self._apply_mass(index, machine)
         mujoco.mj_setConst(self.model, self._scratch)
-        self._reset_state(index, pose, at)
+        self._reset_state(index, pose, at, ground)
 
     def _draw_noise(self, index: int) -> None:
         shape = (self.steps_per_decision, 3, JOINTS)
@@ -270,7 +276,7 @@ class Hydraulics:
             self.model.body_iquat[body] = quat
 
     def _reset_state(self, index: int, pose: Sequence[float] | None,
-                     at: Sequence[float]) -> None:
+                     at: tuple[float, float, float], ground: int | None) -> None:
         model, data = self.model, self.data
         key = model.key(HOME_KEY).id
         for joint in self._own_joints[index]:
@@ -286,7 +292,10 @@ class Hydraulics:
             data.qpos[self._qpos[index]] = pose
         data.ctrl[self._actuators[index]] = 0.0
         data.ctrl[[model.actuator(machine_prefix(index) + t).id for t in TRAVEL_NAMES]] = 0.0
-        place(model, data, index, *at)
+        if ground is not None:
+            stand(model, data, index, int(ground), *at)
+        elif not settle(model, data, index, *at):
+            raise RuntimeError("the machine does not come to rest on this ground at this place")
         self._commands[:, index] = 0.0
         self._held[index] = 0.0
         self._spool[index] = 0.0

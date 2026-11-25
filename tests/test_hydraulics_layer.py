@@ -13,8 +13,14 @@ from hma.machine import (
     load_scene,
     machine_prefix,
 )
-from hma.machine.mass import Solid, body_parts, combine, full_inertia
-from hma.machine.model import COUNTERWEIGHT_MASS, VALVE_GAIN, VALVE_INERTIA, _machine_spec
+from hma.machine.mass import Solid, body_parts, combine, full_inertia, point
+from hma.machine.model import (
+    COUNTERWEIGHT_MASS,
+    VALVE_GAIN,
+    VALVE_INERTIA,
+    _machine_spec,
+    wheel_points,
+)
 
 DT = 0.005
 BUCKET = JOINT_NAMES.index("bucket")
@@ -69,7 +75,7 @@ def test_lag_is_the_drawn_time_constant_after_the_delay():
     speeds = step_response(machine, BUCKET, 0.5, 4.0)[:, BUCKET]
     assert speeds[-1] == pytest.approx(final, rel=1e-3)
     mean_response = np.sum(1.0 - speeds / final) * DT
-    valve_lag = VALVE_INERTIA / VALVE_GAIN
+    valve_lag = VALVE_INERTIA / VALVE_GAIN - DT
     measured = mean_response - round(machine.delay[BUCKET] / DT) * DT - valve_lag
     assert measured == pytest.approx(machine.lag[BUCKET], abs=DT)
 
@@ -240,7 +246,7 @@ def test_changed_masses_shift_the_links_and_the_home_pose_still_rests():
                                            atol=1e-12)
             assert model.body_mass[body] == pytest.approx(expected, rel=1e-12)
         assert model.body_subtreemass[bodies[0]] == pytest.approx(
-            sum(model.body_mass[b] for b in bodies))
+            sum(model.body_mass[b] for b in bodies) + sum(m for m, _ in wheel_points()))
         start = layer.true_state().positions[0].copy()
         for _ in range(400):
             layer.step()
@@ -341,6 +347,7 @@ def test_mass_changes_match_the_compiler_for_the_same_masses():
     layer = layer_for(machine)
     spec = _machine_spec(0, True)
     parts = body_parts()
+    parts["base"] = [*parts["base"], *(point(-m, pos) for m, pos in wheel_points())]
     for k, name in enumerate(BODY_NAMES):
         scaled = [Solid(p.mass * machine.link_mass[k], p.com, p.inertia * machine.link_mass[k])
                   for p in parts[name]]

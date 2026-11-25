@@ -10,36 +10,30 @@ import time
 import mujoco
 import numpy as np
 
+from hma.machine.ground import Ground, apply_ground, settle
 from hma.machine.model import (
     HOME_KEY,
     JOINT_NAMES,
     TRAVEL_NAMES,
     VALVE,
-    ground_axes,
     load_scene,
     machine_prefix,
-    write_friction,
-    write_ground,
 )
 from hma.machine.statics import Machine, reach_load_point
-from hma.machine.tracks import FRONT_LINE, SIDE_LINE, place, step
+from hma.machine.tracks import FRICTION, FRONT_LINE, REAR_LINE, SIDE_LINE, step
 
 P = machine_prefix(0)
 HOLD = 1e9
+TIPPED = 0.5
 
 
-def slope_heights(along=0.0, across=0.0, reach=2.5):
-    xs, ys = ground_axes()
-    x, y = np.meshgrid(np.clip(xs, -reach, reach), np.clip(ys, -reach, reach))
-    return math.tan(along) * x + math.tan(across) * y
+def slope(along=0.0, across=0.0, friction=FRICTION):
+    return Ground(grade=(math.tan(along), math.tan(across)), friction=friction)
 
 
-def released(heights=None, friction=None, pose=None, hold=False):
+def released(ground=None, pose=None, hold=False, heading=0.0):
     model = load_scene(1)
-    if heights is not None:
-        write_ground(model, 0, heights)
-    if friction is not None:
-        write_friction(model, 0, *friction)
+    apply_ground(model, 0, ground or Ground())
     if hold:
         for name in JOINT_NAMES:
             model.tendon_frictionloss[model.tendon(P + name + VALVE).id] = HOLD
@@ -48,7 +42,8 @@ def released(heights=None, friction=None, pose=None, hold=False):
     if pose is not None:
         for name, value in zip(JOINT_NAMES, pose, strict=True):
             data.qpos[model.joint(P + name).qposadr[0]] = value
-    place(model, data, 0)
+    if not settle(model, data, 0, heading=heading):
+        raise RuntimeError("the machine did not come to rest")
     mujoco.mj_forward(model, data)
     return model, data
 
@@ -108,6 +103,7 @@ def tips_under(model, data, load_kg, seconds=3.0):
 
 CASES = {
     "front, flat, 6.0 m": (0.0, 6.0, 0.0, 0.0, 0.0),
+    "rear, flat, 4.5 m": (0.0, 4.5, math.pi, 0.0, 0.0),
     "side, flat, 4.5 m": (0.0, 4.5, math.pi / 2, 0.0, 0.0),
     "front, 10 deg nose down, 6.0 m": (0.0, 6.0, 0.0, -math.radians(10.0), 0.0),
     "side, 10 deg cross slope, 4.5 m": (0.0, 4.5, math.pi / 2, 0.0, -math.radians(10.0)),
@@ -117,23 +113,24 @@ CASES = {
 def tipping_case(name):
     height, radius, swing, along, across = CASES[name]
     pose = chart_pose(height, radius, swing)
-    heights = slope_heights(along, across)
-    model, data = released(heights, friction=(1.0, 1.0), pose=pose, hold=True)
+    ground = slope(along, across)
+    model, data = released(ground, pose=pose, hold=True)
     origin, rot = base_frame(model, data)
-    if swing == 0.0:
-        line, axis = origin + rot @ [FRONT_LINE, 0.0, 0.0], rot[:, 1]
+    if swing in (0.0, math.pi):
+        line = origin + rot @ [FRONT_LINE if swing == 0.0 else REAR_LINE, 0.0, 0.0]
+        axis = rot[:, 1]
     else:
         line, axis = origin + rot @ [0.0, SIDE_LINE, 0.0], rot[:, 0]
-    return heights, pose, hand_tipping_load(model, data, line, axis)
+    return ground, pose, hand_tipping_load(model, data, line, axis)
 
 
 def sim_tipping_load(name: str, tolerance: float = 0.005) -> tuple[float, float]:
-    heights, pose, hand = tipping_case(name)
+    ground, pose, hand = tipping_case(name)
     low, high = 0.8 * hand, 1.2 * hand
     while high - low > tolerance * hand:
         middle = (low + high) / 2
-        model, data = released(heights, friction=(1.0, 1.0), pose=pose, hold=True)
-        if tips_under(model, data, middle) > 3.0:
+        model, data = released(ground, pose=pose, hold=True)
+        if tips_under(model, data, middle) > TIPPED:
             high = middle
         else:
             low = middle

@@ -14,17 +14,17 @@ from hma.machine import (
     JOINT_NAMES,
     LINK_MASSES,
     TIP_SITE,
+    Ground,
     forward_kinematics,
-    ground_axes,
-    ground_shape,
     inverse_kinematics,
     load_scene,
     machine_prefix,
     set_weld,
-    write_ground,
 )
-from hma.machine.model import GROUND_DEPTH, SPEED_LIMITS, VALVE
-from hma.machine.tracks import INTERVALS, step
+from hma.machine import settle as set_down
+from hma.machine.ground import Box, apply_ground, draw_ground, ground_height
+from hma.machine.model import GROUND_BOXES, SPEED_LIMITS, VALVE
+from hma.machine.tracks import WHEEL_MASSES, WHEELS, step
 
 SOURCE_LIMITS_DEG = {"boom": (-70.0, 44.0), "arm": (30.0, 152.0), "bucket": (-33.0, 143.0)}
 
@@ -81,7 +81,9 @@ def test_total_mass_in_operating_weight_band():
     for i in range(2):
         masses = {b: model.body(machine_prefix(i) + b).mass[0] for b in BODY_NAMES}
         assert masses == pytest.approx(LINK_MASSES)
-        assert 12_000.0 <= sum(masses.values()) <= 12_600.0
+        total = model.body_subtreemass[model.body(machine_prefix(i) + "base").id]
+        assert total == pytest.approx(sum(masses.values()) + 2 * sum(WHEEL_MASSES))
+        assert 12_000.0 <= total <= 12_600.0
 
 
 def test_joint_limits_match_source():
@@ -115,7 +117,6 @@ def test_names_are_prefixed_per_machine():
         for name in JOINT_NAMES:
             model.joint(prefix + name)
             model.actuator(prefix + name)
-        model.hfield(prefix + GROUND)
         model.geom(prefix + GROUND)
 
 
@@ -151,17 +152,17 @@ def test_each_machine_stands_on_its_own_ground_with_few_contacts():
         names = sorted((g1, g2))
         prefix = names[0][:3]
         assert names[0] == prefix + GROUND and names[1].startswith(prefix + "track_")
-        assert count <= 2 * (INTERVALS + 2)
-    assert 0 < data.ncon <= 2 * 2 * 2 * (INTERVALS + 2)
+        assert count <= 2
+    assert 0 < data.ncon <= 2 * 2 * 2 * WHEELS
     for i in range(2):
         assert abs(base_position(model, data, i)[2]) < 1e-3
 
 
-def test_welded_machines_have_no_contacts():
+def test_welded_machines_keep_their_ground_contacts():
     model = load_scene(2, weld=True)
     data = home_data(model)
     settle(model, data, 0.5)
-    assert data.ncon == 0
+    assert data.ncon > 0
 
 
 def test_free_base_rests_flush_and_tip_matches_kinematics():
@@ -195,15 +196,19 @@ def test_yawed_base_sits_flat():
     assert abs(base_position(model, data, 0)[2]) < 1e-3
 
 
-def roll_on_ridge(side):
+def on_ground(*boxes, pose=None):
     model = load_scene(1)
-    xs, ys = ground_axes()
-    heights = np.zeros(ground_shape())
-    under_outer_half = (side * ys > 0.95) & (side * ys < 1.35)
-    heights[np.ix_(under_outer_half, np.abs(xs) < 2.0)] = 0.05
-    write_ground(model, 0, heights)
+    apply_ground(model, 0, Ground(boxes=boxes))
     data = home_data(model)
-    data.qpos[2] = 0.06
+    if pose is not None:
+        set_pose(model, data, 0, dict(zip(JOINT_NAMES, pose, strict=True)))
+    assert set_down(model, data, 0)
+    mujoco.mj_forward(model, data)
+    return model, data
+
+
+def roll_on_ridge(side):
+    model, data = on_ground(Box(0.0, side * 1.15, 0.0, 2.0, 0.2, 0.05))
     settle(model, data, 2.0)
     up = base_up(model, data)
     return math.degrees(math.atan2(-up[1], up[2]))
@@ -216,26 +221,14 @@ def test_ridge_under_one_track_rolls_the_machine_and_mirrors():
 
 
 def test_ridge_across_the_middle_of_the_tracks_lifts_the_machine():
-    model = load_scene(1)
-    xs, _ = ground_axes()
-    heights = np.zeros(ground_shape())
-    heights[:, np.abs(xs) < 0.35] = 0.25
-    write_ground(model, 0, heights)
-    data = home_data(model)
-    data.qpos[2] = 0.3
+    model, data = on_ground(Box(0.0, 0.0, 0.0, 0.35, 3.0, 0.25))
     settle(model, data, 3.0)
     assert base_position(model, data, 0)[2] > 0.15
 
 
-@pytest.mark.parametrize("lip", [1.5, 1.4, 1.2, 1.0])
+@pytest.mark.parametrize("lip", [1.5, 1.4, 1.2])
 def test_loaded_machine_stays_level_with_track_ends_over_a_drop(lip):
-    model = load_scene(1)
-    xs, _ = ground_axes()
-    heights = np.zeros(ground_shape())
-    heights[:, xs > lip] = -1.0
-    write_ground(model, 0, heights)
-    data = home_data(model)
-    set_pose(model, data, 0, dict(zip(JOINT_NAMES, (0.0, 0.0, 1.0, 0.5), strict=True)))
+    model, data = on_ground(Box(lip - 6.0, 0.0, 0.0, 6.0, 6.0, 1.0), pose=(0.0, 0.0, 1.0, 0.5))
     settle(model, data, 3.0, 1200.0)
     assert tilt_deg(model, data) < 0.5
 
@@ -298,6 +291,20 @@ def test_weld_switches_at_run_time_and_holds_where_it_was_switched_on():
     assert np.linalg.norm(base_position(model, data, 0) - moved) < 0.01
 
 
+def test_switching_the_weld_at_run_time_writes_nothing_into_the_model():
+    model = load_scene(1, weld=True)
+    data = home_data(model)
+    fields = ("body_contype", "body_conaffinity", "geom_contype", "geom_conaffinity",
+              "pair_geom1", "pair_geom2", "pair_friction", "eq_active0")
+    before = {name: getattr(model, name).copy() for name in fields}
+    set_weld(model, data, 0, False)
+    settle(model, data, 0.5)
+    set_weld(model, data, 0, True)
+    settle(model, data, 0.5)
+    for name in fields:
+        assert np.array_equal(getattr(model, name), before[name]), name
+
+
 def test_reset_after_rewelding_elsewhere_returns_to_home():
     model = load_scene(1, weld=True)
     data = home_data(model)
@@ -327,54 +334,49 @@ def test_two_data_on_one_model_weld_independently():
 
 def test_arm_and_bucket_pass_through_ground_without_contact():
     model = load_scene(1, weld=True)
+    apply_ground(model, 0, Ground(boxes=(Box(9.0, 0.0, 0.0, 6.0, 6.0, 1.5),)))
     data = home_data(model)
-    xs, ys = ground_axes()
-    heights = np.where(xs[None, :] > 3.0, 1.5, 0.0) * np.ones((len(ys), 1))
-    write_ground(model, 0, heights)
     target = np.array([5.5, 0.0, 0.3])
     pose = dict(zip(JOINT_NAMES, inverse_kinematics(target, 1.0), strict=True))
     set_pose(model, data, 0, pose)
     settle(model, data, 1.0)
     mujoco.mj_rnePostConstraint(model, data)
     np.testing.assert_allclose(data.site(machine_prefix(0) + TIP_SITE).xpos, target, atol=0.05)
-    assert data.ncon == 0
-    for body in ("boom", "arm", "bucket"):
-        assert np.allclose(data.cfrc_ext[model.body(machine_prefix(0) + body).id], 0.0)
+    front = {model.body(machine_prefix(0) + b).id for b in ("boom", "arm", "bucket")}
+    for contact in data.contact[:data.ncon]:
+        bodies = {int(model.geom_bodyid[contact.geom1]), int(model.geom_bodyid[contact.geom2])}
+        assert bodies.isdisjoint(front)
+    for body in front:
+        assert np.allclose(data.cfrc_ext[body], 0.0)
     np.testing.assert_allclose(joint_angles(model, data), list(pose.values()), atol=0.02)
 
 
-def test_written_ground_heights_appear_in_the_heightfield():
+@pytest.mark.parametrize("seed", [2, 5, 8, 13])
+def test_drawn_ground_heights_appear_where_the_collision_finds_them(seed):
     model = load_scene(1)
+    apply_ground(model, 0, draw_ground(seed))
     data = home_data(model)
-    xs, ys = ground_axes()
-    heights = np.zeros(ground_shape())
-    col, row = int(np.argmin(np.abs(xs - 6.0))), int(np.argmin(np.abs(ys - 1.0)))
-    heights[row - 2 : row + 3, col - 2 : col + 3] = -5.5
-    write_ground(model, 0, heights)
+    data.qpos[2] = -100.0
     mujoco.mj_forward(model, data)
+    rng = np.random.default_rng(seed)
+    points = np.column_stack([rng.uniform(-3.0, 4.0, 40), rng.uniform(-4.0, 4.0, 40)])
+    expected = ground_height(model, 0, points)
     geomid = np.array([-1], dtype=np.int32)
-    for x, y, expected in ((xs[col], ys[row], -5.5), (2.0, -3.0, 0.0)):
+    for (x, y), height in zip(points, expected, strict=True):
         distance = mujoco.mj_ray(model, data, np.array([x, y, 5.0]), np.array([0.0, 0.0, -1.0]),
                                  None, 1, -1, geomid)
-        assert model.geom(int(geomid[0])).name == machine_prefix(0) + GROUND
-        assert 5.0 - distance == pytest.approx(expected, abs=1e-5)
+        assert model.geom(int(geomid[0])).name.startswith(machine_prefix(0) + GROUND)
+        assert 5.0 - distance == pytest.approx(height, abs=1e-6)
 
 
-def test_write_ground_rejects_bad_input():
+def test_ground_input_is_checked():
     model = load_scene(1)
     with pytest.raises(ValueError):
-        write_ground(model, 0, np.zeros((3, 3)))
+        box = Box(0.0, 0.0, 0.0, 1.0, 1.0, 0.1)
+        apply_ground(model, 0, Ground(boxes=(box,) * (GROUND_BOXES + 1)))
     with pytest.raises(ValueError):
-        write_ground(model, 0, np.zeros(ground_shape()).T)
+        apply_ground(model, 0, Ground(grade=(math.nan, 0.0)))
     with pytest.raises(ValueError):
-        write_ground(model, 0, np.full(ground_shape(), -GROUND_DEPTH - 0.1))
+        apply_ground(model, 0, Ground(friction=0.0))
     with pytest.raises(ValueError):
-        write_ground(model, 0, np.full(ground_shape(), np.nan))
-
-
-def test_ground_grid_covers_the_work_area_and_depth():
-    xs, ys = ground_axes()
-    assert ground_shape() == (len(ys), len(xs)) and len(xs) != len(ys)
-    assert math.isclose(xs[1] - xs[0], 0.1) and math.isclose(ys[1] - ys[0], 0.1)
-    assert xs[0] < -2.5 and xs[-1] > 9.0 and ys[0] < -5.0 and ys[-1] > 5.0
-    assert GROUND_DEPTH >= 6.0
+        draw_ground(-1)

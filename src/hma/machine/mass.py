@@ -23,6 +23,10 @@ FUEL = 250.0 * 0.82
 OPERATOR = 75.0
 BOOM_CYLINDERS = 240.0
 TRACK_CHAINS = 1540.0
+TRAVEL_MOTOR = 180.0
+IDLER = 100.0
+ROLLER = 22.0
+ROLLERS = 7
 SIBLING_SPLIT = {"lower_frame": 2620.0, "swing_frame": 1240.0, "upper_rest": 2750.0}
 
 TUMBLER = 1.44
@@ -181,7 +185,8 @@ def _boom_cylinders() -> tuple[list[Solid], list[Solid]]:
 
 def _lower() -> list[Solid]:
     frame = split("lower_frame")
-    motors, idlers, rollers, carriers, sides = 2 * 180.0, 2 * 100.0, 14 * 22.0, 2 * 15.0, 2 * 300.0
+    motors, idlers, rollers = 2 * TRAVEL_MOTOR, 2 * IDLER, 2 * ROLLERS * ROLLER
+    carriers, sides = 2 * 15.0, 2 * 300.0
     body = frame - motors - idlers - rollers - carriers - sides
     parts = [box(body, (0.0, 0.0, 0.665), (0.55, 0.7, 0.215))]
     for side in (1.0, -1.0):

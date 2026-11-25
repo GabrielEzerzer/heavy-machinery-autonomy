@@ -102,7 +102,7 @@ Left out, with what each would change:
 
 ### Machine on the ground
 
-`hma.machine.mass` builds each body's mass, centre of mass and inertia from its parts. `hma.machine.tracks` stands the machine on two driven tracks and replaces `mujoco.mj_step` with `tracks.step`. `hma.machine.ground` draws rough rigid ground from a seed. `python -m hma.machine.measure tipping` and `python -m hma.machine.measure throughput` print the measurements below.
+`hma.machine.mass` builds each body's mass, centre of mass and inertia from its parts. `hma.machine.tracks` stands the machine on two tracks of road wheels and replaces `mujoco.mj_step` with `tracks.step`, which sets the travel drives' power limit and then calls `mj_step`. `hma.machine.ground` builds rigid ground from MuJoCo primitives and draws it from a seed. `python -m hma.machine.measure tipping` and `python -m hma.machine.measure throughput` print the measurements below.
 
 **Mass.** The model weighs the published operating weight, 12,000 kg, with 500 mm shoes, the 2.52 m arm, a 0.45 m³ bucket and the 2,450 kg counterweight ([spec sheet][zx120]).
 
@@ -135,85 +135,116 @@ The boom cylinder barrels (65/120 of the cylinder mass, assumed) ride on the upp
 
 Only the masses from the spec sheets are sourced. The positions of the other parts are estimates, and the lift chart below is the check on them.
 
-**Track contact.** Each track meets the ground as a belt, not as points fixed to the frame. Every step, the height field is sampled:
+**Tracks.** MuJoCo's own collision finds every contact between the undercarriage and the ground, and its own solver resolves them. Nothing is computed by hand. Each track is:
 
-- under the bottom of each track, at 121 stations 2.4 cm apart over the 2.88 m tumbler distance ([spec sheet][zx120]);
-- at three points across each half of the 500 mm shoe;
-- around each idler and sprocket, on an arc of radius 0.35 m (estimated from the track height).
+- nine road wheels hinged to the lower frame, 0.36 m apart over the 2.88 m tumbler distance ([spec sheet][zx120]). They are the sprocket with its travel motor at the rear (180 kg), seven rollers (22 kg each) and the idler at the front (100 kg). Each is a cylinder of radius 0.35 m, estimated from the 0.79 m track height, and 0.14 m wide;
+- a joint coupling that turns all nine wheels with the sprocket, so the bottom of the track moves as one belt;
+- three massless shells: a box over the 500 mm shoe between the tumblers, from 6 cm above the ground (the link band) to the top of the track, and a cylinder of the shoe's width at each end. They meet kerbs, step faces and the track's outer faces wherever a wheel cannot reach.
 
-Each half of a track is split into eight 0.36 m intervals. Each interval gives one contact at its deepest station. When stations tie within 1 mm, as on flat ground, a middle interval takes its middle station, and the front-most and rear-most touching intervals take their outer stations. Each idler arc gives one more contact, so a machine has at most 40.
+MuJoCo has no belt contact, which is why the tracks are wheels. A wheel turning on its axle gives a contact point that moves with the belt. The track rolls on flat ground with no drag and slides only when it slips, and each wheel's bottom is a support point MuJoCo finds by itself.
 
-An edge or step holds the track at the edge, to within one station. The contacts sit on the line where the rollers meet the track links, 7 cm either side of the track centre (assumed). That line is the side tipping line of [ISO 10567][iso10567]. The ground is rigid: at rest the soft contact sinks the machine by under 0.1 mm over 10 s, and adds no energy.
+The wheels' width sets the side tipping line. It lies where the rollers meet the track links, 7 cm either side of the track centre, which is the side tipping line of [ISO 10567][iso10567]. The 7 cm is fitted: it is the value at which the model's side ratings match the lift chart (below). The front and rear tipping lines are the end wheels' axles, 1.44 m either side of the swing axis.
 
-Friction differs along and across the track:
+Each wheel and shell is in an explicit contact pair with every geom of its machine's ground. The pairs use:
 
-- **Along: 0.45 nominal.** This is the traction factor for crawler tracks on concrete in Caterpillar's handbook ([handbook][catphb]). It is unverified, because the table could not be read.
-- **Across: 0.50 nominal.** This is just below the 0.55 to 0.58 for steel tracks on hard ground in a tracked-vehicles lecture based on Wong ([lecture][umd]).
-- **Drawn ground:** 0.30 to 0.55 along, and 1.11 times that across (assumed).
+- condim 3;
+- MuJoCo's elliptic friction cone with impratio 1000;
+- solimp (0.999, 0.999, 0.001), so a contact is at full stiffness past 1 mm of overlap;
+- friction damping solreffriction (0, −35), for the reason under **Friction cone**.
 
-MuJoCo's soft friction cone pushes a sliding body away from the surface: a box dragged across a plane reached 2 m/s upward, and counter-rotating tracks hopped. So a contact sliding faster than 5 cm/s is frictionless in MuJoCo's solver. For those contacts `tracks.step` applies Coulomb friction itself, elliptic between along and across, from the previous step's normal force. Slower contacts keep MuJoCo's friction, which gives static grip.
+The ground's geoms keep friction priority 0, so a pair or a higher-priority geom on another machine part sets that part's own contact. The lower frame weighs 2,761 kg and the 18 wheels 868 kg, together the 3,629 kg in the table above.
 
-**Drive.** Each track has a belt driven through a travel valve built like the joint valves:
+**Integrator.** The scene uses MuJoCo's semi-implicit Euler integrator. With implicitfast, a machine standing on a slope lifted off and lost its contacts, even with every damping term at zero. Euler is stable for the valve servos at the 5 ms step (dt·kv/I = 0.25). It adds no energy in the passive runs below, once the energy is corrected for Euler's offset of ½·dt times the power of gravity.
+
+**Friction.** Each ground has one coefficient, drawn from 0.55 to 0.58: the range for steel tracks on hard ground in a tracked-vehicles lecture based on Wong ([lecture][umd]). Undrawn ground uses 0.565. `write_friction` puts the same coefficient on the ground's plane, boxes and spheres and on every track pair, along and across alike.
+
+The same lecture gives 0.87 to 1.11 for grass. The spec sheet's 35° gradeability needs at least 0.70, so it belongs to ground like the grass row, not to hard ground. At 0.565 the machine slides down slopes steeper than 29.5°, and drawn slopes stop at 20°.
+
+**Friction cone.** MuJoCo's soft friction pushes a sliding contact out of the surface. The normal acceleration is about μ·b·v/(1+μ²), for slip speed v and friction damping b. At b = 35 and μ = 0.565 that is 15 m/s² for every m/s of slip, so a track slipping faster than about 0.65 m/s lifts off. A lower b lifts less, but the friction no longer reaches μ times the normal force while sliding, and the machine slides too far:
+
+| Friction damping b | Stop distance from 1 m/s against v²/(2μg) | Lift while sliding from 1 m/s | Pushing into a wall at full power: height range, fewest contacts |
+|---|---|---|---|
+| 100 (MuJoCo's default) | −1.2% along, −2.5% across | 0.7 to 2.6 mm | 2.5 mm, 0 |
+| 35 (used) | −0.1% along, −0.6% across | 0.4 mm | 2.1 mm, 0 |
+| 10 | +26% | 0.06 mm | 0.6 mm, 0 |
+| 2 | +447% | 0 | 0.2 mm, 8 |
+
+Parked creep does not depend on b: it is 2.0e-5 m/s at 0.9 of the friction angle at every value tried, about 7 cm an hour, because it comes from the soft brake. MuJoCo's no-slip pass made sliding and creep worse. So b = 35 keeps sliding within 1% of Coulomb friction. Where a track keeps slipping, the machine hops: when counter-rotating at full speed, and when pushing into a wall at full power.
+
+**Drive.** Each track's sprocket is driven through a travel valve built like the joint valves:
 
 - **Commands:** the `travel_left` and `travel_right` actuators take a belt speed in m/s, up to 5.5 km/h (1.53 m/s).
-- **Force cap:** 51 kN per belt, half the 102 kN maximum traction ([spec sheet][zx120]).
-- **Inertia:** each belt carries half the track chain mass, 770 kg.
-- **Parking brake:** with zero command the valve holds the belt, up to the same 51 kN. The spec sheet gives a spring-set travel brake but no capacity, so the cap is assumed.
+- **Force cap:** half the 102 kN maximum traction per track at stall ([spec sheet][zx120]). Above stall a power limit applies. The two tracks share 65 kW of engine power, unverified against the spec sheet, times a drive efficiency of 0.7 (assumed), which is 45.5 kW. Each track gets 45.5 kW divided by the sum of the two belt speeds, and `tracks.step` writes that cap every step.
+- **Inertia:** each sprocket carries half the track chain mass, 770 kg, as belt inertia.
+- **Parking brake:** with zero command the valve holds the belt, up to the same cap. The spec sheet gives a spring-set travel brake but no capacity, so the cap is assumed.
 
-A later hydraulics stage can drive the same two actuators and set the cap from travel pressure and motor size. Measured on flat ground at friction 0.45/0.50:
+The next slice drives the same two actuators through the hydraulics layer. There, travel pressure and motor size set the cap in place of the fixed power figure.
 
-- **Straight**, forward and back: the commanded speed to within 1%.
-- **Counter-rotation** at full speed: 0.88 rad/s, against 1.54 rad/s if neither track slipped. Each track pushes 17.8 to 18.5 kN. Wong's firm-ground turning resistance, μ_t W L / 4 over the 1.99 m gauge ([lecture][umd]), gives 21.3 kN at μ_t = 0.50. Wong puts all the friction across the track; the model splits it along and across.
-- **Pivot turn**, one track braked and the other at full speed: 0.44 rad/s about a centre 1.86 m from the swing axis, outside the braked track. The braked track slides forward at about 0.38 m/s.
-- **Drawbar pull** at friction 1.0: the machine keeps full speed against 90% of 102 kN and slows against 110%.
-- **Gradeability** is set by friction, not traction. The machine slides down a slope steeper than the friction angle along the track: 24.2° at the nominal 0.45, tested at 0.95 and 1.05 times atan 0.45. The spec sheet's 35° would need a friction of 0.70. Drawn slopes stop at 20°.
-- **Parked** at 0.45/0.50, the machine creeps:
+**Ground.** Each machine has its own ground of MuJoCo primitives on a 13 by 12 m field, in the `ground` material and inside the sun's shadow box:
 
-| Slope | Creep, m/s |
-|---|---|
-| 10° | 1.3e-5 |
-| 20° | 3.3e-5 |
-| 23° | 3.6e-5 |
-| 25.5° | slides |
-| 15° across | 8e-6 |
-| Flat | 3e-11 |
+- a plane, tilted for a slope;
+- a pool of 8 boxes for steps, kerbs and the banks of ruts;
+- 6 spheres buried so that their caps make bumps.
 
-**Rough ground.** `draw_ground(seed)` draws ground for one machine, on its 13 by 12 m height field of 0.1 m cells:
+Unused boxes and spheres are parked under the plane. `draw_ground(seed)` draws one ground:
 
-- a plane tilted up to 20° in any direction;
+- a slope of up to 20° in any direction;
 - 0 to 2 steps of 5 to 40 cm;
 - 0 to 2 kerbs, 10 to 20 cm high and 0.2 to 0.4 m wide;
 - 0 to 2 ruts, 5 to 15 cm deep and 0.3 to 0.6 m wide;
-- 0 to 6 smooth bumps or dips of up to 15 cm, with radii of 0.3 to 1.5 m;
-- a friction pair.
+- 0 to 6 bumps of 3 to 15 cm, with radii of 0.3 to 1.5 m;
+- a friction coefficient from 0.55 to 0.58.
 
-The ranges are assumed for a 12 t machine on a site; none is sourced. Steps, kerbs and ruts run along the grid with their top edge on a grid line. The edge is therefore exact, and the height field's one-cell bevel falls on the low side.
+The feature ranges are assumed for a 12 t machine on a site; none is sourced. Every feature lies inside the field and the shadow box, and the same seed gives the same ground.
 
-The same seed gives the same ground. `apply_ground` writes a ground into one machine's height field and friction, and `place` sets a machine down at rest on whatever ground it has.
+These functions place and track a machine on its ground:
 
-**Checks against hand statics.** Each check in `tests/test_machine_ground.py` brackets a hand calculation: below it nothing happens, above it the machine tips, slides or lifts. In the tipping checks the joints are held at a friction of 1e9 N·m, so these results do not depend on the joint force limits.
+- `apply_ground` writes a ground into one machine's geoms and friction.
+- `settle` sets the machine down and steps it until it is still.
+- `stand(seed)` redraws the seed's ground, up to 20 times, until the machine comes to rest on it.
+- `Hydraulics.reset(..., ground=seed)` uses `stand`, then sets the joint loads and the sensor buffer from the settled state.
+- `off_features` is true once a machine's base has left its field, where there is no ground under it.
+
+**Checks.** Each check in `tests/test_machine_ground.py` reproduces a hand figure or a stated limit:
+
+| Check | Result |
+|---|---|
+| Energy in passive runs: sideways into a 0.2 m kerb and a 0.38 m step at 1 m/s, sliding along, landing from 5 cm moving sideways at 0.2 m/s, counter-rotating beside a 0.4 m step, sliding down a slope at 0.9 of the friction angle | Never rises over 3 s (test: under 1 J); no velocity reversal on landing |
+| Stop distance from 1.53 m/s against v²/(2μg) | 0.996 along, 0.993 across (test: within 3%) |
+| Tipping load against hand statics, front, rear and side, flat and on 10° slopes | Within 0.2% (test: 0.995 holds, 1.005 tips) |
+| Edge across the tracks under a wheel, and an edge along between the rails | The tipping line moves to the edge (test: 0.98 holds, 1.02 tips) |
+| Propped on the bucket, tracks pitched 25° | Brake load at most 0.14 N; drift 0.3 mm in 4 s |
+| Full speed into a wall | No progress over 3 s (0.2 mm); front 1.5 mm short of the wall face |
+| Parked and pushed sideways into a wall with 120 kN | Overlap with the wall at most 0.001 mm |
+| Driving onto a 0.2 m step at 0.5 m/s | Climbs it; peak pitch 8.13° against 7.83° from the geometry (test: within 5%) |
+| Full speed up a 20° slope | 1.1299 m/s against 1.1301 m/s from the power limit |
+| Parked at 0.9 of the friction angle | 0.08 mm in 4 s |
+| High-centred on a 0.3 m pad | Sits still |
+| A block dragged at 0.23 to 1.38 m/s with the ground's contact settings | Reads μ within 3% |
+| 300 resets on drawn ground at random headings | At rest, no exception, first load readings equal to the steady ones |
+| Integration state saved and restored | Repeats bit for bit into the same and a fresh MjData |
+| Two machines in one scene for 20 s, one driven at random | The other moves by 4e-19 m |
+
+A further test breaks the physics on purpose and checks that each break fails its check: doubled friction, end wheels removed, wheel coupling removed, brakes released, power limit removed, and the tipping line moved 5 cm. In the tipping checks the joints are held at a friction of 1e9 N·m, so those results do not depend on the joint force limits. `python -m hma.machine.measure tipping` prints:
 
 | Load at the bucket pin that tips the machine, with bucket | Hand statics, kg | Simulated, kg | Difference |
 |---|---|---|---|
-| Over the front, flat, 6.0 m out | 3,283 | 3,268 | −0.5% |
+| Over the front, flat, 6.0 m out | 3,283 | 3,288 | +0.2% |
+| Over the rear, flat, 4.5 m out | 5,077 | 5,085 | +0.2% |
 | Over the side, flat, 4.5 m out | 3,280 | 3,285 | +0.2% |
-| Over the front, 10° nose down, 6.0 m out | 2,744 | 2,731 | −0.5% |
-| Over the side, 10° cross slope, 4.5 m out | 2,553 | 2,541 | −0.5% |
+| Over the front, 10° nose down, 6.0 m out | 2,744 | 2,748 | +0.2% |
+| Over the side, 10° cross slope, 4.5 m out | 2,553 | 2,557 | +0.2% |
 
-The tests also bracket these, against the hand figure:
+The search stops within 0.5% of the hand figure, so +0.2% is within its resolution.
 
-| Check | Bracket |
-|---|---|
-| Boom press-down force that lifts the front of the tracks | 0.9 and 1.1 |
-| Slope where the machine slides | 0.95 and 1.05 times atan of the friction |
-| Cross slope where the machine tips sideways | 0.95 and 1.05 |
-| Tipping load with the front of the tracks over a 1 m drop, 1.2 m and 1.0 m ahead of the swing axis, tipping about the edge | 0.95 and 1.05 |
+**Speed.** `python -m hma.machine.measure throughput` steps machines through the hydraulics layer under random commands at 10 Hz, for 20 simulated seconds, five times each. Physics steps per second, lowest to highest:
 
-They also check that:
+| Machines | Welded | Released, standing | Released, travelling |
+|---|---|---|---|
+| 1 | 3,421 to 3,695 | 3,122 to 4,284 | 2,061 to 2,422 |
+| 8 | 612 to 791 | 180 to 680 | 110 to 142 |
 
-- a machine on drawn ground comes to rest;
-- the same commands on the same ground repeat bit for bit;
-- a welded machine gets no track contacts, and releasing it writes nothing into the model.
+One released machine runs at 60 to 66% of the welded rate when travelling. Eight travelling machines run at under a quarter of it ([issue 28](../../issues/28)).
 
 Against the [spec sheet][zx120]'s lift chart, the table gives 75% of the model's tipping load at every rating the chart marks as limited by tipping. It comes from `python -m hma.machine.statics`: no bucket, load at the bucket pin, kg.
 
@@ -238,14 +269,23 @@ Every entry is within 2.7%. With the earlier mass split and sphere contacts, the
 
 **Left out**, with what each would change ([issue 29](../../issues/29)):
 
-- **Track side faces.** Only the bottom of each track and its idler arcs touch the ground. A kerb or step face pushes on the idler arc only, so a track driven sideways into a kerb rides over it instead of being stopped.
-- **Rollers, recoil springs and track sag.** The track is rigid between its idlers. On a bump shorter than the track it rests on the high points instead of bending around them between rollers. That puts the load spread on rough ground off; the tipping lines are not affected.
-- **Travel hydraulics.** There is no travel circuit, crossover relief, two-speed shift or engine power limit. The travel force is the 102 kN cap at any speed; the real machine has less at high speed and more pull in low gear.
-- **Rolling resistance.** None is modelled: on flat ground the tracks hold speed with about 0.02 N of drive force.
-- **Brake creep.** The parking brake holds through a soft constraint, so a parked machine creeps by up to 3.6e-5 m/s on a slope, about 13 cm an hour. A spring-set brake holds still.
-- **Other ground contact.** The belly, counterweight, boom, arm and bucket pass through the ground. A machine that rolls past about 85° falls through it.
-- **Contact resolution.** An edge between two stations holds the track at the nearer inboard station, up to 2.4 cm in. With the drop exactly 1.0 m ahead, the tipping load was 3.0% under the hand figure. The height field's 0.1 m cells bevel every drop over one cell.
-- **Speed.** A released machine steps about six times slower than a welded one, because the contacts are found in Python ([issue 28](../../issues/28)).
+- **Edges between wheels.** The machine stands on its wheel bottoms, 0.36 m apart, so a ground edge under the track becomes the tipping line only when it lies under a wheel. With the front of the tracks over a 1 m drop, tipping load as a share of the hand figure about the edge (tipped at 3° of pitch):
+
+| Edge ahead of the swing axis, m | 1.00 | 1.08 | 1.12 | 1.16 | 1.20 | 1.26 | 1.32 | 1.38 | 1.44 |
+|---|---|---|---|---|---|---|---|---|---|
+| From the edge out to the next wheel, over the drop, m | 0.08 | 0.00 | 0.32 | 0.28 | 0.24 | 0.18 | 0.12 | 0.06 | 0.00 |
+| Tipping load / hand figure about the edge | 0.79 | 1.00 | 0.95 | 0.90 | 0.86 | 0.80 | 0.75 | 0.90 | 1.00 |
+
+  The machine tips about the last wheel still on the ground, so between wheels it tips at up to a quarter less than a real track, whose links carry the load out to the edge. Lowering the frame shell from 6 cm to 0.5 cm above the ground raised the worst of three edge positions only to 0.86.
+- **Hops while slipping.** By the friction-cone lift above, a track that keeps slipping lifts its side. Counter-rotating at full speed, a track loses all its contacts at times. Pushing into a wall at full power, the machine makes no progress but jitters by up to 0.19 m/s. Its contacts drop to none at times, and on landing it overlaps the wall by up to 1.39 mm, more than the 1 mm at which a contact reaches full stiffness.
+- **Rebound off a kerb.** A machine sliding sideways into a kerb or step at 0.8 m/s rebounds at 0.13 to 0.18 m/s, losing energy but not all of it.
+- **Track flex, recoil springs and sag.** The wheels are hinged to a rigid frame with no suspension, and the track between wheels is the flat bottom of the frame shell, 6 cm up. A bump narrower than the wheel spacing rises between two wheels until it meets the shell.
+- **Rolling resistance.** None is modelled: on flat ground a track rolls with no drive force.
+- **Brake creep.** The parking brake holds through a soft constraint, so a parked machine creeps by 2e-5 m/s at 0.9 of the friction angle, about 7 cm an hour. A spring-set brake holds still.
+- **Travel hydraulics.** The power limit is a fixed 45.5 kW and the stall force a fixed 102 kN. There is no travel circuit, crossover relief or two-speed shift.
+- **Other ground contact.** The belly, counterweight, boom, arm and bucket do not touch the ground yet.
+- **The field's edge.** Each ground covers only its 13 by 12 m field, and a machine that drives off it falls; `off_features` reports it.
+- **Speed.** Eight released machines travelling step at under a quarter of the welded rate ([issue 28](../../issues/28)).
 
 ### Base controller
 
@@ -279,7 +319,7 @@ The specification also has `status` (`plan`, `clarify` or `refuse`) and a short 
 5. **Path:** every point sampled along the route, every 0.25 m, passes the same checks. A lift's route goes up 0.3 m from the load, across, and down. A travel route checks the machine at every sample. A turn checks the machine every 5° of heading, the shorter way round, from where it faces to the marker.
 6. **Operator confirmation:** a person approves the plan in words. Nothing is asked for a plan that failed a check.
 
-The ground under the machine is read over its track footprint, not at one point: from x = −1.69 to 1.68 m and y = ±1.34 m about the swing axis (the model's track contact geoms), every 0.25 m, turned to the machine's heading. The tilt is the largest along and across the tracks anywhere under them. For lifting, propping and turning, one surface means a single slope and downhill direction under the whole footprint and no step under the machine.
+The ground under the machine is read over its track footprint, not at one point: from x = −1.79 to 1.79 m and y = ±1.245 m about the swing axis (the end wheels' rims and the outer edges of the shoes), every 0.25 m, turned to the machine's heading. The tilt is the largest along and across the tracks anywhere under them. For lifting, propping and turning, one surface means a single slope and downhill direction under the whole footprint and no step under the machine.
 
 | Rule | Value | Source |
 |---|---|---|
@@ -300,7 +340,7 @@ The ground under the machine is read over its track footprint, not at one point:
 
 Every limit lives in `hma.task.checks.Limits`; the chart is `hma.machine.statics.CHART` with its at-maximum-reach column in `hma.task.body.MAX_REACH`. `hma.task.scene.SAME_HEIGHT_M` is not a limit, only the tolerance for calling two heights equal. Neither the instruction nor the model's output can change any of them.
 
-**The machine seam.** Capacity, plan size and the propping pose reach the checks through the `Body` protocol, the way reach does through `Reach`. `MachineBody` reads plan size, track footprint, travel reach and boom-to-arm angles from `hma.machine`, and its `lift_capacity` calls `hma.machine.statics.lift` for the side tipping load and the hydraulic capacity at main relief. One call takes about 1.7 s, so the results for every chart cell are stored in `hma.task.capacity_table`, written by `python -m hma.task.capacity`. Run that command after any change to the machine model; a test compares the table with `statics.lift` and fails until it is rerun. The model's tipping loads sit above the chart's (the comparison is under [Cylinders](#cylinders)), so a model capacity can only lower the chart rating, never raise it; in the demo scene the chart sets every rating.
+**The machine seam.** Capacity, plan size and the propping pose reach the checks through the `Body` protocol, the way reach does through `Reach`. `MachineBody` reads plan size, track footprint, travel reach and boom-to-arm angles from `hma.machine`, and its `lift_capacity` calls `hma.machine.statics.lift` for the side tipping load and the hydraulic capacity at main relief. One call takes about 1.7 s, so the results for every chart cell are stored in `hma.task.capacity_table`, written by `python -m hma.task.capacity`. Run that command after any change to the machine model; a test compares the table with `statics.lift` and fails until it is rerun. A model capacity can only lower the chart rating, never raise it. 75% of the model's side tipping load is below the chart at 7 of its 18 rated cells, by up to 2.7% (the comparison is under [Machine on the ground](#machine-on-the-ground)); there the model sets the rating. Every rating a demo carry reaches falls on other cells, so in the demo scene the chart sets every rating.
 
 **Fixtures.** `mock/model_outputs/` holds model replies recorded through the Codex CLI: four plans (carry, travel, prop, turn), a clarifying question, a refusal, an over-capacity carry, a ten-minute prop, a drive down the 35° bank and the injection attempt. Two replies are written by hand because the model would not produce them: a wrong type (`wrong_type`, `hold_s` as text) and an extra field (`extra_field`, `limits_off`). Tests replay them without the model. `steep_bank` was recorded on the current demo scene. The others were recorded on an earlier version of it, before the bank was rebuilt with its cutting floor, the bank marker moved and the prompt stopped sending a reach figure; their replies name only loads and markers that did not change, so they still apply.
 
@@ -361,7 +401,7 @@ A feature is **done** when it runs from a clean checkout and its checks pass.
 | Machine model | A 12 t class excavator with swing, boom, arm and bucket joints. Each joint takes a speed command and has a force limit. The base can be held still, or left free on two driven tracks to travel, turn, slide and tip | Done |
 | Hydraulics model | Gives each machine its own delay, sluggishness, dead zone, lever-to-speed curve, flow limit, speed and force limits, slack in the joints, weights, and sensor noise and latency | Done |
 | Baseline controller | A conventional controller tuned once on the standard machine | Done: follows paths in free air |
-| Rough ground | Slopes, steps and edges of rigid ground. The machine can slide, rock and tip, and the arm and bucket meet the ground | In progress: ground drawn from a seed, and the tracks stand, drive, slide and tip on it, checked against hand statics; the arm and bucket do not touch it yet |
+| Rough ground | Slopes, steps and edges of rigid ground. The machine can slide, rock and tip, and the arm and bucket meet the ground | In progress: ground of MuJoCo primitives drawn from a seed; the tracks stand, drive, slide and tip on it through MuJoCo's own contact, checked against hand statics; the arm and bucket do not touch it yet |
 | Carried load | A load with real mass on the bucket | Planned |
 | Planner | Turns a checked specification into paths for the bucket and the load | Planned |
 | Cylinder forces | Joint force limits from the hydraulic cylinders' sizes and positions | In progress: geometry, sizes and static checks done; the simulation still uses constant caps |
@@ -390,8 +430,8 @@ The first command opens a viewer and moves the arm through its range, with the h
 
 - Simulation only. Nothing here has been checked against a real excavator.
 - Only the tracks touch the ground. The arm and bucket pass through it without force.
-- The track model leaves out side faces, rollers and track sag, travel hydraulics and rolling resistance, and its parking brake creeps ([issue 29](../../issues/29)).
-- A released machine steps about six times slower than a welded one ([issue 28](../../issues/28)).
+- The tracks stand on discrete wheels, so an edge between two wheels tips the machine early. Slipping tracks hop, and the model leaves out track flex, travel hydraulics and rolling resistance, and its parking brake creeps ([issue 29](../../issues/29)).
+- Eight released machines travelling step at under a quarter of the welded rate ([issue 28](../../issues/28)).
 - Calibrating the controller to a specific real machine is future work.
 
 ## Licence
