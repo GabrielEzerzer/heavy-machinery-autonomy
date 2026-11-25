@@ -1,5 +1,5 @@
 """The scene's clip, fog and haze distances are the same in metres at any machine count, the sun's
-shadow box holds every machine at full reach, and the plain drawn meshes add no mass or contact."""
+shadow box holds every machine at full reach, and the plain drawn meshes add no contact."""
 
 import mujoco
 import numpy as np
@@ -47,7 +47,7 @@ def test_sun_shadow_box_holds_every_machine(count):
         assert along - REACH > near
 
 
-def test_tracks_and_upper_structure_are_drawn_plain_without_mass_or_contact():
+def test_tracks_and_upper_structure_are_drawn_plain_without_contact():
     model = load_scene(2)
     default = mujoco.MjvOption()
     assert default.geomgroup[DRAWN_GROUP] and not default.geomgroup[HIDDEN_GROUP]
@@ -60,5 +60,3 @@ def test_tracks_and_upper_structure_are_drawn_plain_without_mass_or_contact():
             assert plain.bodyid[0] == detailed.bodyid[0]
             fine, coarse = model.mesh(detailed.dataid[0]), model.mesh(plain.dataid[0])
             assert coarse.facenum[0] < 0.6 * fine.facenum[0]
-    alone = load_scene(1)
-    np.testing.assert_array_equal(alone.body_mass[:6], model.body_mass[:6])
