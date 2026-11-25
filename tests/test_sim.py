@@ -6,11 +6,27 @@ import pytest
 
 import hma.machine.model
 from hma.hydraulics import NOMINAL, RANGES, Hydraulics, draw_machine
-from hma.machine import JOINT_NAMES, load_scene, machine_prefix
+from hma.machine import JOINT_LIMITS, JOINT_NAMES, load_scene, machine_prefix
 from hma.machine.kinematics import inverse_kinematics
 from hma.machine.model import GROUND, GROUND_DEPTH, GROUND_TOP, SOIL_AXES, SOIL_INVWEIGHT
 from hma.sim import reset, step
-from hma.sim.dig import PITCH_DIG, admissible, dig, home_path
+from hma.sim.dig import (
+    DUMP_AT,
+    PITCH_DIG,
+    TRENCH,
+    admissible,
+    breaks_rule,
+    count_stalls,
+    cut_volumes,
+    depth_excess,
+    dig,
+    holding,
+    home_path,
+    machine_origin,
+    off_grid,
+    tip_error,
+    tip_point,
+)
 from hma.soil import NOMINAL as NOMINAL_SOIL
 from hma.soil import Soil, SoilParams, sample_soil
 
@@ -367,3 +383,104 @@ def test_the_soil_tendons_keep_the_nominal_machines_softness_at_the_dig_pose(mon
     other = load_scene(1, weld=True)
     assert not np.allclose(other.tendon_invweight0[valves], model.tendon_invweight0[valves])
     np.testing.assert_array_equal(soil_softness(other), SOIL_INVWEIGHT)
+
+
+class Still:
+    duration = 1.0
+
+    def __init__(self, point, pitch=PITCH_DIG):
+        self.point, self.pitch = np.asarray(point, float), pitch
+
+    def __call__(self, t):
+        return self.point, self.pitch
+
+
+class Lowering:
+    duration = 2.0
+
+    def __call__(self, t):
+        return np.array([6.0, 0.0, 0.5 if t < 1.0 else -0.3]), PITCH_DIG
+
+
+def test_depth_is_scored_against_what_the_path_asks_at_that_moment():
+    path = Lowering()
+    assert depth_excess(0.25, path, 0.0, 0.5) == pytest.approx(0.25)
+    assert depth_excess(0.45, path, 0.0, 1.5) == pytest.approx(0.15)
+    assert depth_excess(0.45, path, -0.1, 1.5) == pytest.approx(0.25)
+    assert breaks_rule(depth_excess(0.25, path, 0.0, 0.5), False)
+    assert not breaks_rule(depth_excess(0.45, path, 0.0, 1.5), False)
+    assert breaks_rule(0.0, True)
+    assert off_grid(-0.01, 0.0, inside=False)
+    assert not off_grid(-0.01, 0.0, inside=True)
+    assert not off_grid(0.01, 0.0, inside=False)
+
+
+def test_a_stall_is_ten_whole_control_steps_held_at_full_load():
+    limits = np.array([[-np.inf, np.inf], *JOINT_LIMITS.values()])
+    q = np.array([0.0, *[(lo + hi) / 2 for lo, hi in JOINT_LIMITS.values()]])
+    load, v = np.array([0.0, 0.0, 0.995, 0.0]), np.zeros(4)
+    held = holding(q, v, load, limits)
+    assert held.tolist() == [False, False, True, False]
+    assert not holding(q, v + 0.02, load, limits).any()
+    at_stop = q.copy()
+    at_stop[ARM] = limits[ARM, 1] - 0.01
+    assert not holding(at_stop, v, load, limits).any()
+    stalls, counts = set(), np.zeros(4, int)
+    for _ in range(9):
+        counts = count_stalls(stalls, counts, held, 10.0, "drag")
+    counts = count_stalls(stalls, counts, np.zeros(4, bool), 10.0, "drag")
+    for _ in range(9):
+        counts = count_stalls(stalls, counts, held, 10.0, "drag")
+    assert not stalls
+    count_stalls(stalls, counts, held, 10.0, "drag")
+    assert stalls == {"arm in drag"}
+
+
+def test_a_path_with_an_edge_end_off_the_grid_or_below_its_pass_is_not_admissible():
+    model = load_scene(1, weld=True)
+    data = mujoco.MjData(model)
+    soil = Soil(model, 0)
+    side = Still(tip_point(6.45, 1.2, -0.25))
+    data.qpos[[model.joint(machine_prefix(0) + j).qposadr[0] for j in JOINT_NAMES]] = (
+        inverse_kinematics(*side(0.0)))
+    mujoco.mj_kinematics(model, data)
+    _, ys = soil.grid.axes()
+    assert data.site_xpos[soil.tip, 1] < ys[-1] < data.site_xpos[soil.edges, 1].max()
+    assert data.site_xpos[soil.edges, 2].max() < soil.grid.z0
+    assert not admissible(side, model, soil, samples=3)
+    assert admissible(Still(tip_point(6.0, 0.0, -0.25)), model, soil, samples=3)
+    assert not admissible(Still(tip_point(6.0, 0.0, -0.45)), model, soil, samples=3)
+
+
+def test_cut_volumes_count_the_trench_the_ground_cut_outside_it_and_the_pile():
+    model = load_scene(1, weld=True)
+    soil = Soil(model, 0)
+    start = soil.heights.copy()
+    (x0, _), (y0, _) = TRENCH
+    x, y = soil.cells[..., 0], soil.cells[..., 1]
+    trench = (x > x0 + 0.2) & (x < x0 + 0.7) & (y > y0 + 0.2) & (y < y0 + 0.7)
+    outside = (x > 8.0) & (x < 8.5) & (y > -5.0) & (y < -4.5)
+    pile = np.hypot(x - DUMP_AT[0], y - DUMP_AT[1]) < 0.5
+    soil.heights[trench] -= 0.2
+    soil.heights[outside] -= 0.1
+    soil.heights[pile] += 0.3
+    area = soil.grid.cell_area
+    volumes = cut_volumes(soil, start)
+    assert volumes["trench_out"] == pytest.approx(0.2 * trench.sum() * area)
+    assert volumes["cut_outside"] == pytest.approx(0.1 * outside.sum() * area)
+    assert volumes["pile"] == pytest.approx(0.3 * pile.sum() * area)
+
+
+def test_the_tip_error_is_taken_in_the_world_against_where_the_machine_stands():
+    model = load_scene(2, weld=False)
+    data = mujoco.MjData(model)
+    point = tip_point(6.0, 0.3, -0.2)
+    errors = []
+    for index in (0, 1):
+        soil = Soil(model, index)
+        placed(model, data, soil, point)
+        errors.append(tip_error(data, soil, machine_origin(model, index), point))
+    assert errors[0] == pytest.approx(errors[1], abs=1e-9)
+    assert errors[0] < 1e-6
+    placed(model, data, soil, point, shift=(0.1, 0.0))
+    assert tip_error(data, soil, machine_origin(model, 1), point) == pytest.approx(0.1, abs=1e-6)

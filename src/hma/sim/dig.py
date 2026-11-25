@@ -24,6 +24,7 @@ from hma.machine import (
     machine_prefix,
 )
 from hma.machine.kinematics import BOOM_PIVOT
+from hma.machine.model import ANCHOR
 from hma.sim import reset, step
 from hma.soil import NOMINAL as NOMINAL_SOIL
 from hma.soil import Soil, SoilParams, sample_soil, sync_viewer
@@ -103,8 +104,49 @@ def home_path() -> CyclePath:
 DUMP_AT = tip_point(DRAG_TO, SWING_TO, CARRY_HEIGHT)
 
 
-def asked_depth(path: CyclePath, soil: Soil, t: float) -> float:
-    return max(soil.grid.z0 - float(path(t)[0][2]), 0.0)
+def depth_excess(uncut: float, path: CyclePath, z0: float, t: float) -> float:
+    return uncut - max(z0 - float(path(t)[0][2]), 0.0)
+
+
+def off_grid(edge_z: float, z0: float, inside: bool) -> bool:
+    return edge_z < z0 and not inside
+
+
+def breaks_rule(excess: float, outside: bool) -> bool:
+    return excess > EXCESS_DEPTH or outside
+
+
+def holding(q: np.ndarray, v: np.ndarray, load: np.ndarray, limits: np.ndarray) -> np.ndarray:
+    free = (q - limits[:, 0] > STOP_MARGIN) & (limits[:, 1] - q > STOP_MARGIN)
+    return (np.abs(load) >= STALL_LOAD) & (np.abs(v) < STALL_SPEED) & free
+
+
+def count_stalls(stalls: set, counts: np.ndarray, held: np.ndarray, control_hz: float,
+                 phase: str) -> np.ndarray:
+    counts = np.where(held, counts + 1, 0)
+    for j in np.flatnonzero(counts >= round(STALL_TIME * control_hz)):
+        stalls.add(f"{JOINT_NAMES[j]} in {phase}")
+    return counts
+
+
+def machine_origin(model: mujoco.MjModel, index: int) -> np.ndarray:
+    return np.array(model.body(machine_prefix(index) + ANCHOR).pos)
+
+
+def tip_error(data: mujoco.MjData, soil: Soil, origin: np.ndarray, point: np.ndarray) -> float:
+    return float(np.linalg.norm(data.site_xpos[soil.tip] - origin - point))
+
+
+def cut_volumes(soil: Soil, start: np.ndarray) -> dict:
+    change = soil.heights - start
+    (x0, x1), (y0, y1) = TRENCH
+    x, y = soil.cells[..., 0], soil.cells[..., 1]
+    trench = (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)
+    pile = np.hypot(x - DUMP_AT[0], y - DUMP_AT[1]) <= PILE_RADIUS
+    area = soil.grid.cell_area
+    return {"trench_out": float(-change[trench].sum() * area),
+            "cut_outside": float(np.maximum(-change[~trench], 0.0).sum() * area),
+            "pile": float(change[pile].sum() * area)}
 
 
 def admissible(path: CyclePath, model: mujoco.MjModel, soil: Soil, samples: int = 2000) -> bool:
@@ -123,10 +165,6 @@ def admissible(path: CyclePath, model: mujoco.MjModel, soil: Soil, samples: int 
     return True
 
 
-def _region(soil: Soil, inside) -> np.ndarray:
-    return inside(soil.cells[..., 0], soil.cells[..., 1])
-
-
 def dig(machine: Machine, params: SoilParams, weld: bool = True, viewer=None) -> dict:
     model = load_scene(1, weld=weld)
     data = mujoco.MjData(model)
@@ -138,8 +176,8 @@ def dig(machine: Machine, params: SoilParams, weld: bool = True, viewer=None) ->
     start = soil.heights.copy()
     total = soil.total_volume()
     limits = np.array([[-math.inf, math.inf], *JOINT_LIMITS.values()])
+    origin = machine_origin(model, 0)
     stalled_for = np.zeros(len(JOINT_NAMES), int)
-    stall_steps = round(STALL_TIME * layer.control_hz)
     stalls, errors, filled, excess, outside, base = set(), [], 0.0, 0.0, False, []
     steps = round(path.duration * layer.control_hz)
     for k in range(steps):
@@ -148,35 +186,26 @@ def dig(machine: Machine, params: SoilParams, weld: bool = True, viewer=None) ->
         state = layer.true_state()
         q, v, load = state.positions[0], state.velocities[0], state.loads[0]
         now = t + 1.0 / layer.control_hz
-        errors.append(np.linalg.norm(data.site_xpos[soil.tip] - path(now)[0]))
+        errors.append(tip_error(data, soil, origin, path(now)[0]))
         filled = max(filled, soil.bucket_volume)
-        excess = max(excess, soil.uncut_depth(data) - asked_depth(path, soil, now))
+        excess = max(excess, depth_excess(soil.uncut_depth(data), path, soil.grid.z0, now))
         edge_z = data.site_xpos[soil.edges, 2].min()
-        outside |= edge_z < soil.grid.z0 and not soil.edge_inside(data)
-        free = (q - limits[:, 0] > STOP_MARGIN) & (limits[:, 1] - q > STOP_MARGIN)
-        held = (np.abs(load) >= STALL_LOAD) & (np.abs(v) < STALL_SPEED) & free
-        stalled_for = np.where(held, stalled_for + 1, 0)
-        for j in np.flatnonzero(stalled_for >= stall_steps):
-            stalls.add(f"{JOINT_NAMES[j]} in {path.phase(t)}")
+        outside |= off_grid(edge_z, soil.grid.z0, soil.edge_inside(data))
+        held = holding(q, v, load, limits)
+        stalled_for = count_stalls(stalls, stalled_for, held, layer.control_hz, path.phase(t))
         base.append(data.xpos[soil.base].copy())
         if viewer is not None:
             viewer(model, data, soil)
     change = soil.heights - start
-    (x0, x1), (y0, y1) = TRENCH
-    trench = _region(soil, lambda x, y: (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1))
-    pile = _region(soil, lambda x, y: np.hypot(x - DUMP_AT[0], y - DUMP_AT[1]) <= PILE_RADIUS)
-    area = soil.grid.cell_area
     errors = np.array(errors)
     base = np.array(base)
     return {
         "machine": machine.seed, "soil": params,
-        "trench_out": float(-change[trench].sum() * area),
-        "cut_outside": float(np.maximum(-change[~trench], 0.0).sum() * area),
-        "pile": float(change[pile].sum() * area),
+        **cut_volumes(soil, start),
         "filled": filled, "left_in_bucket": soil.bucket_volume,
         "error_mean": float(errors.mean()), "error_max": float(errors.max()),
         "stalls": sorted(stalls), "dumped": soil.bucket_volume < DUMPED,
-        "broke_rule": excess > EXCESS_DEPTH or outside,
+        "broke_rule": breaks_rule(excess, outside),
         "excess": excess, "outside": outside,
         "volume_error": soil.total_volume() - total, "lost": soil.lost_volume,
         "base_moved": float(np.linalg.norm(base[-1] - base[0])),

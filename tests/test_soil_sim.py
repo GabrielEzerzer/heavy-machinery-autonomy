@@ -19,6 +19,7 @@ from hma.soil import (
 from hma.soil.demo import (
     DRAG_FROM,
     DRAG_TO,
+    PHASE_TIMEOUT,
     PITCH_DIG,
     PITCH_DUMP,
     SWING_TO,
@@ -114,6 +115,8 @@ def test_cycle_leaves_a_trench_and_a_pile(nominal):
     assert max(step["bucket"] for step in trace) > 0.8 * BUCKET_CAPACITY
     assert [p for p, _ in itertools.groupby(step["phase"] for step in trace)] == [
         "lower", "drag", "curl", "lift", "swing", "dump"]
+    longest = max(len(list(g)) for _, g in itertools.groupby(step["phase"] for step in trace))
+    assert longest < round(PHASE_TIMEOUT * 10.0)
     assert cells_near(soil, (DRAG_FROM + DRAG_TO) / 2, 0.0, 0.5).min() < -0.25
     pile = cells_near(soil, DRAG_TO * np.cos(SWING_TO), DRAG_TO * np.sin(SWING_TO), 3.0)
     assert pile.max() > 0.2

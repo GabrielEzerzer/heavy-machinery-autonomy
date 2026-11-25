@@ -17,7 +17,6 @@ from hma.machine import (
 from hma.machine.model import COUNTERWEIGHT_MASS, VALVE_GAIN, VALVE_INERTIA, _machine_spec
 
 DT = 0.005
-SOLVER_TOLERANCE_WITHOUT_NEIGHBOUR_COUPLING = 1e-12
 BUCKET = JOINT_NAMES.index("bucket")
 SWING = JOINT_NAMES.index("swing")
 
@@ -370,7 +369,6 @@ def quiet(machine):
 
 def readings(machines, commands):
     model = load_scene(len(machines), weld=True)
-    model.opt.tolerance = SOLVER_TOLERANCE_WITHOUT_NEIGHBOUR_COUPLING
     layer = Hydraulics(model, mujoco.MjData(model), machines)
     seen = []
     for u in commands:
@@ -666,7 +664,6 @@ def test_resetting_one_machine_leaves_the_other_machines_noise_alone():
 
     def scene(reset_machine_1):
         model = load_scene(2, weld=True)
-        model.opt.tolerance = SOLVER_TOLERANCE_WITHOUT_NEIGHBOUR_COUPLING
         layer = Hydraulics(model, mujoco.MjData(model), machines)
         first = episode(layer, 1, machines[1], commands, running)
         for _ in range(3):
