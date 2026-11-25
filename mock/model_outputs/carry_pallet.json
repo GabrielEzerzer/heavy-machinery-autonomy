@@ -1,0 +1,5 @@
+{
+ "instruction": "put the pallet of kerbstones down at the near marker",
+ "source": "recorded",
+ "output": "{\"status\":\"plan\",\"message\":\"Carry the pallet of kerbstones to the near marker.\",\"task_type\":\"carry\",\"load_id\":\"L1\",\"marker_id\":\"M1\",\"stand_marker_id\":null,\"hold_s\":null}"
+}

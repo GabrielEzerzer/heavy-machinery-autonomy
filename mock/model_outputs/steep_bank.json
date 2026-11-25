@@ -1,0 +1,5 @@
+{
+ "instruction": "drive down the bank to the bank marker",
+ "source": "recorded",
+ "output": "{\"status\":\"plan\",\"message\":\"Drive to the bank marker.\",\"task_type\":\"travel\",\"load_id\":null,\"marker_id\":\"M6\",\"stand_marker_id\":null,\"hold_s\":null}"
+}

@@ -14,7 +14,8 @@ import numpy as np
 
 from hma.hydraulics import NOMINAL, Hydraulics
 from hma.hydraulics.circuit import valve_opening
-from hma.machine.model import HOME_POSE, MACHINE_SPACING, load_scene
+from hma.machine.model import HOME_POSE, load_scene
+from hma.machine.render import apply_look, default_camera, draw_hydraulics, view_option
 
 WAYPOINTS = np.array([
     HOME_POSE,
@@ -67,13 +68,21 @@ def main() -> None:
     before = set(threading.enumerate())
     with mujoco.viewer.launch_passive(model, data) as viewer:
         with viewer.lock():
-            viewer.cam.lookat[:] = [3.0, (n_machines - 1) * MACHINE_SPACING / 2, 1.5]
-            viewer.cam.distance, viewer.cam.azimuth, viewer.cam.elevation = 16.0, 120.0, -20.0
+            camera = default_camera(model, data)
+            viewer.cam.lookat[:] = camera.lookat
+            viewer.cam.distance, viewer.cam.azimuth = camera.distance, camera.azimuth
+            viewer.cam.elevation = camera.elevation
+            option = view_option()
+            viewer.opt.sitegroup[:] = option.sitegroup
+            viewer.opt.flags[:] = option.flags
+            apply_look(viewer.user_scn)
         start = time.perf_counter()
         while viewer.is_running():
             with viewer.lock():
                 if next(steps, None) is None:
                     break
+                viewer.user_scn.ngeom = 0
+                draw_hydraulics(model, data, viewer.user_scn)
             viewer.sync()
             ahead = data.time - (time.perf_counter() - start)
             if ahead > 0:
