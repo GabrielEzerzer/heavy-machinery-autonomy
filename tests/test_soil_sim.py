@@ -17,7 +17,15 @@ from hma.soil import (
     step,
     sync_viewer,
 )
-from hma.soil.demo import DRAG_FROM, DRAG_TO, PITCH_DIG, SWING_TO, cycle, start_pose
+from hma.soil.demo import (
+    DRAG_FROM,
+    DRAG_TO,
+    PITCH_DIG,
+    PITCH_DUMP,
+    SWING_TO,
+    cycle,
+    start_pose,
+)
 
 PREFIX = machine_prefix(0)
 STIFF = SoilParams(105.0e3, 105.0e3, 0.8, 22.0e3, 0.4, 300.0)
@@ -406,6 +414,31 @@ def test_the_bucket_fills_to_capacity_and_spills_the_rest_ahead():
     assert soil.lost_volume == 0.0
     assert soil.total_volume() == pytest.approx(start, abs=1e-12)
 
+
+def test_the_bucket_pours_at_a_rate_set_by_its_tilt():
+    model, data, soil = machine()
+    joints = [model.joint(PREFIX + j).qposadr[0] for j in JOINT_NAMES]
+    point = np.array([5.0, 0.0, 1.5])
+
+    def hold(pitch):
+        data.qpos[joints] = inverse_kinematics(point, pitch)
+        data.qvel[:] = 0.0
+        mujoco.mj_forward(model, data)
+        soil.substep(model, data)
+
+    place(model, data, soil, point, 1.5)
+    soil.bucket_volume = BUCKET_CAPACITY
+    hold(1.3)
+    hold(1.5)
+    assert 0.0 < BUCKET_CAPACITY - soil.bucket_volume < 0.01 * BUCKET_CAPACITY
+    soil.bucket_volume = BUCKET_CAPACITY
+    start, steps = soil.total_volume(), 0
+    while soil.bucket_volume > 0.0:
+        hold(PITCH_DUMP)
+        steps += 1
+    assert 0.5 < steps * model.opt.timestep < 1.0
+    assert soil.lost_volume == 0.0
+    assert soil.total_volume() == pytest.approx(start, abs=1e-12)
 
 def test_moving_the_pose_after_reset_cuts_nothing():
     model, data, soil = machine()

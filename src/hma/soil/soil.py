@@ -29,6 +29,7 @@ from hma.soil.params import NOMINAL, SoilParams
 CONTROL_HZ = 10.0
 BUCKET_CAPACITY = 0.45
 DUMP_ANGLE = math.pi / 4
+DUMP_TIME = 0.5
 EDGE_SAMPLES = 7
 STEER_SPEED = 0.001
 PREDICTIONS = 5
@@ -175,11 +176,14 @@ class Soil:
                 _, force, direction = best
                 self._set_resistance(model, data, force, direction)
         if self.bucket_volume > 0.0 and not in_soil and -lip[2] > math.sin(DUMP_ANGLE):
+            tilt = (math.asin(min(-lip[2], 1.0)) - DUMP_ANGLE) / (math.pi / 2 - DUMP_ANGLE)
+            poured = min(self.bucket_volume,
+                         BUCKET_CAPACITY * tilt * model.opt.timestep / DUMP_TIME)
             below = self.reach * np.array(travel)
             self.lost_volume += self.grid.deposit(
-                self.heights, self.loose, self.protected, self.bucket_volume,
+                self.heights, self.loose, self.protected, poured,
                 np.array(a) - below / 2, np.array(span), below)
-            self.bucket_volume = 0.0
+            self.bucket_volume -= poured
         if not in_soil:
             self._set_resistance(model, data, 0.0, direction)
         self._weigh(data)
