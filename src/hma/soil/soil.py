@@ -176,16 +176,17 @@ class Soil:
                 self._set_resistance(model, data, force, direction)
         if self.bucket_volume > 0.0 and not in_soil and -lip[2] > math.sin(DUMP_ANGLE):
             below = self.reach * np.array(travel)
-            self.lost_volume += self.grid.deposit(self.heights, self.loose, self.bucket_volume,
-                                                  np.array(a) - below / 2, np.array(span), below)
+            self.lost_volume += self.grid.deposit(
+                self.heights, self.loose, self.protected, self.bucket_volume,
+                np.array(a) - below / 2, np.array(span), below)
             self.bucket_volume = 0.0
         if not in_soil:
             self._set_resistance(model, data, 0.0, direction)
         self._weigh(data)
 
     def control_step(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
-        settle(self.heights, self.loose, self.params.friction_angle, self.grid.cell,
-               SETTLE_PASSES)
+        settle(self.heights, self.loose, self.protected, self.params.friction_angle,
+               self.grid.cell, SETTLE_PASSES)
         self._protect(data)
         write_ground(model, self.index, self.heights)
 
@@ -202,9 +203,9 @@ class Soil:
         norm = math.hypot(moved[0], moved[1])
         stride = self.grid.cell / norm if norm > 1e-12 else 0.0
         ahead = np.array([moved[0] * stride, moved[1] * stride, 0.0])
-        self.lost_volume += self.grid.deposit(self.heights, self.loose, removed - taken,
-                                              np.array(a) + SPILL_AHEAD * ahead, np.array(span),
-                                              ahead)
+        self.lost_volume += self.grid.deposit(
+            self.heights, self.loose, self.protected, removed - taken,
+            np.array(a) + SPILL_AHEAD * ahead, np.array(span), ahead)
 
     def _weigh(self, data: mujoco.MjData) -> None:
         data.xfrc_applied[self.bucket] = 0.0
