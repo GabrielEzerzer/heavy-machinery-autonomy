@@ -36,9 +36,8 @@ class Grid:
     def surface(self, heights: np.ndarray, loose: np.ndarray, x: float,
                 y: float) -> tuple[float, float]:
         nrow, ncol = self.shape
-        fx, fy = (x - self.x0) / self.cell, (y - self.y0) / self.cell
-        if not (0.0 <= fx <= ncol - 1 and 0.0 <= fy <= nrow - 1):
-            return -math.inf, 0.0
+        fx = min(max((x - self.x0) / self.cell, 0.0), ncol - 1.0)
+        fy = min(max((y - self.y0) / self.cell, 0.0), nrow - 1.0)
         cx, cy = min(int(fx), ncol - 2), min(int(fy), nrow - 2)
         tx, ty = fx - cx, fy - cy
         weights = ((1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty)
@@ -126,6 +125,8 @@ class Grid:
         free = cells[~protected.flat[cells]]
         if free.size == 0:
             open_cells = np.flatnonzero(~protected)
+            if open_cells.size == 0:
+                return volume
             centre = np.array([cells % ncol, cells // ncol]).mean(axis=1)
             gap = np.hypot(open_cells % ncol - centre[0], open_cells // ncol - centre[1])
             free = open_cells[np.argsort(gap, kind="stable")[:cells.size]]

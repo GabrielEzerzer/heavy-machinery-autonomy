@@ -153,3 +153,12 @@ def test_spoil_does_not_shed_onto_protected_cells():
         settle(heights, loose, protected, 0.5, GRID.cell, 10)
     assert not heights[protected].any()
     assert heights.sum() == pytest.approx(1.0)
+
+
+def test_deposit_onto_a_fully_protected_grid_reports_all_volume_lost():
+    heights, loose, protected = blank()
+    protected[:] = True
+    lost = GRID.deposit(heights, loose, protected, 0.2, np.array([1.0, 1.0, 0.0]),
+                        np.array([0.6, 0.0, 0.0]), np.array([0.0, 0.5, 0.0]))
+    assert lost == 0.2
+    assert not heights.any() and not loose.any()
