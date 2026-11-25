@@ -1,5 +1,5 @@
-"""Height-grid operations in world coordinates: surface lookup, cutting along a swept edge,
-depositing volume over an area, and shedding loose spoil steeper than its repose angle. Every
+"""Height-grid operations in world coordinates: surface and spoil lookup, cutting along a swept
+edge, depositing volume over an area, and shedding loose spoil steeper than its repose angle. Every
 change moves volume between cells or reports it as lost, so totals are conserved by construction."""
 
 from __future__ import annotations
@@ -33,16 +33,19 @@ class Grid:
         nrow, ncol = self.shape
         return self.x0 + self.cell * np.arange(ncol), self.y0 + self.cell * np.arange(nrow)
 
-    def height(self, heights: np.ndarray, x: float, y: float) -> float:
+    def surface(self, heights: np.ndarray, loose: np.ndarray, x: float,
+                y: float) -> tuple[float, float]:
         nrow, ncol = self.shape
         fx, fy = (x - self.x0) / self.cell, (y - self.y0) / self.cell
         if not (0.0 <= fx <= ncol - 1 and 0.0 <= fy <= nrow - 1):
-            return -math.inf
+            return -math.inf, 0.0
         cx, cy = min(int(fx), ncol - 2), min(int(fy), nrow - 2)
         tx, ty = fx - cx, fy - cy
-        low = heights[cy, cx] * (1 - tx) + heights[cy, cx + 1] * tx
-        high = heights[cy + 1, cx] * (1 - tx) + heights[cy + 1, cx + 1] * tx
-        return float(low * (1 - ty) + high * ty) + self.z0
+        weights = ((1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty)
+        cells = ((cy, cx), (cy, cx + 1), (cy + 1, cx), (cy + 1, cx + 1))
+        top = sum(w * heights[c] for w, c in zip(weights, cells, strict=True))
+        spoil = sum(w * loose[c] for w, c in zip(weights, cells, strict=True))
+        return float(top) + self.z0, float(spoil)
 
     def clearance(self, heights: np.ndarray, points: tuple, reach: int) -> float:
         nrow, ncol = self.shape

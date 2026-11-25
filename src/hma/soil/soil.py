@@ -229,16 +229,18 @@ class Soil:
             return 0.0, (0.0, 0.0, 0.0), False
         direction = (motion[0] / norm, motion[1] / norm, motion[2] / norm)
         lx, ly = self.grid.cell * direction[0], self.grid.cell * direction[1]
-        depths = []
+        depths, spoil = [], []
         for f in self.fractions:
             x, y = a[0] + f * span[0], a[1] + f * span[1]
-            top = self.grid.height(self.heights, x + lx, y + ly)
+            top, loose = self.grid.surface(self.heights, self.loose, x + lx, y + ly)
             if top == -math.inf:
-                top = self.grid.height(self.heights, x, y)
+                top, loose = self.grid.surface(self.heights, self.loose, x, y)
             depths.append(max(top - a[2] - f * span[2], 0.0))
+            spoil.append(loose)
         if max(depths) <= 0.0:
             return 0.0, direction, False
-        return self._resistance(depths, direction, travel, lip, mouth), direction, True
+        return (self._resistance(depths, spoil, direction, travel, lip, mouth), direction,
+                True)
 
     def _slip(self, model: mujoco.MjModel, data: mujoco.MjData, force: float,
               direction: tuple[float, float, float]) -> np.ndarray | None:
@@ -265,10 +267,10 @@ class Soil:
                 step = residual - float(residual @ dr) / norm * (dx + dr)
         return (direction + step).tolist(), (direction, residual)
 
-    def _resistance(self, depths: list[float], direction: tuple[float, float, float],
-                    travel: tuple[float, float, float], lip: tuple[float, float, float],
-                    mouth: tuple[float, float, float]) -> float:
-        sums = depth_sums(depths, self.width)
+    def _resistance(self, depths: list[float], spoil: list[float],
+                    direction: tuple[float, float, float], travel: tuple[float, float, float],
+                    lip: tuple[float, float, float], mouth: tuple[float, float, float]) -> float:
+        sums = depth_sums(depths, spoil, self.width)
         attack = direction[0] * lip[0] + direction[1] * lip[1] + direction[2] * lip[2]
         load = self.params.unit_weight * self.bucket_volume
         along = direction[0] * mouth[0] + direction[1] * mouth[1] + direction[2] * mouth[2]

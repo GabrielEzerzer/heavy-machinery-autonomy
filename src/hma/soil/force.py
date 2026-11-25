@@ -1,6 +1,6 @@
 """Resistance of soil to the bucket's cutting edge: the fundamental earthmoving equation
-(separation) plus a tooth penetration term, smoothly capped at FORCE_CAP.
-Within SINGULAR_MARGIN of the singular rake, separation ramps up to BACK_GAIN times."""
+(separation) plus a tooth penetration term, smoothly capped at FORCE_CAP. Cohesion, adhesion
+and penetration act only on the undisturbed part of the cut; loose spoil adds weight alone."""
 
 from __future__ import annotations
 
@@ -53,28 +53,32 @@ def smooth_cap(force: float) -> float:
     return force / (1.0 + (force / FORCE_CAP) ** CAP_SHARPNESS) ** (1.0 / CAP_SHARPNESS)
 
 
-def depth_sums(depths: list[float], width: float) -> tuple[float, float, float]:
+def depth_sums(depths: list[float], spoil: list[float],
+               width: float) -> tuple[float, float, float, float]:
     d = [max(x, 0.0) for x in depths]
+    firm = [max(x - max(s, 0.0), 0.0) for x, s in zip(d, spoil, strict=True)]
     slice_width = width / len(d)
     return (sum(d) * slice_width, sum(x * x for x in d) * slice_width,
-            sum(min(x / SURCHARGE_DEPTH, 1.0) for x in d) / len(d))
+            sum(min(x / SURCHARGE_DEPTH, 1.0) for x in d) / len(d), sum(firm) * slice_width)
 
 
-def raw_force(soil: SoilParams, sums: tuple[float, float, float], rake: float,
+def raw_force(soil: SoilParams, sums: tuple[float, float, float, float], rake: float,
               attack_cos: float, load: float) -> float:
-    area, moment, wetted = sums
+    area, moment, wetted, firm = sums
     n_gamma, n_cohesion, n_surcharge, n_adhesion = fee_factors(soil, rake)
     separation = (soil.unit_weight * moment * n_gamma
-                  + (soil.cohesion * n_cohesion + soil.adhesion * n_adhesion) * area
+                  + (soil.cohesion * n_cohesion + soil.adhesion * n_adhesion) * firm
                   + load * n_surcharge * wetted)
     past = min(max((effective_rake(rake) - rake_limit(soil)) / BACK_RAMP, 0.0), 1.0)
     separation *= 1.0 + (BACK_GAIN - 1.0) * past * past * (3.0 - 2.0 * past)
     penetration = (soil.penetration_factor * passive_coefficient(soil) * soil.unit_weight
-                   * area * EDGE_THICKNESS * abs(attack_cos))
+                   * firm * EDGE_THICKNESS * abs(attack_cos))
     return separation + penetration
 
 
 def cutting_force(soil: SoilParams, depths: np.ndarray, width: float, rake: float,
-                  attack_cos: float, load: float) -> float:
-    sums = depth_sums([float(x) for x in np.ravel(depths)], width)
+                  attack_cos: float, load: float, spoil: float | np.ndarray = 0.0) -> float:
+    depths = np.ravel(depths).astype(float)
+    spoil = np.broadcast_to(np.asarray(spoil, float), depths.shape)
+    sums = depth_sums(depths.tolist(), spoil.tolist(), width)
     return smooth_cap(raw_force(soil, sums, rake, attack_cos, load))

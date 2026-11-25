@@ -199,6 +199,24 @@ def test_a_jittery_vertical_descent_changes_the_force_smoothly():
     assert both.sum() > 1500
     assert jumps.max() < 2.0e3
 
+def test_dragging_through_spoil_costs_less_than_through_undisturbed_soil():
+    def drag(spoil):
+        model, data, soil = machine(STIFF)
+        place(model, data, soil, *BURIED)
+        soil.loose[:] = spoil
+        start = data.site_xpos[soil.tip][0]
+        data.ctrl[model.actuator(PREFIX + "arm").id] = 0.2
+        resistance = []
+        for _ in range(100):
+            advance(model, data, soil, 1)
+            resistance.append(soil.resistance)
+        return np.median(resistance), start - data.site_xpos[soil.tip][0]
+
+    firm, firm_travel = drag(0.0)
+    spoil, spoil_travel = drag(0.5)
+    assert spoil < 0.3 * firm
+    assert spoil_travel > 5.0 * firm_travel
+
 def test_a_sliding_edge_meets_exactly_the_resistance_against_its_motion():
     model, data, soil = machine()
     acts = actuators(model)

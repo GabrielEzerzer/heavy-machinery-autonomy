@@ -60,3 +60,19 @@ def test_fee_factors_stay_positive_for_every_rake():
     for soil in SOILS:
         for rake in np.linspace(-4.0, 4.0, 801):
             assert min(fee_factors(soil, rake)) >= 0.0
+
+
+def test_spoil_costs_its_weight_without_cohesion_and_blends_continuously():
+    depth, rake = 0.3, 1.0
+    firm = force(STIFF, depth, rake, load=0.0)
+    spoil = np.linspace(0.0, 0.5, 5001)
+    values = np.array([cutting_force(STIFF, [depth] * 7, WIDTH, rake, 1.0, 0.0, s)
+                       for s in spoil])
+    assert values[0] == firm
+    assert values[-1] < 0.1 * firm
+    assert np.all(np.diff(values) <= 0.0)
+    assert np.abs(np.diff(values)).max() < 1e-3 * firm
+    assert values[-1] == cutting_force(STIFF, [depth] * 7, WIDTH, rake, 1.0, 0.0, depth)
+    weight_only = SoilParams(0.0, 0.0, STIFF.friction_angle, STIFF.unit_weight,
+                             STIFF.steel_friction_angle, 0.0)
+    assert values[-1] == force(weight_only, depth, rake, load=0.0)
