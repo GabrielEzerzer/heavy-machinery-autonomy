@@ -1,5 +1,5 @@
 """One soil per machine: a height grid cut by the bucket's edge; bucket fill, spill, dump, settling.
-Call substep() before every mj_step and control_step() once per control period, or use step().
+Call substep() before every mj_step, mj_kinematics after it, control_step() once per control period.
 Resistance is friction on three tendons set by the bucket's pose; soil weight is a bucket force."""
 
 from __future__ import annotations
@@ -16,9 +16,9 @@ from hma.machine.model import (
     SOIL_AXES,
     TIP_SITE,
     TRACK_FEET,
-    VALVE,
     ground_shape,
     machine_prefix,
+    tendon_friction,
     write_ground,
 )
 from hma.soil.force import V_CAP, depth_sums, penetration, raw_force, smooth_cap
@@ -46,13 +46,6 @@ def physics_steps(model: mujoco.MjModel, control_hz: float) -> int:
     return steps
 
 
-def joint_load(model: mujoco.MjModel, data: mujoco.MjData, index: int, joint: str) -> float:
-    tendon = model.tendon(machine_prefix(index) + joint + VALVE).id
-    rows = ((data.efc_type == mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON)
-            & (data.efc_id == tendon))
-    return -float(data.efc_force[rows].sum())
-
-
 class Soil:
     def __init__(self, model: mujoco.MjModel, index: int = 0, params: SoilParams = NOMINAL):
         prefix = machine_prefix(index)
@@ -76,7 +69,8 @@ class Soil:
         tip = model.site_pos[self.tip]
         self.reach = float(np.linalg.norm(tip))
         along = tip / np.linalg.norm(tip)
-        offset = model.body_ipos[self.bucket] - (model.body_ipos[self.bucket] @ along) * along
+        centre = model.geom_pos[model.geom(prefix + "bucket").id]
+        offset = centre - (centre @ along) * along
         self.mouth = -offset / np.linalg.norm(offset)
         feet = [g for g in range(model.ngeom)
                 if model.geom(g).name.startswith(prefix + TRACK_FEET)]
@@ -118,14 +112,19 @@ class Soil:
     def total_volume(self) -> float:
         return self.ground_volume() + self.bucket_volume + self.lost_volume
 
+    def uncut_depth(self, data: mujoco.MjData) -> float:
+        a, b = data.site_xpos[self.edges]
+        return max(self._depth(*(a + f * (b - a)))[1] for f in (0.0, *self.fractions, 1.0))
+
+    def edge_inside(self, data: mujoco.MjData) -> bool:
+        xs, ys = self.grid.axes()
+        x, y = data.site_xpos[self.edges, 0], data.site_xpos[self.edges, 1]
+        return bool(np.all((x >= xs[0]) & (x <= xs[-1]) & (y >= ys[0]) & (y <= ys[-1])))
+
     def edge_force(self, data: mujoco.MjData) -> np.ndarray:
-        force = np.zeros(3)
-        friction = data.efc_type == mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON
-        for tendon, anchor in zip(self.tendons, self.anchors, strict=True):
-            line = data.site_xpos[self.tip] - data.mocap_pos[anchor]
-            force += float(data.efc_force[friction & (data.efc_id == tendon)].sum()) * line / (
-                np.linalg.norm(line))
-        return force
+        lines = data.site_xpos[self.tip] - data.mocap_pos[self.anchors]
+        lines /= np.linalg.norm(lines, axis=1, keepdims=True)
+        return tendon_friction(data, self.tendons) @ lines
 
     def substep(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
         a, b = data.site_xpos[self.edges].tolist()
@@ -252,6 +251,7 @@ def step(model: mujoco.MjModel, data: mujoco.MjData, soils: list[Soil],
         for soil in soils:
             soil.substep(model, data)
         mujoco.mj_step(model, data)
+        mujoco.mj_kinematics(model, data)
     for soil in soils:
         soil.control_step(model, data)
 

@@ -17,7 +17,9 @@ from hma.machine.model import (
     ground_shape,
     load_scene,
     machine_prefix,
+    set_soil_softness,
     set_weld,
+    tendon_friction,
     write_ground,
 )
 
@@ -40,6 +42,8 @@ __all__ = [
     "inverse_kinematics",
     "load_scene",
     "machine_prefix",
+    "set_soil_softness",
     "set_weld",
+    "tendon_friction",
     "write_ground",
 ]

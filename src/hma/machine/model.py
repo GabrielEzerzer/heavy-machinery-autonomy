@@ -18,12 +18,13 @@ BASE_JOINT = "base_free"
 TIP_SITE = "bucket_tip"
 EDGE_SITES = ("bucket_edge_right", "bucket_edge_left")
 SOIL_AXES = ("soil_0", "soil_1", "soil_2")
+SOIL_INVWEIGHT = (8.396e-3, 9.241e-4, 5.199e-3)
 TRACK_FEET = "track_"
 ANCHOR = "anchor"
 WELD = "base_weld"
 GROUND = "ground"
 HOME_KEY = "home"
-HOME_POSE = (0.0, 0.0, 1.6, 0.4)
+HOME_POSE = (0.0, -0.6, 1.9, 0.6)
 
 LINK_MASSES = {"base": 4500.0, "upper": 5580.0, "boom": 1220.0, "arm": 600.0, "bucket": 400.0}
 COUNTERWEIGHT_MASS = 2450.0
@@ -44,11 +45,27 @@ MACHINE_SPACING = 14.0
 MAX_MACHINES = 31
 
 TIMESTEP = 0.005
-SOLVER_TOLERANCE = 1e-12
+SOLVER_TOLERANCE = 1e-14
+FRICTION_TENDON = int(mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON)
 
 
 def machine_prefix(index: int) -> str:
     return f"m{index}/"
+
+
+def tendon_friction(data: mujoco.MjData, tendons: np.ndarray) -> np.ndarray:
+    tendons = np.asarray(tendons, np.intp)
+    rows = data.efc_type == FRICTION_TENDON
+    forces = np.bincount(data.efc_id[rows], weights=data.efc_force[rows],
+                         minlength=int(tendons.max(initial=-1)) + 1)
+    return forces[tendons]
+
+
+def set_soil_softness(model: mujoco.MjModel) -> None:
+    for t in range(model.ntendon):
+        axis = model.tendon(t).name.rpartition("/")[2]
+        if axis in SOIL_AXES:
+            model.tendon_invweight0[t] = SOIL_INVWEIGHT[SOIL_AXES.index(axis)]
 
 
 def ground_shape() -> tuple[int, int]:
@@ -149,6 +166,7 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
                            active=int(weld))
     scene.add_key(name=HOME_KEY)
     model = scene.compile()
+    set_soil_softness(model)
     flat = np.zeros(ground_shape())
     for i in range(n_machines):
         write_ground(model, i, flat)
