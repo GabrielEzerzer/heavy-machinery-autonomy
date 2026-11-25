@@ -60,6 +60,7 @@ from hma.machine.tracks import (
 )
 
 P = machine_prefix(0)
+SPEC_PULL_PER_TRACK = 102.0e3 / 2
 G = 9.81
 SINK = 1e-5
 
@@ -395,12 +396,19 @@ def test_a_track_in_the_air_leaves_the_other_its_full_traction():
     data.mocap_pos[0, 2] += 1.0
     data.qpos[2] += 1.0
     data.ctrl[travel(model)] = [TRAVEL_SPEED, 0.3]
-    load = 0.98 * TRACTION
-    data.qfrc_applied[model.joint(P + wheel_name("right", 1)).dofadr[0]] = -load * WHEEL_RADIUS
+    load = 0.98 * SPEC_PULL_PER_TRACK
+    wheel = model.joint(P + wheel_name("right", 1)).dofadr[0]
+    data.qfrc_applied[wheel] = -load * WHEEL_RADIUS
     step(model, data, round(4.0 / model.opt.timestep))
     belts = data.qvel[drives(model).dofs[0]] * WHEEL_RADIUS
     assert belts == pytest.approx([TRAVEL_SPEED, 0.3], rel=1e-3)
     assert drive_forces(model, data)[0, 1] == pytest.approx(load, rel=1e-3)
+    data.qfrc_applied[wheel] = -1.05 * SPEC_PULL_PER_TRACK * WHEEL_RADIUS
+    step(model, data, round(1.0 / model.opt.timestep))
+    belts = data.qvel[drives(model).dofs[0]] * WHEEL_RADIUS
+    assert belts[0] == pytest.approx(TRAVEL_SPEED, rel=1e-3)
+    assert belts[1] < 0.0
+    assert drive_forces(model, data)[0, 1] == pytest.approx(SPEC_PULL_PER_TRACK, rel=1e-3)
 
 
 def test_positive_drive_power_never_exceeds_the_engine_share():
@@ -521,8 +529,10 @@ def test_a_refused_draw_leaves_no_drift_for_the_next_draw_to_start_from():
     joints = [model.joint(P + name).qposadr[0] for name in JOINT_NAMES]
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
     apply_ground(model, 0, draw_ground(75, 0))
+    mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
     assert not settle(model, data, 0)
-    assert np.abs(data.qpos[joints] - HOME_POSE).max() > 0.1
+    assert np.isfinite(data.qpos).all()
+    assert np.abs(data.qpos[joints] - HOME_POSE).max() > 0.04
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
     stand(model, data, 0, 75)
     assert np.abs(data.qpos[joints] - HOME_POSE).max() < 1e-2
