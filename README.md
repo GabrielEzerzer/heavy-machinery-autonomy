@@ -92,7 +92,7 @@ python -m hma.machine.demo
 python -m hma.task "dig 1 m down at the far marker"
 ```
 
-The first command opens a viewer and moves the arm through its range. The second asks a GPT model for a trench plan, the task type of the language step until it is changed, and checks it. It calls the [Codex CLI](https://github.com/openai/codex), which must be installed and signed in with your own ChatGPT account; this repo holds no API key.
+The first command opens a viewer and moves the arm through its range, with the hydraulic cylinders and bucket linkage drawn on their pins. The second asks a GPT model for a trench plan, the task type of the language step until it is changed, and checks it. It calls the [Codex CLI](https://github.com/openai/codex), which must be installed and signed in with your own ChatGPT account; this repo holds no API key.
 
 ## Limits
 

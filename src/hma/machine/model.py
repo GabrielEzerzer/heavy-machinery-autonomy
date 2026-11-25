@@ -9,6 +9,8 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+from hma.machine.scenery import dress
+
 ASSETS = Path(__file__).parent / "assets"
 MACHINE_XML = ASSETS / "excavator.xml"
 
@@ -127,16 +129,6 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
     scene.option.timestep = TIMESTEP
     scene.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
     scene.option.tolerance = SOLVER_TOLERANCE
-    scene.visual.global_.offwidth = 1280
-    scene.visual.global_.offheight = 720
-    scene.visual.quality.shadowsize = 4096
-    scene.add_texture(name=GROUND, type=mujoco.mjtTexture.mjTEXTURE_2D,
-                      builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER, width=64, height=64,
-                      rgb1=[0.55, 0.45, 0.33], rgb2=[0.5, 0.41, 0.3])
-    ground = scene.add_material(name=GROUND, texrepeat=[12, 12])
-    ground.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = GROUND
-    scene.worldbody.add_light(pos=[0, 0, 30], dir=[0.3, 0.2, -1],
-                              type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL, castshadow=1)
     for i in range(n_machines):
         prefix = machine_prefix(i)
         offset = np.array([0.0, i * MACHINE_SPACING, 0.0])
@@ -148,6 +140,8 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
                            objtype=mujoco.mjtObj.mjOBJ_BODY, name1=prefix + "base",
                            name2=prefix + ANCHOR, data=[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0],
                            active=int(weld))
+    dress(scene, [(*GROUND_X, i * MACHINE_SPACING + GROUND_Y[0], i * MACHINE_SPACING + GROUND_Y[1])
+                  for i in range(n_machines)])
     scene.add_key(name=HOME_KEY)
     model = scene.compile()
     flat = np.zeros(ground_shape())
