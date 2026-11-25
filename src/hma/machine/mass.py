@@ -11,6 +11,8 @@ from typing import NamedTuple
 
 import numpy as np
 
+from hma.machine import cylinders
+
 ASSETS = Path(__file__).parent / "assets"
 
 OPERATING_WEIGHT = 12000.0
@@ -29,11 +31,10 @@ SHOE_WIDTH = 0.5
 TRACK_HEIGHT = 0.79
 LINK_BAND = 0.06
 
-BOOM_PIVOT = np.array([0.14, 0.424])
-BOOM_TURN = math.pi / 2
+BOOM_PIVOT = np.array(cylinders.BOOM_PIVOT)
 HOME_BOOM = -0.6
-BOOM_FOOT = np.array([0.5561, -0.1644, 0.033])
-BOOM_ROD = np.array([-0.999, 0.0, 1.7051])
+BOOM_FOOT = np.array(cylinders.PINS["boom_foot"][1])
+BOOM_ROD = np.array(cylinders.PINS["boom_rod"][1])
 BOOM_CYLINDER_Y = (-0.25, 0.25)
 BARREL_LENGTH, ROD_LENGTH = 1.25, 1.15
 BARREL_SHARE = 65.0 / 120.0
@@ -158,7 +159,7 @@ def _turn(angle: float, x: float, z: float) -> np.ndarray:
 
 
 def _boom_cylinders() -> tuple[list[Solid], list[Solid]]:
-    angle = BOOM_TURN + HOME_BOOM
+    angle = cylinders.BOOM_TURN + HOME_BOOM
     rod_pin = BOOM_PIVOT + _turn(angle, BOOM_ROD[0], BOOM_ROD[2])
     foot = BOOM_FOOT[[0, 2]]
     axis = (rod_pin - foot) / np.linalg.norm(rod_pin - foot)

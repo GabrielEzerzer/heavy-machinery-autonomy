@@ -40,6 +40,9 @@ BELT_ARMATURE = TRACK_CHAINS / 2
 NOMINAL_FRICTION = (0.45, 0.50)
 
 
+FRONT_LINE, REAR_LINE, SIDE_LINE = TUMBLER, -TUMBLER, GAUGE / 2 + RAIL
+
+
 def side_sign(side: str) -> float:
     return 1.0 if side == "left" else -1.0
 
