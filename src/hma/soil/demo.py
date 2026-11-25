@@ -1,6 +1,6 @@
 """One scripted dig cycle on the welded machine in nominal soil: lower, drag, curl, lift, swing,
-dump. Joints follow inverse-kinematics targets through proportional speed commands.
-Usage: python -m hma.soil.demo"""
+dump. Joints follow inverse-kinematics targets through proportional speed commands; a phase
+ends without the swing while the soil holds the edge. Usage: python -m hma.soil.demo"""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ DRAG_SPEED = 0.3
 SWING_TO = 1.2
 GAIN = 3.0
 TOLERANCE = 0.01
+SWING = JOINT_NAMES.index("swing")
 PHASE_TIMEOUT = 15.0
 START = (np.array([DRAG_FROM, 0.0, 0.5]), PITCH_DIG)
 PHASES = (
@@ -64,7 +65,10 @@ def cycle(model: mujoco.MjModel, data: mujoco.MjData, soil: Soil,
             pitch = goal_pitch if name != "drag" else pitch
             target = inverse_kinematics(position, pitch)
             error = target - data.qpos[qpos]
-            if np.linalg.norm(goal - position) < 1e-9 and np.abs(error).max() < TOLERANCE:
+            waiting = np.abs(error)
+            if any(soil.limits):
+                waiting[SWING] = 0.0
+            if np.linalg.norm(goal - position) < 1e-9 and waiting.max() < TOLERANCE:
                 break
             data.ctrl[acts] = np.clip(GAIN * error, -limits, limits)
             step(model, data, [soil], control_hz)

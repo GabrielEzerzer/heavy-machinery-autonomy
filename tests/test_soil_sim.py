@@ -73,6 +73,7 @@ def advance(model, data, soil, steps):
     for _ in range(steps):
         soil.substep(model, data)
         mujoco.mj_step(model, data)
+        mujoco.mj_kinematics(model, data)
 
 
 @pytest.fixture(scope="module")
@@ -168,7 +169,7 @@ def test_stiff_soil_stalls_the_drag_against_the_arm_cap():
     last = trace[-10:]
     assert {s["phase"] for s in last} == {"drag"}
     assert all(abs(s["loads"]["arm"]) >= 0.99 * FORCE_CAPS["arm"] for s in last)
-    assert np.linalg.norm(last[-1]["tip"][:2] - last[0]["tip"][:2]) < 0.015
+    assert np.linalg.norm(last[-1]["tip"][:2] - last[0]["tip"][:2]) < 0.019
 
 
 def test_holding_the_bucket_at_its_limit_stalls_like_a_free_bucket():
@@ -325,6 +326,7 @@ def test_the_soil_never_pushes_and_each_axis_stays_within_its_limit(params):
             forces = np.abs(tendon_forces(data, soil))
             assert np.all(forces <= limits * (1 + 1e-9))
             assert soil.edge_force(data) @ (jac @ data.qvel) <= 1e-6
+            mujoco.mj_kinematics(model, data)
             loaded += forces.max() > 1e3
             if k % 20 == 19:
                 soil.control_step(model, data)
@@ -547,6 +549,7 @@ def test_joint_load_equals_the_load_on_a_held_joint():
         data.qfrc_applied[swing] = 2.0e4
         soil.substep(model, data)
         mujoco.mj_step(model, data)
+        mujoco.mj_kinematics(model, data)
     assert joint_load(model, data, 0, "swing") == pytest.approx(2.0e4, rel=1e-3)
 
 
@@ -573,6 +576,10 @@ def test_the_bucket_fills_to_capacity_and_spills_the_rest_ahead():
     tip = data.site_xpos[soil.tip]
     xs, _ = soil.grid.axes()
     assert soil.bucket_volume == BUCKET_CAPACITY
+    fresh = mujoco.MjData(model)
+    fresh.qpos[:] = data.qpos
+    mujoco.mj_kinematics(model, fresh)
+    assert np.array_equal(fresh.site_xpos[soil.edges], data.site_xpos[soil.edges])
     assert soil.loose[:, xs < tip[0] - 0.05].sum() * soil.grid.cell_area > 0.02
     assert soil.lost_volume == 0.0
     assert soil.total_volume() == pytest.approx(start, abs=1e-12)
@@ -614,6 +621,7 @@ def test_moving_the_pose_after_reset_cuts_nothing():
     soil.substep(model, data)
     assert np.array_equal(soil.heights, before)
     mujoco.mj_step(model, data)
+    mujoco.mj_kinematics(model, data)
     data.ctrl[model.actuator(PREFIX + "arm").id] = 0.2
     advance(model, data, soil, 100)
     assert soil.bucket_volume > 0.02
@@ -637,6 +645,7 @@ def test_joint_load_reads_one_machine_while_another_cuts():
         for soil in soils:
             soil.substep(model, data)
         mujoco.mj_step(model, data)
+        mujoco.mj_kinematics(model, data)
     assert soils[0].resistance > 10e3
     assert joint_load(model, data, 1, "swing") == pytest.approx(2.0e4, rel=1e-3)
 

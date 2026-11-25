@@ -14,7 +14,15 @@ import mujoco
 import numpy as np
 
 from hma.hydraulics import NOMINAL, BaseController, Hydraulics, Machine, draw_machine
-from hma.machine import HOME_POSE, JOINT_LIMITS, JOINT_NAMES, forward_kinematics, load_scene
+from hma.machine import (
+    HOME_POSE,
+    JOINT_LIMITS,
+    JOINT_NAMES,
+    forward_kinematics,
+    inverse_kinematics,
+    load_scene,
+    machine_prefix,
+)
 from hma.machine.kinematics import BOOM_PIVOT
 from hma.sim import reset, step
 from hma.soil import NOMINAL as NOMINAL_SOIL
@@ -95,15 +103,23 @@ def home_path() -> CyclePath:
 DUMP_AT = tip_point(DRAG_TO, SWING_TO, CARRY_HEIGHT)
 
 
-def admissible(path: CyclePath, soil: Soil, samples: int = 2000) -> bool:
+def asked_depth(path: CyclePath, soil: Soil, t: float) -> float:
+    return max(soil.grid.z0 - float(path(t)[0][2]), 0.0)
+
+
+def admissible(path: CyclePath, model: mujoco.MjModel, soil: Soil, samples: int = 2000) -> bool:
+    data = mujoco.MjData(model)
+    joints = [model.joint(machine_prefix(soil.index) + j).qposadr[0] for j in JOINT_NAMES]
     xs, ys = soil.grid.axes()
     for t in np.linspace(0.0, path.duration, samples):
-        (x, y, z), _ = path(t)
-        below = z < soil.grid.z0
-        if below and not (xs[0] <= x <= xs[-1] and ys[0] <= y <= ys[-1]):
-            return False
-        if soil.grid.z0 - z > PASS_DEPTH + 1e-9:
-            return False
+        data.qpos[joints] = inverse_kinematics(*path(t))
+        mujoco.mj_kinematics(model, data)
+        for x, y, z in data.site_xpos[soil.edges]:
+            below = z < soil.grid.z0
+            if below and not (xs[0] <= x <= xs[-1] and ys[0] <= y <= ys[-1]):
+                return False
+            if soil.grid.z0 - z > PASS_DEPTH + 1e-9:
+                return False
     return True
 
 
@@ -122,7 +138,8 @@ def dig(machine: Machine, params: SoilParams, weld: bool = True, viewer=None) ->
     start = soil.heights.copy()
     total = soil.total_volume()
     limits = np.array([[-math.inf, math.inf], *JOINT_LIMITS.values()])
-    stalled_for = np.zeros(len(JOINT_NAMES))
+    stalled_for = np.zeros(len(JOINT_NAMES), int)
+    stall_steps = round(STALL_TIME * layer.control_hz)
     stalls, errors, filled, excess, outside, base = set(), [], 0.0, 0.0, False, []
     steps = round(path.duration * layer.control_hz)
     for k in range(steps):
@@ -130,16 +147,16 @@ def dig(machine: Machine, params: SoilParams, weld: bool = True, viewer=None) ->
         step(layer, [soil], controller(t, layer.observe().positions[0])[None])
         state = layer.true_state()
         q, v, load = state.positions[0], state.velocities[0], state.loads[0]
-        tip, _ = forward_kinematics(q)
-        errors.append(np.linalg.norm(tip - path(t + 1.0 / layer.control_hz)[0]))
+        now = t + 1.0 / layer.control_hz
+        errors.append(np.linalg.norm(data.site_xpos[soil.tip] - path(now)[0]))
         filled = max(filled, soil.bucket_volume)
-        excess = max(excess, soil.uncut_depth(data) - PASS_DEPTH)
+        excess = max(excess, soil.uncut_depth(data) - asked_depth(path, soil, now))
         edge_z = data.site_xpos[soil.edges, 2].min()
         outside |= edge_z < soil.grid.z0 and not soil.edge_inside(data)
         free = (q - limits[:, 0] > STOP_MARGIN) & (limits[:, 1] - q > STOP_MARGIN)
         held = (np.abs(load) >= STALL_LOAD) & (np.abs(v) < STALL_SPEED) & free
-        stalled_for = np.where(held, stalled_for + 1.0 / layer.control_hz, 0.0)
-        for j in np.flatnonzero(stalled_for >= STALL_TIME):
+        stalled_for = np.where(held, stalled_for + 1, 0)
+        for j in np.flatnonzero(stalled_for >= stall_steps):
             stalls.add(f"{JOINT_NAMES[j]} in {path.phase(t)}")
         base.append(data.xpos[soil.base].copy())
         if viewer is not None:
@@ -154,6 +171,7 @@ def dig(machine: Machine, params: SoilParams, weld: bool = True, viewer=None) ->
     return {
         "machine": machine.seed, "soil": params,
         "trench_out": float(-change[trench].sum() * area),
+        "cut_outside": float(np.maximum(-change[~trench], 0.0).sum() * area),
         "pile": float(change[pile].sum() * area),
         "filled": filled, "left_in_bucket": soil.bucket_volume,
         "error_mean": float(errors.mean()), "error_max": float(errors.max()),
@@ -168,8 +186,9 @@ def dig(machine: Machine, params: SoilParams, weld: bool = True, viewer=None) ->
 
 def _row(name: str, r: dict) -> str:
     stalls = ", ".join(r["stalls"]) or "-"
-    return (f"{name:>10} {r['trench_out']:6.3f} {r['pile']:6.3f} {r['filled']:6.3f} "
-            f"{r['left_in_bucket']:6.3f} {100 * r['error_mean']:6.1f} {100 * r['error_max']:6.1f} "
+    return (f"{name:>10} {r['trench_out']:6.3f} {r['cut_outside']:7.3f} {r['pile']:6.3f} "
+            f"{r['filled']:6.3f} {r['left_in_bucket']:6.3f} {100 * r['error_mean']:6.1f} "
+            f"{100 * r['error_max']:6.1f} "
             f"{'yes' if r['broke_rule'] else 'no':>5} {stalls}")
 
 
@@ -206,8 +225,8 @@ def main() -> None:
     parser.add_argument("--free", action="store_true", help="also run one cycle on a free base")
     parser.add_argument("--view", action="store_true", help="watch the nominal cycle")
     args = parser.parse_args()
-    print(f"{'pair':>10} {'out m3':>6} {'pile':>6} {'filled':>6} {'left':>6} {'err cm':>6} "
-          f"{'max':>6} {'broke':>5} stalls")
+    print(f"{'pair':>10} {'out m3':>6} {'outside':>7} {'pile':>6} {'filled':>6} {'left':>6} "
+          f"{'err cm':>6} {'max':>6} {'broke':>5} stalls")
     if args.view:
         sync, close = _viewer_sync()
         try:
@@ -223,6 +242,7 @@ def main() -> None:
         print(_row(f"seed {seed}", runs[-1]))
     if runs:
         print(f"{'median':>10} {np.median([r['trench_out'] for r in runs]):6.3f} "
+              f"{np.median([r['cut_outside'] for r in runs]):7.3f} "
               f"{np.median([r['pile'] for r in runs]):6.3f} "
               f"{np.median([r['filled'] for r in runs]):6.3f} "
               f"{np.median([r['left_in_bucket'] for r in runs]):6.3f} "

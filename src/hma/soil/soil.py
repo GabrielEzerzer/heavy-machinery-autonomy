@@ -1,5 +1,5 @@
 """One soil per machine: a height grid cut by the bucket's edge; bucket fill, spill, dump, settling.
-Call substep() before every mj_step and control_step() once per control period, or use step().
+Call substep() before every mj_step, mj_kinematics after it, control_step() once per control period.
 Resistance is friction on three tendons set by the bucket's pose; soil weight is a bucket force."""
 
 from __future__ import annotations
@@ -251,6 +251,7 @@ def step(model: mujoco.MjModel, data: mujoco.MjData, soils: list[Soil],
         for soil in soils:
             soil.substep(model, data)
         mujoco.mj_step(model, data)
+        mujoco.mj_kinematics(model, data)
     for soil in soils:
         soil.control_step(model, data)
 

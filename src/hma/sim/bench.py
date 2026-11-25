@@ -40,10 +40,11 @@ def measure(machines, soils_params) -> dict:
     pose = inverse_kinematics(*START)
     commands = np.tile(DRAG, (len(machines), 1))
     best = None
-    physics = mujoco.mj_step
+    physics, kinematics = mujoco.mj_step, mujoco.mj_kinematics
     for _ in range(REPEATS):
         clock = {"physics": 0.0, "soil": 0.0}
         mujoco.mj_step = _timed(clock, "physics", physics)
+        mujoco.mj_kinematics = _timed(clock, "physics", kinematics)
         for soil in soils:
             soil.substep = _timed(clock, "soil", Soil.substep.__get__(soil))
             soil.control_step = _timed(clock, "soil", Soil.control_step.__get__(soil))
@@ -58,7 +59,7 @@ def measure(machines, soils_params) -> dict:
                     cutting.append(np.mean([s.resistance > 0.0 for s in soils]))
                 total += time.perf_counter() - start
         finally:
-            mujoco.mj_step = physics
+            mujoco.mj_step, mujoco.mj_kinematics = physics, kinematics
             for soil in soils:
                 del soil.substep, soil.control_step
         steps = EPISODES * EPISODE * layer.steps_per_decision

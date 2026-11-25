@@ -25,6 +25,7 @@ from hma.machine import (
     VALVE,
     load_scene,
     machine_prefix,
+    set_soil_softness,
     tendon_friction,
 )
 from hma.machine.model import COUNTERWEIGHT_MASS
@@ -218,6 +219,7 @@ class Hydraulics:
         self.model.tendon_frictionloss[self._tendons[index]] = machine.force_limit
         self._apply_mass(index, machine)
         mujoco.mj_setConst(self.model, self._scratch)
+        set_soil_softness(self.model)
         self._reset_state(index, pose)
 
     def _draw_noise(self, index: int) -> None:

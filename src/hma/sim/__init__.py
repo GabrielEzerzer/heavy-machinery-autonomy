@@ -1,11 +1,12 @@
 """A scene with both layers: machines through the hydraulics layer, each optionally on its soil.
-Per physics step every soil sets its resistance and bucket weight, then the hydraulics layer writes
-the joint speeds, the physics steps and the layer reads loads that include the soil."""
+Per physics step every soil sets its resistance and bucket weight, the hydraulics layer steps the
+physics and reads loads that include the soil, then positions are brought up to the new pose."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
+import mujoco
 import numpy as np
 
 from hma.hydraulics import Hydraulics, Machine
@@ -19,6 +20,7 @@ def step(layer: Hydraulics, soils: Sequence[Soil], commands: np.ndarray) -> None
         for soil in soils:
             soil.substep(model, data)
         layer.step()
+        mujoco.mj_kinematics(model, data)
     for soil in soils:
         soil.control_step(model, data)
 
