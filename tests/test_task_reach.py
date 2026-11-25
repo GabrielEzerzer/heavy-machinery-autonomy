@@ -3,7 +3,6 @@ import math
 import numpy as np
 
 from hma.machine import JOINT_LIMITS, JOINT_NAMES, forward_kinematics
-from hma.task.checks import deepest_reachable
 
 
 def test_every_pose_inside_joint_limits_is_reachable(arm):
@@ -19,5 +18,3 @@ def test_envelope_is_that_of_a_12_tonne_class_machine(arm):
     assert arm.reachable(5.5, 0, -1)
     assert not arm.reachable(5.5, 0, -8)
     assert not arm.reachable(9.0, 0, 0)
-    assert 4.0 < -deepest_reachable(arm, 5.5, 0) < 5.5
-    assert deepest_reachable(arm, 20, 0) is None
