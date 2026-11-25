@@ -9,10 +9,8 @@ from dataclasses import dataclass
 import mujoco
 import numpy as np
 
+from hma.machine.contact import ground_geoms
 from hma.machine.model import (
-    GROUND,
-    GROUND_X,
-    GROUND_Y,
     HOME_KEY,
     HOOK,
     LOAD,
@@ -23,7 +21,6 @@ from hma.machine.model import (
     MACHINE_SPACING,
     SLING,
     box_inertia,
-    ground_axes,
     leg_length,
     load_points,
     machine_prefix,
@@ -39,6 +36,8 @@ RANGES = {
 }
 LEGS = 4
 SLACK = 1e-3
+RAY_TOP = 100.0
+DOWN = np.array([0.0, 0.0, -1.0])
 CORNERS = ((1, 1), (-1, 1), (-1, -1), (1, -1))
 
 
@@ -81,28 +80,36 @@ def _ids(model: mujoco.MjModel, index: int):
             np.array([model.tendon(f"{prefix}{SLING}{k}").id for k in range(LEGS)]))
 
 
-def ground_height(model: mujoco.MjModel, index: int, x: float, y: float) -> float:
-    name = machine_prefix(index) + GROUND
-    hf = model.hfield(name)
-    nrow, ncol = int(hf.nrow[0]), int(hf.ncol[0])
-    grid = model.hfield_data[hf.adr[0]:hf.adr[0] + nrow * ncol].reshape(nrow, ncol)
-    xs, ys = ground_axes()
-    gx = float(np.clip(np.interp(x, xs, np.arange(ncol)), 0, ncol - 1.000001))
-    gy = float(np.clip(np.interp(y, ys, np.arange(nrow)), 0, nrow - 1.000001))
-    i, j, fy, fx = int(gy), int(gx), gy % 1.0, gx % 1.0
-    value = ((1 - fy) * ((1 - fx) * grid[i, j] + fx * grid[i, j + 1])
-             + fy * ((1 - fx) * grid[i + 1, j] + fx * grid[i + 1, j + 1]))
-    return float(model.geom_pos[model.geom(name).id][2] + value * hf.size[2])
+def ground_height(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float,
+                  y: float) -> float | None:
+    top = np.array([x, y + index * MACHINE_SPACING, RAY_TOP])
+    best = np.inf
+    for geom in ground_geoms(model, index):
+        kind = model.geom_type[geom]
+        if kind == mujoco.mjtGeom.mjGEOM_HFIELD:
+            dist = mujoco.mj_rayHfield(model, data, geom, top, DOWN)
+        elif kind == mujoco.mjtGeom.mjGEOM_MESH:
+            dist = mujoco.mj_rayMesh(model, data, geom, top, DOWN)
+        else:
+            dist = mujoco.mju_rayGeom(data.geom_xpos[geom], data.geom_xmat[geom],
+                                      model.geom_size[geom], top, DOWN, kind)
+        if dist >= 0:
+            best = min(best, dist)
+    return None if best == np.inf else float(RAY_TOP - best)
 
 
-def resting_height(model: mujoco.MjModel, index: int, x: float, y: float, yaw: float,
-                   half: np.ndarray) -> float:
+def resting_height(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float, y: float,
+                   yaw: float, half: np.ndarray) -> float:
+    mujoco.mj_kinematics(model, data)
     c, s = np.cos(yaw), np.sin(yaw)
     u = np.linspace(-1.0, 1.0, 9)
     gx, gy = np.meshgrid(u * half[0], u * half[1])
     px, py = x + c * gx - s * gy, y + s * gx + c * gy
-    return max(ground_height(model, index, a, b)
-               for a, b in zip(px.ravel(), py.ravel(), strict=True))
+    heights = [ground_height(model, data, index, a, b)
+               for a, b in zip(px.ravel(), py.ravel(), strict=True)]
+    if None in heights:
+        raise ValueError("the load must be placed on this machine's ground")
+    return max(heights)
 
 
 def apply_load(model: mujoco.MjModel, index: int, load: Load, scratch: mujoco.MjData) -> None:
@@ -138,26 +145,25 @@ def apply_load(model: mujoco.MjModel, index: int, load: Load, scratch: mujoco.Mj
                                                                       half[2]]
     model.tendon_range[tendons] = [0.0, load.leg]
     model.tendon_limited[tendons] = 0
-    rest_home(model, index)
+    rest_home(model, scratch, index)
     mujoco.mj_setConst(model, scratch)
 
 
-def rest_home(model: mujoco.MjModel, index: int) -> None:
+def rest_home(model: mujoco.MjModel, scratch: mujoco.MjData, index: int) -> None:
     _, _, geom, q0, *_ = _ids(model, index)
     half = model.geom_size[geom]
     x, y = LOAD_HOME
+    z = resting_height(model, scratch, index, x, y, 0.0, half) + half[2]
     model.key_qpos[model.key(HOME_KEY).id, q0:q0 + 7] = [
-        x, y + index * MACHINE_SPACING, resting_height(model, index, x, y, 0.0, half) + half[2],
+        x, y + index * MACHINE_SPACING, z,
         1.0, 0.0, 0.0, 0.0]
 
 
 def place_load(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float, y: float,
                yaw: float = 0.0) -> None:
-    if not (GROUND_X[0] < x < GROUND_X[1] and GROUND_Y[0] < y < GROUND_Y[1]):
-        raise ValueError("the load must be placed on this machine's ground")
     _, _, geom, q0, v0, tendons = _ids(model, index)
     half = model.geom_size[geom]
-    z = resting_height(model, index, x, y, yaw, half) + half[2]
+    z = resting_height(model, data, index, x, y, yaw, half) + half[2]
     data.qpos[q0:q0 + 7] = [x, y + index * MACHINE_SPACING, z, np.cos(yaw / 2), 0.0, 0.0,
                             np.sin(yaw / 2)]
     data.qvel[v0:v0 + 6] = 0.0

@@ -19,7 +19,12 @@ from hma.machine import (
     write_ground,
 )
 from hma.machine.collision import LINK_MESH, PIECES, link_triangles
-from hma.machine.contact import STEEL_FRICTION_RANGE, draw_friction, set_friction
+from hma.machine.contact import (
+    STEEL_FRICTION_RANGE,
+    draw_friction,
+    ground_geoms,
+    set_friction,
+)
 from hma.machine.load import (
     RANGES,
     apply_load,
@@ -299,9 +304,10 @@ def test_driving_every_joint_end_to_end_passes_nothing_through_anything(swing):
 
 
 def ground_contacts(model, data, link):
-    ground = model.geom(P + "ground").id
-    return [c for c in data.contact[:data.ncon] if ground in (c.geom1, c.geom2)
-            and model.body(model.geom_bodyid[c.geom1 + c.geom2 - ground]).name == P + link]
+    ground = set(ground_geoms(model, 0).tolist())
+    body = model.body(P + link).id
+    return [c for c in data.contact[:data.ncon]
+            if {c.geom1, c.geom2} & ground and body in model.geom_bodyid[[c.geom1, c.geom2]]]
 
 
 @pytest.mark.parametrize(("link", "start", "edges"), [
@@ -356,8 +362,9 @@ def test_swung_counterweight_stops_against_a_mound_beside_the_tracks():
     swing = data.qpos[model.joint(P + "swing").qposadr[0]]
     assert swing < math.radians(45.0)
     rear = model.geom(P + "upper_rear").id
-    ground = model.geom(P + "ground").id
-    touching = [c for c in data.contact[:data.ncon] if {c.geom1, c.geom2} == {rear, ground}]
+    ground = set(ground_geoms(model, 0).tolist())
+    touching = [c for c in data.contact[:data.ncon]
+                if rear in (c.geom1, c.geom2) and {c.geom1, c.geom2} & ground]
     assert touching and min(c.dist for c in touching) > -0.002
     assert abs(valve_load(model, data, "swing")) == pytest.approx(FORCE_CAPS["swing"], rel=1e-3)
 

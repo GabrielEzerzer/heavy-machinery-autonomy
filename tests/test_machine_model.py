@@ -23,8 +23,9 @@ from hma.machine import (
     set_weld,
     write_ground,
 )
+from hma.machine.contact import ground_geoms
 from hma.machine.load import apply_load, block, hang_load
-from hma.machine.model import GROUND_DEPTH, LOAD_POINTS, SPEED_LIMITS, VALVE
+from hma.machine.model import GROUND_DEPTH, LOAD_POINTS, MAX_MACHINES, SPEED_LIMITS, VALVE
 
 LIFT_POSE = (0.0, -0.7, 0.8, 2.3)
 SOURCE_LIMITS_DEG = {"boom": (-70.0, 44.0), "arm": (30.0, 152.0), "bucket": (-33.0, 143.0)}
@@ -146,13 +147,12 @@ def test_each_machine_stands_on_its_own_ground_with_few_contacts():
     settle(model, data)
     pairs = {}
     for contact in data.contact[: data.ncon]:
-        g1, g2 = model.geom(contact.geom1).name, model.geom(contact.geom2).name
-        pairs[(g1, g2)] = pairs.get((g1, g2), 0) + 1
+        pairs[(contact.geom1, contact.geom2)] = pairs.get((contact.geom1, contact.geom2), 0) + 1
     for (g1, g2), count in pairs.items():
-        names = sorted((g1, g2))
-        prefix = names[0][:3]
-        assert names[0] == prefix + GROUND
-        assert names[1].startswith(prefix + "track_") and count <= 4 or names[1].startswith(
+        index, ground, other = on_ground(model, g1, g2)
+        prefix = machine_prefix(index)
+        name = model.geom(other).name
+        assert name.startswith(prefix + "track_") and count <= 4 or name.startswith(
             prefix + LOAD_POINTS)
     assert 0 < data.ncon <= 2 * (24 * 2 + 26)
     for i in range(2):
@@ -164,9 +164,16 @@ def test_welded_machines_have_no_contacts():
     data = home_data(model)
     settle(model, data, 0.5)
     for contact in data.contact[: data.ncon]:
-        names = sorted((model.geom(contact.geom1).name, model.geom(contact.geom2).name))
-        assert names[0] == names[0][:3] + GROUND
-        assert names[1].startswith(names[0][:3] + LOAD_POINTS)
+        index, _, other = on_ground(model, contact.geom1, contact.geom2)
+        assert model.geom(other).name.startswith(machine_prefix(index) + LOAD_POINTS)
+
+
+def on_ground(model, g1, g2):
+    for index in range(MAX_MACHINES):
+        ground = ground_geoms(model, index)
+        if g1 in ground or g2 in ground:
+            return index, (g1 if g1 in ground else g2), (g2 if g1 in ground else g1)
+    raise AssertionError("a contact that does not involve any machine's ground")
 
 
 def test_free_base_rests_flush_and_tip_matches_kinematics():
