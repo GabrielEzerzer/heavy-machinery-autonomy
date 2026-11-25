@@ -1,5 +1,5 @@
 {
- "instruction": "dig one metre down at the far marker",
+ "instruction": "prop the machine up on its bucket for ten seconds",
  "source": "constructed",
- "output": "{\"status\":\"plan\",\"message\":\"Dig 1 m down at the far marker.\",\"task_type\":\"trench\",\"marker_id\":\"M3\",\"depth_m\":\"1\",\"length_m\":null,\"width_m\":null,\"heading\":null,\"spoil_side\":null,\"soil_class\":\"unknown\"}"
+ "output": "{\"status\":\"plan\",\"message\":\"Prop the machine on its bucket for 10 seconds.\",\"task_type\":\"prop\",\"load_id\":null,\"marker_id\":null,\"stand_marker_id\":null,\"hold_s\":\"10\"}"
 }

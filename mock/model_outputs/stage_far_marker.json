@@ -1,5 +1,0 @@
-{
- "instruction": "dig 1 m down at the far marker",
- "source": "recorded",
- "output": "{\"status\":\"plan\",\"message\":\"Dig 1 m down at the far marker.\",\"task_type\":\"trench\",\"marker_id\":\"M3\",\"depth_m\":1,\"length_m\":null,\"width_m\":null,\"heading\":null,\"spoil_side\":null,\"soil_class\":\"unknown\"}"
-}

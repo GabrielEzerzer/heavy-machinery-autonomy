@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from hma.task.body import Body
 from hma.task.cache import PlanCache
 from hma.task.checks import CheckReport, Plan, confirm_plan, validate
 from hma.task.model import PlanSource
@@ -27,6 +28,7 @@ def plan_task(
     source: PlanSource,
     cache: PlanCache,
     reach: Reach,
+    body: Body,
     confirm: Callable[[Plan], bool],
     on_validated: Callable[[CheckReport, bool, float | None], None] | None = None,
 ) -> Outcome:
@@ -36,7 +38,7 @@ def plan_task(
         start = time.perf_counter()
         raw = source(instruction, scene)
         seconds = time.perf_counter() - start
-    report = validate(raw, scene, reach)
+    report = validate(raw, scene, reach, body)
     if report.validated and not from_cache:
         try:
             cache.put(instruction, scene, raw)

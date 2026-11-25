@@ -21,24 +21,10 @@ class Status(StrEnum):
 
 
 class TaskType(StrEnum):
-    trench = "trench"
-
-
-class Heading(StrEnum):
-    toward_machine = "toward_machine"
-    across = "across"
-
-
-class SpoilSide(StrEnum):
-    left = "left"
-    right = "right"
-
-
-class SoilClass(StrEnum):
-    A = "A"
-    B = "B"
-    C = "C"
-    unknown = "unknown"
+    carry = "carry"
+    prop = "prop"
+    turn = "turn"
+    travel = "travel"
 
 
 def printable(text: str) -> str:
@@ -51,7 +37,7 @@ def _printable(text: str) -> str:
     return printable(text)
 
 
-Metres = Annotated[float, Field(ge=0, le=50, allow_inf_nan=False)]
+Seconds = Annotated[float, Field(ge=0, le=3600, allow_inf_nan=False)]
 
 
 class TaskSpec(BaseModel):
@@ -60,19 +46,23 @@ class TaskSpec(BaseModel):
     status: Status
     message: Annotated[str, AfterValidator(_printable)]
     task_type: TaskType | None
+    load_id: str | None
     marker_id: str | None
-    depth_m: Metres | None
-    length_m: Metres | None
-    width_m: Metres | None
-    heading: Heading | None
-    spoil_side: SpoilSide | None
-    soil_class: SoilClass | None
+    stand_marker_id: str | None
+    hold_s: Seconds | None
 
 
 @lru_cache(maxsize=8)
 def spec_model(scene: Scene) -> type[TaskSpec]:
     marker_ids = StrEnum("MarkerId", {m.id: m.id for m in scene.markers})
-    return create_model("TaskSpec", __base__=TaskSpec, marker_id=(marker_ids | None, ...))
+    load_ids = StrEnum("LoadId", {m.id: m.id for m in scene.loads})
+    return create_model(
+        "TaskSpec",
+        __base__=TaskSpec,
+        load_id=(load_ids | None, ...),
+        marker_id=(marker_ids | None, ...),
+        stand_marker_id=(marker_ids | None, ...),
+    )
 
 
 def strict_schema(scene: Scene) -> dict:
