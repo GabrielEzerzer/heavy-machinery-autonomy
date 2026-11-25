@@ -13,7 +13,7 @@ import numpy as np
 from hma.hydraulics import circuit as c
 from hma.hydraulics.params import CURVE_SEGMENTS, NOMINAL, RANGES, Machine
 from hma.machine import BODY_NAMES, HOME_KEY, JOINT_NAMES, WELD, load_scene, machine_prefix
-from hma.machine.cylinders import MAIN_RELIEF
+from hma.machine.cylinders import MAIN_RELIEF, seal_friction
 from hma.machine.model import COUNTERWEIGHT_MASS
 
 CONTROL_HZ = 10.0
@@ -147,7 +147,6 @@ class Hydraulics:
         self._qvel = joint_field("dofadr")
         self._actuators = np.array([[model.actuator(machine_prefix(i) + j).id
                                      for j in JOINT_NAMES] for i in range(self.n)])
-        self._swing_dofs = self._qvel[:, SWING].copy()
         self._bodies = np.array([[model.body(machine_prefix(i) + b).id for b in BODY_NAMES]
                                  for i in range(self.n)])
         self._own_joints = [[j for j in range(model.njnt)
@@ -172,9 +171,10 @@ class Hydraulics:
         self._scratch = mujoco.MjData(model)
         reference_dofs = [reference.joint(machine_prefix(0) + j).dofadr[0] for j in JOINT_NAMES]
         self._base_armature = np.tile(reference.dof_armature[reference_dofs], (self.n, 1))
-        self._base_friction = np.full(self.n, reference.dof_frictionloss[reference_dofs[SWING]])
+        self._base_frictionloss = np.tile(reference.dof_frictionloss[reference_dofs], (self.n, 1))
+        self._base_friction = self._base_frictionloss[:, SWING].copy()
         model.dof_armature[self._qvel] = self._base_armature
-        model.dof_frictionloss[self._swing_dofs] = self._base_friction
+        model.dof_frictionloss[self._qvel] = self._base_frictionloss
 
         delay_cap = max([RANGES["delay"][1], *(float(np.max(m.delay)) for m in machines)])
         latency_cap = max([RANGES["sensor_latency"][1], *(m.sensor_latency for m in machines)])
@@ -495,6 +495,10 @@ class Hydraulics:
         mujoco.mj_getState(model, data, self._state, STATE)
         self._neutral = np.where(self._piloted, 0.0, self._neutral + dt)
         brake = self._base_friction + np.where(self._neutral >= c.BRAKE_DELAY, self._brake, 0.0)
+        chambers = pressure[:, c.PUMPS:].reshape(n, JOINTS, 2)
+        seal = np.zeros((n, JOINTS))
+        seal[:, 1:] = seal_friction(chambers[:, 1:, 0], chambers[:, 1:, 1], rod[:, 1:])
+        seal *= np.abs(lever)
         redo = np.zeros(n, bool)
         redo_held = np.zeros((n, NODES), bool)
         redo_speed = np.zeros((n, JOINTS))
@@ -531,10 +535,12 @@ class Hydraulics:
             push = np.where(contact, lever * (held - others), 0.0)
             data.ctrl[self._actuators] = push - stiff * qd
             model.dof_armature[qvel] = self._base_armature + stiff * dt
-            model.dof_frictionloss[self._swing_dofs] = brake
+            friction = self._base_frictionloss + np.where(contact, seal, 0.0)
+            friction[:, SWING] = brake
+            model.dof_frictionloss[qvel] = friction
             mujoco.mj_step(model, data)
             model.dof_armature[qvel] = self._base_armature
-            model.dof_frictionloss[self._swing_dofs] = self._base_friction
+            model.dof_frictionloss[qvel] = self._base_frictionloss
 
             joint_rod = lever * data.qvel[qvel]
             room = play * (1.0 / dt)

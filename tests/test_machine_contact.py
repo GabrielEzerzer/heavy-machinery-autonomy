@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from hma.hydraulics import NOMINAL, circuit
+from hma.hydraulics import layer as oil_layer
 from hma.hydraulics.layer import DISPLACEMENT
 from hma.machine import (
     HOME_KEY,
@@ -18,6 +19,7 @@ from hma.machine import (
     write_ground,
 )
 from hma.machine.collision import LINK_MESH, PIECES, link_triangles
+from hma.machine.cylinders import seal_friction
 from hma.machine.contact import STEEL_FRICTION_RANGE, draw_friction, set_friction
 from hma.machine.load import (
     LEG_WLL,
@@ -290,6 +292,53 @@ def test_joint_loads_with_a_hanging_load_match_statics():
         sim = data.actuator_force[model.actuator(P + joint).id]
         assert abs(sim) == pytest.approx(abs(hand), rel=0.01)
 
+
+
+def test_hung_load_on_the_oil_reads_its_sling_tension_on_the_instant():
+    model, data = hung(3000.0)
+    run(model, data, 6.0)
+    block_weight = model.body_mass[model.body(P + "load").id] * G
+    for _ in range(5):
+        assert sling_tension(model, data, 0) == pytest.approx(
+            block_weight / math.cos(math.radians(30.0)), rel=0.01)
+        run(model, data, 1.0)
+
+
+def bounce(model, data, layer, seconds):
+    static = model.body_mass[model.body(P + "load").id] * G / math.cos(math.radians(30.0))
+    swing, boom_seals = [], []
+    for _ in range(round(seconds / model.opt.timestep)):
+        layer.step()
+        swing.append(sling_tension(model, data, 0) / static - 1.0)
+        _, lever = circuit.geometry(data.qpos[layer._qpos[0]])
+        chambers = layer.chamber_pressures()[0]
+        speed = lever * data.qvel[layer._qvel[0]]
+        boom_seals.append(seal_friction(chambers[1:, 0], chambers[1:, 1], speed[1:])[0]
+                          * abs(lever[1]))
+    swing = np.abs(swing)
+    peaks = np.flatnonzero((swing[1:-1] >= swing[:-2]) & (swing[1:-1] > swing[2:])) + 1
+    t = (peaks + 1) * model.opt.timestep
+    kept = (t > 1.0) & (t < 3.3) & (swing[peaks] > 0.01)
+    return np.polyfit(t[kept], swing[peaks][kept], 1)[0], np.median(np.diff(t[kept])), np.mean(
+        boom_seals[200:660])
+
+
+def test_hung_load_bounce_dies_at_the_rate_the_boom_seals_give_by_hand(monkeypatch):
+    with monkeypatch.context() as patch:
+        patch.setattr(oil_layer, "seal_friction", lambda head, rod, speed: np.zeros(np.shape(head)))
+        model, data = hung(3000.0)
+        oil_only, half_period, _ = bounce(model, data, held(model, data), 3.5)
+    model, data = hung(3000.0)
+    layer = held(model, data)
+    with_seals, _, seals = bounce(model, data, layer, 3.5)
+    mass = np.zeros((model.nv, model.nv))
+    mujoco.mj_fullM(model, data, mass)
+    boom = layer._qvel[0, 1]
+    reach = data.site_xpos[model.site(P + "hook").id][0] - pivot_x(model, data, "boom")
+    inertia = mass[boom, boom] + 3000.0 * reach ** 2
+    hand = 4.0 * abs(reach) * seals / (inertia * G) / (2.0 * half_period)
+    assert oil_only < 0.0
+    assert hand <= oil_only - with_seals <= 1.25 * hand
 
 
 def test_sling_readings_match_statics_and_a_snatch_reads_over_the_rating():
