@@ -118,8 +118,8 @@ def test_a_cylinder_reaching_its_end_stop_overshoots_the_power_only_while_the_pu
         power.append(layer.pump_power[0])
     share = np.array(power) / (NOMINAL.power * c.PUMP_EFFICIENCY)
     window = round(0.5 / DT)
-    assert 1.5 < share.max() < 2.0
-    assert np.convolve(share, np.ones(window) / window, mode="valid").max() < 1.3
+    assert 1.2 < share.max() < 1.8
+    assert np.convolve(share, np.ones(window) / window, mode="valid").max() < 1.25
     assert share[-window:].mean() == pytest.approx(1.0, abs=0.01)
 
 
@@ -146,7 +146,8 @@ def test_sensors_report_the_state_from_the_drawn_latency_ago_with_bounded_noise(
             layer.step()
             truth = layer.true_state()
             history.append(np.concatenate([truth.positions[0], truth.velocities[0],
-                                           (truth.pressures[0] + m.pressure_offset).T.ravel()]))
+                                           np.maximum(truth.pressures[0] + m.pressure_offset,
+                                                      0.0).T.ravel()]))
             if len(history) > lag_steps:
                 seen = layer.observe()
                 reading = np.concatenate([seen.positions[0], seen.velocities[0],
@@ -169,7 +170,7 @@ def test_backlash_crosses_the_drawn_play_when_the_load_reverses():
         layer.reset(0, m, pose)
         layer.act(np.array([[0.0, 0.0, 0.3, 0.0]]))
         trace = []
-        for _ in range(round(2.5 / DT)):
+        for _ in range(round(6.5 / DT)):
             layer.step()
             trace.append((layer.true_state().positions[0, ARM], layer._gap[0, ARM],
                           layer.data.qfrc_bias[layer._qvel[0, ARM]]))
@@ -398,12 +399,55 @@ def test_control_rate_must_be_finite_positive_and_divide_the_physics_rate(contro
     {"leakage": -NOMINAL.leakage},
     {"brake": -1.0},
     {"pump_flow": 0.0},
+    {"delay": np.full(3, 0.05)},
+    {"curve": NOMINAL.curve[:, :-1].copy()},
+    {"leakage": NOMINAL.leakage.ravel()},
+    {"port_relief": np.full(NOMINAL.port_relief.shape, c.TANK_PRESSURE)},
+    {"curve": np.minimum(NOMINAL.curve + 0.1, 1.0)},
+    {"curve": 0.9 * NOMINAL.curve},
 ])
-def test_reset_refuses_a_machine_with_impossible_values(change):
-    layer = layer_for(NOMINAL)
+def test_reset_refuses_a_machine_with_impossible_values_and_leaves_the_layer_alone(change):
+    layer = layer_for(only("mass"))
+    layer.act(np.array([[0.5, -0.5, 0.5, -0.5]]))
+    for _ in range(40):
+        layer.step()
+
+    def snapshot():
+        return [np.concatenate([x.ravel() for x in layer.true_state()]),
+                layer.model.body_mass.copy(), layer.model.dof_armature.copy(),
+                layer._spool.copy(), layer._relief.copy(), layer._pressure.copy(),
+                layer._leakage.copy(), layer._slope.copy(), layer._delay_index.copy()]
+
+    before, machine = snapshot(), layer.machines[0]
     with pytest.raises(ValueError):
         layer.reset(0, replace(NOMINAL, **change))
-    assert layer.machines[0] is NOMINAL
+    assert layer.machines[0] is machine
+    for x, y in zip(before, snapshot(), strict=True):
+        np.testing.assert_array_equal(x, y)
+
+
+def test_stepping_leaves_the_model_as_found_and_a_later_layer_matches_a_fresh_one():
+    machine = draw_machine(5)
+    commands = np.random.default_rng(3).uniform(-1.0, 1.0, size=(12, 1, 4))
+
+    def drive(layer):
+        seen = []
+        for u in commands:
+            layer.act(u)
+            for _ in range(layer.steps_per_decision):
+                layer.step()
+            seen.append(np.concatenate([x.ravel() for x in layer.true_state()]))
+        return np.array(seen)
+
+    fresh = drive(layer_for(machine))
+    model = load_scene(1, weld=True)
+    data = mujoco.MjData(model)
+    loaded = model.dof_armature.copy(), model.dof_frictionloss.copy()
+    drive(Hydraulics(model, data, [draw_machine(6)]))
+    np.testing.assert_array_equal(model.dof_armature, loaded[0])
+    np.testing.assert_array_equal(model.dof_frictionloss, loaded[1])
+    np.testing.assert_allclose(drive(Hydraulics(model, data, [machine])), fresh,
+                               rtol=0, atol=1e-9)
 
 
 def test_a_layer_needs_at_least_one_machine():

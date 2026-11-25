@@ -11,7 +11,7 @@ import mujoco
 import numpy as np
 
 from hma.hydraulics import circuit as c
-from hma.hydraulics.params import CURVE_SEGMENTS, RANGES, Machine
+from hma.hydraulics.params import CURVE_SEGMENTS, NOMINAL, RANGES, Machine
 from hma.machine import BODY_NAMES, HOME_KEY, JOINT_NAMES, load_scene, machine_prefix
 from hma.machine.model import COUNTERWEIGHT_MASS
 
@@ -22,6 +22,14 @@ SWING = JOINT_NAMES.index("swing")
 COUNTERWEIGHT = "counterweight"
 UPPER = BODY_NAMES.index("upper")
 JOINT_SIZES = {int(mujoco.mjtJoint.mjJNT_FREE): (7, 6), int(mujoco.mjtJoint.mjJNT_BALL): (4, 3)}
+BRAKE_PILOT = 0.02
+RELIEF_BAND = 3.0 * c.RELIEF_KNEE
+RELIEF_STEP = 0.1 * c.RELIEF_KNEE
+CORRECTOR_PASSES = 6
+SPEED_STEP = 1e-4
+SWING_BLEND = 0.05 * c.SWING_TORQUE * c.SWING_SPEED
+PRIORITY_FIRST = JOINT_NAMES.index(c.PRIORITY[0])
+SHAPES = {k: np.shape(v) for k, v in vars(NOMINAL).items() if k != "seed"}
 
 
 class Observation(NamedTuple):
@@ -76,6 +84,8 @@ def _counterweight_solid(model: mujoco.MjModel) -> _Solid:
 ORIFICES = slice(0, len(c.ORIFICES))
 RELIEFS = slice(len(c.ORIFICES), len(c.ORIFICES) + len(c.RELIEFS))
 LEAKS = slice(len(c.ORIFICES) + len(c.RELIEFS), len(c.INCIDENCE))
+RELIEF_EDGES = np.arange(RELIEFS.start, RELIEFS.stop)
+JOINT_INDEX = np.arange(JOINTS)
 DROPS = c.INCIDENCE.T.copy()
 NODE_INCIDENCE = c.INCIDENCE[:, :NODES].copy()
 NODE_DROPS = NODE_INCIDENCE.T.copy()
@@ -148,7 +158,11 @@ class Hydraulics:
         ]
         self._counterweight = _counterweight_solid(reference)
         self._scratch = mujoco.MjData(model)
-        self._base_armature = model.dof_armature[self._qvel].copy()
+        reference_dofs = [reference.joint(machine_prefix(0) + j).dofadr[0] for j in JOINT_NAMES]
+        self._base_armature = np.tile(reference.dof_armature[reference_dofs], (self.n, 1))
+        self._base_friction = np.full(self.n, reference.dof_frictionloss[reference_dofs[SWING]])
+        model.dof_armature[self._qvel] = self._base_armature
+        model.dof_frictionloss[self._swing_dofs] = self._base_friction
 
         delay_cap = max([RANGES["delay"][1], *(float(np.max(m.delay)) for m in machines)])
         latency_cap = max([RANGES["sensor_latency"][1], *(m.sensor_latency for m in machines)])
@@ -162,7 +176,7 @@ class Hydraulics:
         self._command_head = 0
         self._sensor_head = 0
         self._held = np.zeros(shape)
-        self._moving = np.zeros(n, bool)
+        self._piloted = np.zeros(n, bool)
         self._spool = np.zeros(shape)
         self._segment_base = np.arange(n * JOINTS).reshape(shape) * CURVE_SEGMENTS
 
@@ -206,7 +220,11 @@ class Hydraulics:
         self._pump = np.zeros((n, c.PUMPS))
         self._gap = np.zeros(shape)
         self._rod_speed = np.zeros(shape)
+        self._accel = np.zeros(shape)
         self._cavity = np.zeros((n, NODES))
+        self._held_nodes = np.zeros((n, NODES), bool)
+        self._stiff = np.zeros(shape)
+        self._torque_scale = np.ones(shape)
         self._neutral = np.zeros(n)
         self._rhs = np.zeros((n, NODES, 1 + JOINTS))
         self._rhs[:, :, 1:] = DISPLACEMENT
@@ -222,6 +240,9 @@ class Hydraulics:
             pose = np.asarray(pose, float)
             if pose.shape != (JOINTS,) or not np.all(np.isfinite(pose)):
                 raise ValueError("pose must be four finite joint angles")
+        for name, shape in SHAPES.items():
+            if np.shape(getattr(machine, name)) != shape:
+                raise ValueError(f"{name} must have shape {shape}")
         values = [np.asarray(v, float) for k, v in vars(machine).items() if k != "seed"]
         if not all(np.all(np.isfinite(v)) for v in values):
             raise ValueError("every machine parameter must be finite")
@@ -239,8 +260,9 @@ class Hydraulics:
             raise ValueError("gain and spool flow must be positive")
         if machine.pump_flow <= 0 or machine.power <= 0:
             raise ValueError("pump flow and power must be positive")
-        if machine.main_relief <= c.STANDBY_PRESSURE or np.any(machine.port_relief <= 0):
-            raise ValueError("relief pressures must be positive and above standby")
+        if machine.main_relief <= c.STANDBY_PRESSURE or np.any(
+                machine.port_relief <= c.TANK_PRESSURE):
+            raise ValueError("main relief must be above standby and port reliefs above tank")
         if machine.bulk_modulus <= 0 or machine.pump_volume <= 0 or np.any(
                 machine.dead_volume <= 0):
             raise ValueError("bulk modulus and oil volumes must be positive")
@@ -252,12 +274,10 @@ class Hydraulics:
             raise ValueError("link mass and counterweight factors must be positive")
         if min(machine.position_noise, machine.velocity_noise, machine.pressure_noise) < 0:
             raise ValueError("sensor noise must not be negative")
-        if machine.curve.shape != (JOINTS, CURVE_SEGMENTS + 1):
-            raise ValueError(f"curve must have shape {(JOINTS, CURVE_SEGMENTS + 1)}")
         if np.any(np.diff(machine.curve, axis=1) < 0):
             raise ValueError("the valve curve must not fall as the spool opens")
-        if machine.port_relief.shape != (JOINTS, 2) or machine.leakage.shape != (JOINTS, 2):
-            raise ValueError(f"port reliefs and leakage must have shape {(JOINTS, 2)}")
+        if np.any(machine.curve[:, 0] != 0.0) or np.any(machine.curve[:, -1] != 1.0):
+            raise ValueError("the valve curve must run from 0 when shut to 1 when fully open")
         self.machines[index] = machine
         delay_steps = np.round(machine.delay / self.dt).astype(np.intp)
         heads = np.arange(self._command_len)[:, None]
@@ -276,7 +296,7 @@ class Hydraulics:
         self._pump_max[index] = c.PUMP_FLOW * machine.pump_flow
         self._power[index] = machine.power * c.PUMP_EFFICIENCY
         self._relief[index] = np.r_[machine.port_relief.ravel(),
-                                    np.full(c.PUMPS, machine.main_relief)]
+                                    np.full(c.PUMPS, machine.main_relief)] - c.RELIEF_VENT
         self._volume0[index] = machine.dead_volume + VOLUME_CONSTANT
         self._pump_volume[index] = machine.pump_volume
         self._inv_bulk[index] = 1.0 / machine.bulk_modulus
@@ -293,11 +313,7 @@ class Hydraulics:
         self._noise_cursor[index] = 0
 
         self._apply_mass(index, machine)
-        armature = self.model.dof_armature[self._qvel]
-        self.model.dof_armature[self._qvel] = self._base_armature
         mujoco.mj_setConst(self.model, self._scratch)
-        self.model.dof_armature[self._qvel] = armature
-        self.model.dof_armature[self._qvel[index]] = self._base_armature[index]
         self._reset_state(index, pose)
 
     def _draw_noise(self, index: int) -> None:
@@ -349,7 +365,7 @@ class Hydraulics:
         data.ctrl[self._actuators[index]] = 0.0
         self._commands[:, index] = 0.0
         self._held[index] = 0.0
-        self._moving[index] = False
+        self._piloted[index] = False
         self._spool[index] = 0.0
         mujoco.mj_forward(model, data)
         _, lever = c.geometry(data.qpos[self._qpos[index]])
@@ -366,13 +382,16 @@ class Hydraulics:
         self._pump[index] = c.STANDBY_FLOW
         self._gap[index] = np.where(force >= 0.0, 1.0, -1.0)
         self._rod_speed[index] = 0.0
+        self._accel[index] = 0.0
         self._cavity[index] = 0.0
+        self._held_nodes[index] = False
+        self._stiff[index] = 0.0
+        self._torque_scale[index] = 1.0
         self._neutral[index] = c.BRAKE_DELAY
         self.pump_energy[index] = 0.0
         self.lost_energy[index] = 0.0
         self.work_energy[index] = 0.0
         self.pump_power[index] = 0.0
-        self.model.dof_frictionloss[self._swing_dofs[index]] = self._brake[index]
         first = self._true_rows()[:, index]
         first += self._rngs[index].uniform(-1.0, 1.0, first.shape) * self._noise[:, index]
         self._clip_pressure_rows(first)
@@ -383,7 +402,6 @@ class Hydraulics:
         if commands.shape != (self.n, JOINTS) or not np.all(np.isfinite(commands)):
             raise ValueError(f"commands must be finite with shape {(self.n, JOINTS)}")
         self._held = np.clip(commands, -1.0, 1.0)
-        self._moving = np.any(self._held != 0.0, axis=1)
 
     def _openings(self) -> np.ndarray:
         head = self._command_head = (self._command_head + 1) % self._command_len
@@ -391,6 +409,7 @@ class Hydraulics:
         spool = self._spool
         spool += self._alpha * (self._command_flat[self._delay_index[head]] - spool)
         opening = np.maximum(np.abs(spool) - self._deadband, 0.0)
+        self._piloted = (opening * self._open_scale > BRAKE_PILOT * CURVE_SEGMENTS).any(1)
         opening *= self._open_scale
         segment = np.minimum(opening.astype(np.intp), CURVE_SEGMENTS - 1)
         segment += self._segment_base
@@ -401,12 +420,13 @@ class Hydraulics:
         return area
 
     def step(self) -> None:
-        n, dt, data = self.n, self.dt, self.data
+        n, dt, data, model = self.n, self.dt, self.data, self.model
         area = self._openings()
         extend = self._spool * c.JOINT_SIGN > 0.0
         wide = extend[..., None]
+        qvel = self._qvel
         q = data.qpos[self._qpos]
-        qd = data.qvel[self._qvel]
+        qd = data.qvel[qvel]
         length, lever = c.geometry(q)
         pressure = self._pressure
 
@@ -425,66 +445,97 @@ class Hydraulics:
             np.where(wide, MASK_EXTEND, MASK_RETRACT) * area[..., None]).max(1)
         valve[:, :JOINTS] = opening[:, :JOINTS] * extend
         gain = valve @ c.GAIN_MAP
+        gain[:, c.PRIORITY_EDGES] *= (1.0 - area[:, PRIORITY_FIRST])[:, None]
         self._nodes[:, :NODES] = pressure
         drop = self._nodes @ DROPS
         flow, slope = self._edge_flow, self._edge_slope
         flow[:, ORIFICES], slope[:, ORIFICES] = _one_way(gain, drop[:, ORIFICES])
-        knee, opened = _softplus((drop[:, RELIEFS] - self._relief) * (1.0 / c.RELIEF_KNEE))
-        flow[:, RELIEFS] = knee * (c.RELIEF_SLOPE * c.RELIEF_KNEE)
-        slope[:, RELIEFS] = opened * c.RELIEF_SLOPE
+        flow[:, RELIEFS], slope[:, RELIEFS] = self._relief_flow(drop[:, RELIEFS], self._relief)
         flow[:, LEAKS] = self._leakage * drop[:, LEAKS]
         slope[:, LEAKS] = self._leakage
 
-        inflow = flow @ INFLOW
-        inflow[:, :c.PUMPS] += self._pump
+        force_now = -(pressure @ DISPLACEMENT)
+        motoring = np.tanh(force_now[:, SWING] * qd[:, SWING] * (1.0 / SWING_BLEND))
+        scale = self._torque_scale
+        scale[:, SWING] = c.SWING_MECHANICAL ** motoring
+        flow_scale = c.SWING_VOLUMETRIC ** -motoring
+        rhs = self._rhs
+        rhs[:, :, 1 + SWING] = DISPLACEMENT[:, SWING] * flow_scale[:, None]
+        rhs[:, :, 0] = flow @ INFLOW
+        rhs[:, :c.PUMPS, 0] += self._pump
         volume = np.maximum(self._volume0 + VOLUME_SLOPE * length[..., None], 1e-6)
         self._capacity[:, c.PUMPS:] = volume.reshape(n, -1) * self._inv_bulk_dt
         system = (self._weights @ SYSTEM_MAP).reshape(n, NODES, NODES)
-        self._rhs[:, :, 0] = inflow
-        solved = np.linalg.solve(system, self._rhs)
-        response = DISPLACEMENT_T @ solved
-        force_now = -(pressure @ DISPLACEMENT)
-        held = force_now - response[..., 0]
-        coupling = response[..., 1:]
+        solved = np.linalg.solve(system, rhs)
 
-        rod = lever * qd
         play = self._half_play * np.abs(lever)
-        force_next = held - (coupling @ rod[..., None])[..., 0]
-        contact = (play == 0.0) | ((np.abs(self._gap) >= PLAY_CLOSED)
-                                   & (self._gap * force_next >= 0.0))
-        guess = np.where(contact, rod, self._rod_speed)
-        diag = coupling[:, self._joint, self._joint]
-        others = (coupling @ guess[..., None])[..., 0] - diag * guess
-        free_speed = (held - others) / diag
         per_play = np.divide(dt, play, out=np.zeros_like(play), where=play > 0.0)
-        reach = self._gap + (free_speed - rod) * per_play
-        closing = ~contact & (np.abs(reach) >= 1.0)
-        contact |= closing
+        rod = lever * qd
+        motion = (self._gap, play == 0.0, rod, lever * (qd + dt * self._accel),
+                  self._rod_speed, per_play)
+        predicted = self._engage(*self._forces(solved, force_now, scale), *motion)[0]
+        rise = solved[..., 0] + (solved[..., 1:] @ predicted[..., None])[..., 0]
+        self._held_nodes[:] = False
+        start = drop[:, RELIEFS]
+        reach = start + (rise @ NODE_DROPS)[:, RELIEFS]
+        relief_moves = ((np.maximum(start, reach) > self._relief - RELIEF_BAND)
+                        & (np.abs(reach - start) > RELIEF_STEP))
+        fix = ((pressure + rise < c.CAVITATION_PRESSURE) | (self._cavity > 0.0)).any(1)
+        fix |= relief_moves.any(1)
+        if fix.any():
+            rows = np.flatnonzero(fix)
+            self._correct(rows, system, solved, start, rise, predicted, force_now[rows],
+                          scale[rows], tuple(m[rows] for m in motion))
+
+        held, coupling = self._forces(solved, force_now, scale)
+        _, contact, closing, reach, free_speed, diag, others = self._engage(
+            held, coupling, *motion)
         self._gap = np.where(closing, np.sign(reach), self._gap)
 
-        stiff = np.where(contact, diag * lever * lever, 0.0)
+        stiff = self._stiff
+        stiff[:] = np.where(contact, diag * lever * lever, 0.0)
         data.ctrl[self._actuators] = np.where(contact, lever * (held - others), 0.0) - stiff * qd
-        self.model.dof_armature[self._qvel] = self._base_armature + stiff * dt
-        self._neutral = np.where(self._moving, 0.0, self._neutral + dt)
-        self.model.dof_frictionloss[self._swing_dofs] = np.where(
+        self._neutral = np.where(self._piloted, 0.0, self._neutral + dt)
+        model.dof_armature[qvel] = self._base_armature + stiff * dt
+        model.dof_frictionloss[self._swing_dofs] = self._base_friction + np.where(
             self._neutral >= c.BRAKE_DELAY, self._brake, 0.0)
+        mujoco.mj_step(model, data)
+        model.dof_armature[qvel] = self._base_armature
+        model.dof_frictionloss[self._swing_dofs] = self._base_friction
 
-        mujoco.mj_step(self.model, data)
-
-        joint_rod = lever * data.qvel[self._qvel]
+        self._accel = (data.qvel[qvel] - qd) * (1.0 / dt)
+        joint_rod = lever * data.qvel[qvel]
         room = play * (1.0 / dt)
         free_speed = np.minimum(np.maximum(free_speed, joint_rod - room * (1.0 + self._gap)),
                                 joint_rod + room * (1.0 - self._gap))
         speed = np.where(contact, joint_rod, free_speed)
         self._rod_speed = free_speed
         change = solved[..., 0] + (solved[..., 1:] @ speed[..., None])[..., 0]
-        fixed = (pressure + change < c.CAVITATION_PRESSURE) | (self._cavity > 0.0)
-        if fixed.any():
-            self._cavitate(system, inflow, speed, change, fixed)
+        held_nodes = self._held_nodes
+        cavity = self._cavity
+        missing = np.zeros_like(cavity)
+        tracked = (held_nodes | (cavity > 0.0)).any(1)
+        if tracked.any():
+            rows = np.flatnonzero(tracked)
+            missing[rows] = self._balance(system[rows], self._rhs[rows], change[rows], speed[rows])
+        wrong = (np.where(held_nodes, cavity + missing < 0.0,
+                          pressure + change < c.CAVITATION_PRESSURE)).any(1)
+        if wrong.any():
+            rows = np.flatnonzero(wrong)
+            sol, held_nodes[rows], missing[rows] = self._hold(
+                rows, system[rows], held_nodes[rows], speed[rows])
+            change[rows] = sol[..., 0] + (sol[..., 1:] @ speed[rows][..., None])[..., 0]
+        missing *= held_nodes | (cavity > 0.0)
         pressure += change
         used = flow + slope * (change @ NODE_DROPS)
-        self.lost_energy += (used * (pressure @ NODE_DROPS)).sum(1) * dt
-        self.work_energy += (speed * (pressure @ DISPLACEMENT)).sum(1) * -dt
+        lost = (used * (pressure @ NODE_DROPS)).sum(1) * dt
+        lost -= (pressure * missing).sum(1)
+        cavity[:] = np.where(held_nodes, np.maximum(cavity + missing, 0.0), 0.0)
+        hydraulic = speed * (pressure @ DISPLACEMENT)
+        hydraulic[:, SWING] *= flow_scale
+        mechanical = speed * (pressure @ DISPLACEMENT) * scale
+        self.lost_energy += lost + (mechanical - hydraulic).sum(1) * dt
+        self.work_energy -= mechanical.sum(1) * dt
         gap = self._gap + np.where(contact, 0.0, (free_speed - joint_rod) * per_play)
         self._gap = np.minimum(np.maximum(gap, -1.0, out=gap), 1.0, out=gap)
         self.pump_power = (pressure[:, :c.PUMPS] * self._pump).sum(1)
@@ -503,25 +554,89 @@ class Hydraulics:
         cursor += 1
         cursor[cursor == self.steps_per_decision] = 0
 
-    def _cavitate(self, system: np.ndarray, inflow: np.ndarray, speed: np.ndarray,
-                  change: np.ndarray, fixed: np.ndarray) -> None:
-        rows = np.flatnonzero(fixed.any(axis=1))
-        matrix, held = system[rows], fixed[rows]
-        demand = inflow[rows] + speed[rows] @ DISPLACEMENT_T
-        floor = c.CAVITATION_PRESSURE - self._pressure[rows]
-        cavity = self._cavity[rows]
-        for _ in range(NODES):
-            delta = np.linalg.solve(np.where(held[..., None], IDENTITY, matrix),
-                                    np.where(held, floor, demand)[..., None])[..., 0]
-            missing = ((matrix @ delta[..., None])[..., 0] - demand) * self.dt
-            refilled = held & (cavity + missing < 0.0) & (delta > floor)
-            if not refilled.any():
+    @staticmethod
+    def _relief_flow(drop: np.ndarray, relief: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        knee, opened = _softplus((drop - relief) * (1.0 / c.RELIEF_KNEE))
+        return knee * (c.RELIEF_SLOPE * c.RELIEF_KNEE), opened * c.RELIEF_SLOPE
+
+    def _balance(self, matrix: np.ndarray, rhs: np.ndarray, delta: np.ndarray,
+                 speed: np.ndarray) -> np.ndarray:
+        balance = (matrix @ delta[..., None])[..., 0] - rhs[..., 0]
+        return (balance - (rhs[..., 1:] @ speed[..., None])[..., 0]) * self.dt
+
+    def _hold(self, rows: np.ndarray, matrix: np.ndarray, held: np.ndarray,
+              speed: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        rhs = self._rhs[rows]
+        pressure, cavity = self._pressure[rows], self._cavity[rows]
+        floor = c.CAVITATION_PRESSURE - pressure
+        for attempt in range(NODES):
+            given = rhs.copy()
+            given[..., 0] = np.where(held, floor, rhs[..., 0] - cavity / self.dt)
+            given[..., 1:] *= ~held[..., None]
+            solved = np.linalg.solve(np.where(held[..., None], IDENTITY, matrix), given)
+            delta = solved[..., 0] + (solved[..., 1:] @ speed[..., None])[..., 0]
+            missing = self._balance(matrix, rhs, delta, speed)
+            now = np.where(held, cavity + missing > 0.0, delta < floor)
+            if (now == held).all() or attempt == NODES - 1:
                 break
-            held &= ~refilled
-        grown = np.where(held, cavity + missing, 0.0)
-        self.lost_energy[rows] += (c.CAVITATION_PRESSURE * (grown - cavity)).sum(1)
-        self._cavity[rows] = np.maximum(grown, 0.0)
-        change[rows] = delta
+            held = now
+        return solved, held, missing * (held | (cavity > 0.0))
+
+    @staticmethod
+    def _forces(solved: np.ndarray, force_now: np.ndarray,
+                scale: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        response = DISPLACEMENT_T @ solved
+        response *= scale[..., None]
+        return force_now * scale - response[..., 0], response[..., 1:]
+
+    @staticmethod
+    def _engage(held: np.ndarray, coupling: np.ndarray, gap: np.ndarray, rigid: np.ndarray,
+                rod: np.ndarray, ahead: np.ndarray, loose: np.ndarray,
+                per_play: np.ndarray) -> tuple[np.ndarray, ...]:
+        force_next = held - (coupling @ rod[..., None])[..., 0]
+        contact = rigid | ((np.abs(gap) >= PLAY_CLOSED) & (gap * force_next >= 0.0))
+        guess = np.where(contact, ahead, loose)
+        diag = coupling[:, JOINT_INDEX, JOINT_INDEX]
+        others = (coupling @ guess[..., None])[..., 0] - diag * guess
+        free = np.divide(held - others, diag, out=rod.copy(), where=diag != 0.0)
+        reach = gap + (free - rod) * per_play
+        closing = ~contact & (np.abs(reach) >= 1.0)
+        contact |= closing
+        return np.where(contact, ahead, free), contact, closing, reach, free, diag, others
+
+    def _correct(self, rows: np.ndarray, system: np.ndarray, solved: np.ndarray,
+                 start: np.ndarray, rise: np.ndarray, speed: np.ndarray, force_now: np.ndarray,
+                 scale: np.ndarray, motion: tuple[np.ndarray, ...]) -> None:
+        guess = speed[rows]
+        relief = self._relief[rows]
+        base = start[rows]
+        shift = np.zeros_like(base)
+        held = (self._pressure[rows] + rise[rows] < c.CAVITATION_PRESSURE) | (
+            self._cavity[rows] > 0.0)
+        matrix = system[rows]
+        for attempt in range(CORRECTOR_PASSES):
+            sol, held, _ = self._hold(rows, matrix, held, guess)
+            moved = self._engage(*self._forces(sol, force_now, scale), *motion)[0]
+            slid = np.abs(moved - guess) > SPEED_STEP
+            guess = np.where(slid, moved, guess)
+            delta = sol[..., 0] + (sol[..., 1:] @ guess[..., None])[..., 0]
+            reach = base + (delta @ NODE_DROPS)[:, RELIEFS]
+            moves = ((np.maximum(base + shift, reach) > relief - RELIEF_BAND)
+                     & (np.abs(reach - base - shift) > RELIEF_STEP))
+            if not (moves.any() or slid.any()) or attempt == CORRECTOR_PASSES - 1:
+                break
+            if not moves.any():
+                continue
+            shift = np.where(moves, reach - base, shift)
+            level, tangent = self._relief_flow(base + shift, relief)
+            self._edge_flow[rows[:, None], RELIEF_EDGES] = level - tangent * shift
+            self._edge_slope[rows[:, None], RELIEF_EDGES] = tangent
+            self._rhs[rows, :, 0] = self._edge_flow[rows] @ INFLOW
+            self._rhs[rows, :c.PUMPS, 0] += self._pump[rows]
+            matrix = (self._weights[rows] @ SYSTEM_MAP).reshape(len(rows), NODES, NODES)
+        system[rows] = matrix
+        solved[rows] = sol
+        self._held_nodes[rows] = held
 
     def _true_rows(self, out: np.ndarray | None = None) -> np.ndarray:
         if out is None:

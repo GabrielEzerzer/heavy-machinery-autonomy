@@ -185,7 +185,7 @@ def draw_machine(seed: int, effects: tuple[str, ...] = EFFECTS) -> Machine:
         "pump_volume": float(rng.uniform(*RANGES["pump_volume"])),
         "leakage": _leakage(rng.uniform(*RANGES["spool_leakage"], size=ports),
                             rng.uniform(*RANGES["holding_leakage"], size=ports),
-                            rng.uniform(*RANGES["motor_leakage"], size=2)),
+                            rng.uniform(*RANGES["motor_leakage"])),
         "brake": float(rng.uniform(*RANGES["brake"])),
         "backlash": rng.uniform(*RANGES["backlash"], size=joints),
         "link_mass": rng.uniform(*RANGES["link_mass"], size=len(BODY_NAMES)),

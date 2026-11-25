@@ -28,7 +28,6 @@ HOME_POSE = (0.0, -0.6, 1.9, 0.6)
 LINK_MASSES = {"base": 4500.0, "upper": 5580.0, "boom": 1220.0, "arm": 600.0, "bucket": 400.0}
 COUNTERWEIGHT_MASS = 2450.0
 END_STOP_SOLIMP = (0.999, 0.9999, 0.001)
-END_STOP_TIMECONST = 0.04
 
 GROUND_CELL = 0.1
 GROUND_X = (-3.0, 10.0)
@@ -76,7 +75,7 @@ def _machine_spec(index: int, weld: bool) -> mujoco.MjSpec:
     for name, home in zip(JOINT_NAMES, HOME_POSE, strict=True):
         joint = spec.joint(name)
         _turn_reference_to_home(joint, home)
-        joint.solref_limit = [END_STOP_TIMECONST, 1.0]
+        joint.solref_limit = [2 * TIMESTEP, 1.0]
         joint.solimp_limit = [*END_STOP_SOLIMP, 0.5, 2.0]
         joint.solref_friction = [2 * TIMESTEP, 1.0]
         joint.solimp_friction = [*END_STOP_SOLIMP, 0.5, 2.0]

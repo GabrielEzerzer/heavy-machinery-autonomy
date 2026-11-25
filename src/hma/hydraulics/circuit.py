@@ -22,11 +22,15 @@ STANDBY_PRESSURE = 1.0e6
 SWING_TORQUE = 34.0e3
 SWING_RELIEF = 32.3e6
 SWING_SPEED = 13.7 * 2.0 * math.pi / 60.0
-SWING_DISPLACEMENT = SWING_TORQUE / SWING_RELIEF
+SWING_VOLUMETRIC = 0.95
+SWING_DISPLACEMENT = PUMP_FLOW * SWING_VOLUMETRIC / SWING_SPEED
+SWING_MECHANICAL = SWING_TORQUE / (SWING_DISPLACEMENT * SWING_RELIEF)
 TANK_PRESSURE = 0.3e6
 CAVITATION_PRESSURE = -0.09e6
 VALVE_DROP = 1.5e6
-LOWERING_DROP = 7.0e6
+RETURN_DROP = {("boom", "retract"): 5.0e6, ("arm", "extend"): 100.0e6,
+               ("arm", "retract"): 14.0e6, ("bucket", "extend"): 12.0e6}
+REGENERATION_DROP = {"boom": 30.0e6, "arm": 100.0e6, "bucket": 12.0e6}
 RELIEF_OVERRIDE = 1.0e6
 RELIEF_KNEE = 0.2e6
 MAKEUP_DROP = 0.2e6
@@ -35,6 +39,7 @@ BRAKE_DELAY = 5.0
 JOINT_SIGN = np.array([1.0, -1.0, 1.0, 1.0])
 
 AREA = np.array([(SWING_DISPLACEMENT, SWING_DISPLACEMENT), *(areas(j) for j in CYLINDER_JOINTS)])
+FLOW_AREA = AREA / np.array([[SWING_VOLUMETRIC], [1.0], [1.0], [1.0]])
 STROKE_AREA = AREA * np.array([[0.0], [1.0], [1.0], [1.0]])
 
 FEEDS = {
@@ -43,12 +48,12 @@ FEEDS = {
     "arm": {"extend": (1.0, 1.0), "retract": (1.0, 1.0)},
     "bucket": {"extend": (1.0, 0.0), "retract": (1.0, 0.0)},
 }
-REGENERATION = {"boom": "retract", "arm": "extend"}
-LOWERING = {"boom": "retract"}
+REGENERATION = {"boom": "retract", "arm": "extend", "bucket": "extend"}
+PRIORITY = ("swing", "arm", 1)
 
 
 def _rated_flow(joint: str) -> float:
-    return SWING_DISPLACEMENT * SWING_SPEED if joint == "swing" else PUMP_FLOW
+    return PUMP_FLOW
 
 
 def _tables() -> dict[str, np.ndarray]:
@@ -62,11 +67,12 @@ def _tables() -> dict[str, np.ndarray]:
             feeds = np.array(FEEDS[joint][direction]) * _rated_flow(joint)
             demand[d, k] = feeds
             meter_in[d, k, :, inlet] = feeds / math.sqrt(VALVE_DROP)
-            back = feeds.sum() * AREA[k, outlet] / AREA[k, inlet]
-            drop = LOWERING_DROP if LOWERING.get(joint) == direction else VALVE_DROP
+            back = feeds.sum() * FLOW_AREA[k, outlet] / FLOW_AREA[k, inlet]
+            regenerates = REGENERATION.get(joint) == direction
+            drop = RETURN_DROP.get((joint, direction), VALVE_DROP)
             meter_out[d, k, outlet] = back / math.sqrt(drop)
-            if REGENERATION.get(joint) == direction:
-                regeneration[d, k] = meter_out[d, k, outlet]
+            if regenerates:
+                regeneration[d, k] = back / math.sqrt(REGENERATION_DROP[joint])
     return {"demand": demand, "meter_in": meter_in, "meter_out": meter_out,
             "regeneration": regeneration}
 
@@ -105,6 +111,10 @@ def _orifices() -> list[tuple[int, int, int, float, float]]:
     return edges
 
 
+def _vented() -> np.ndarray:
+    return np.array([float(dst == TANK) for _, dst in _reliefs()])
+
+
 def _reliefs() -> list[tuple[int, int]]:
     edges = [(chamber(0, 0), chamber(0, 1)), (chamber(0, 1), chamber(0, 0))]
     edges += [(chamber(k, side), TANK) for k in range(1, len(JOINT_NAMES)) for side in range(2)]
@@ -113,6 +123,7 @@ def _reliefs() -> list[tuple[int, int]]:
 
 ORIFICES = _orifices()
 RELIEFS = _reliefs()
+RELIEF_VENT = _vented() * TANK_PRESSURE
 LEAKS = [(chamber(k, side), TANK) for k in range(len(JOINT_NAMES)) for side in range(2)]
 
 
@@ -138,6 +149,8 @@ def _gain_map() -> np.ndarray:
 
 
 GAIN_MAP = _gain_map()
+PRIORITY_EDGES = np.array([e for e, (src, _, column, _, _) in enumerate(ORIFICES)
+                           if column == JOINT_NAMES.index(PRIORITY[1]) and src == PRIORITY[2]])
 DEMAND_MASK = (TABLES["demand"] > 0.0).astype(float)
 
 GEOMETRY_MARGIN = 0.1
@@ -186,9 +199,9 @@ def _outlet_drops() -> tuple[np.ndarray, np.ndarray]:
     regeneration = np.zeros((2, len(JOINT_NAMES)))
     for k, joint in enumerate(JOINT_NAMES):
         for d, direction in enumerate(("extend", "retract")):
-            if LOWERING.get(joint) == direction:
-                drops[d, k] = LOWERING_DROP
-            regeneration[d, k] = float(REGENERATION.get(joint) == direction)
+            drops[d, k] = RETURN_DROP.get((joint, direction), VALVE_DROP)
+            if REGENERATION.get(joint) == direction:
+                regeneration[d, k] = 1.0 / math.sqrt(REGENERATION_DROP[joint])
     return drops, regeneration
 
 
@@ -200,7 +213,7 @@ def full_speed(q: np.ndarray, direction: np.ndarray) -> np.ndarray:
     extend = np.asarray(direction, float) * JOINT_SIGN > 0
     d = np.where(extend, 0, 1)
     flow = TABLES["demand"][d, np.arange(len(JOINT_NAMES))].sum(-1)
-    inlet = np.where(extend, AREA[:, 0], AREA[:, 1])
+    inlet = np.where(extend, FLOW_AREA[:, 0], FLOW_AREA[:, 1])
     return flow / (inlet * np.abs(lever))
 
 
@@ -217,8 +230,9 @@ def valve_opening(q: np.ndarray, speed: np.ndarray, pressures: np.ndarray,
     p_out = pressures[joints, 1 - inlet]
     drop = OUTLET_DROP[d, joints]
     outlet = (np.sqrt(np.maximum(p_out - TANK_PRESSURE, 0.0) / drop)
-              + REGENERATING[d, joints] * np.sqrt(np.maximum(p_out - p_in, 0.0) / drop))
-    overrun = p_out * AREA[joints, 1 - inlet] > p_in * AREA[joints, inlet]
+              + REGENERATING[d, joints] * np.sqrt(np.maximum(p_out - p_in, 0.0)))
+    overrun = (p_out > TANK_PRESSURE) & (
+        p_out * AREA[joints, 1 - inlet] > p_in * AREA[joints, inlet])
     fed = (DEMAND_MASK[d, joints] > 0.0) & (share > 0.0)[:, None]
     pushed = fed & ~overrun[:, None]
     bypass = np.zeros(len(JOINT_NAMES))
