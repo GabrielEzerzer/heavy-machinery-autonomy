@@ -565,3 +565,56 @@ def test_reversing_against_a_resisting_load_stays_within_the_power_limit(machine
             power.append(np.maximum(force * data.ctrl[actuators], 0.0).sum())
     assert np.mean(power[200:]) <= 1.02 * machine.power
     assert np.mean(power[200:]) > 0.7 * machine.power
+
+
+def episode(layer, index, machine, commands, others=None):
+    layer.reset(index, machine)
+    seen = []
+    for u in commands:
+        full = np.zeros((layer.n, 4)) if others is None else others.copy()
+        full[index] = u
+        layer.act(full)
+        for _ in range(layer.steps_per_decision):
+            layer.step()
+        seen.append(np.concatenate([np.stack(layer.observe())[:, index].ravel(),
+                                    layer.true_state().positions[index]]))
+    return np.array(seen)
+
+
+@pytest.mark.parametrize("stray_steps", [0, 3])
+def test_an_episode_after_a_reset_repeats_a_fresh_layer_bit_for_bit(stray_steps):
+    machine = draw_machine(5)
+    commands = np.random.default_rng(4).uniform(-1.0, 1.0, size=(12, 4))
+    fresh = episode(layer_for(machine), 0, machine, commands)
+    layer = layer_for(machine)
+    episode(layer, 0, machine, commands[::-1])
+    for _ in range(stray_steps):
+        layer.step()
+    assert np.array_equal(episode(layer, 0, machine, commands), fresh)
+
+
+def test_resetting_one_machine_leaves_the_other_machines_noise_alone():
+    machines = [draw_machine(5), draw_machine(6)]
+    commands = np.random.default_rng(6).uniform(-1.0, 1.0, size=(12, 4))
+    running = np.full((2, 4), 0.4)
+
+    def scene(reset_machine_1):
+        model = load_scene(2, weld=True)
+        model.opt.tolerance = SOLVER_TOLERANCE_WITHOUT_NEIGHBOUR_COUPLING
+        layer = Hydraulics(model, mujoco.MjData(model), machines)
+        first = episode(layer, 1, machines[1], commands, running)
+        for _ in range(3):
+            layer.step()
+        if reset_machine_1:
+            second = episode(layer, 1, machines[1], commands, running)
+        else:
+            layer.act(running)
+            for _ in range(len(commands) * layer.steps_per_decision):
+                layer.step()
+            second = None
+        return first, second, np.stack(layer.observe())[:, 0]
+
+    first, second, other = scene(True)
+    _, _, undisturbed = scene(False)
+    np.testing.assert_allclose(second, first, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(other, undisturbed, rtol=0, atol=1e-9)

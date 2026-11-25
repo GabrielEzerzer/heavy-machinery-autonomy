@@ -154,8 +154,9 @@ class Hydraulics:
         self._flow = np.ones(self.n)
         self._latency_steps = np.zeros(self.n, np.intp)
         self._noise = np.zeros((3, self.n, 1))
-        self._noise_draws = np.zeros((self.steps_per_decision, 3, *shape))
-        self._noise_cursor = 0
+        self._noise_draws = np.zeros((self.n, self.steps_per_decision, 3, JOINTS))
+        self._noise_cursor = np.zeros(self.n, np.intp)
+        self._machine_index = np.arange(self.n)
         self._rngs: list[np.random.Generator | None] = [None] * self.n
         for i, machine in enumerate(machines):
             self.reset(i, machine)
@@ -206,7 +207,7 @@ class Hydraulics:
         self._noise[:, index, 0] = (machine.position_noise, machine.velocity_noise,
                                     machine.load_noise)
         self._rngs[index] = np.random.default_rng((machine.seed, 1))
-        self._draw_noise(index)
+        self._noise_cursor[index] = 0
 
         self.model.tendon_frictionloss[self._tendons[index]] = machine.force_limit
         self._apply_mass(index, machine)
@@ -215,7 +216,7 @@ class Hydraulics:
 
     def _draw_noise(self, index: int) -> None:
         shape = (self.steps_per_decision, 3, JOINTS)
-        self._noise_draws[:, :, index] = self._rngs[index].uniform(-1.0, 1.0, shape)
+        self._noise_draws[index] = self._rngs[index].uniform(-1.0, 1.0, shape)
 
     def _apply_mass(self, index: int, machine: Machine) -> None:
         for k, body in enumerate(self._bodies[index]):
@@ -314,11 +315,11 @@ class Hydraulics:
         np.maximum(self._force, force, out=self._force)
         np.sign(reading[2], out=self._force_sign)
         cursor = self._noise_cursor
-        if cursor == 0:
-            for i in range(self.n):
-                self._draw_noise(i)
-        reading += self._noise_draws[cursor] * self._noise
-        self._noise_cursor = (cursor + 1) % self.steps_per_decision
+        for i in np.flatnonzero(cursor == 0):
+            self._draw_noise(i)
+        reading += self._noise_draws[self._machine_index, cursor].transpose(1, 0, 2) * self._noise
+        cursor += 1
+        cursor[cursor == self.steps_per_decision] = 0
 
     def _read_into(self, out: np.ndarray) -> None:
         data = self.data
