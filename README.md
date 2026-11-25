@@ -2,13 +2,13 @@
 
 A simulation demo. You type a task in plain English, and a simulated 12-tonne excavator carries it out on rough ground without tipping over. One controller, trained in simulation, handles simulated machines of this type that each behave differently, with no retuning.
 
-**Status: in development.** The machine model and its hydraulics are built, and a conventional controller follows bucket paths through them. The language step runs on its own and still produces trench plans from an earlier direction of the project. Rough ground, a carried load and the learned controller do not exist yet. An earlier version simulated soil and digging; it was removed and is in the repository's history. The [feature map](#feature-map) lists what is built and what is planned.
+**Status: in development.** The machine model and its hydraulics are built, and a conventional controller follows bucket paths through them. The language step runs on its own and still produces trench plans from an earlier direction of the project. Rough ground, a carried load, the planner and the learned controller do not exist yet. An earlier version simulated soil and digging; it was removed and is in the repository's history. The [feature map](#feature-map) lists what is built and what is planned.
 
 ## How it works
 
 1. A GPT model turns a plain-English instruction into a small task specification. The task type is being changed: today the specification still describes a trench, with a marker, a depth and a length.
 2. Fixed checks accept or refuse the specification: valid fields, within the machine's reach, within the task's safety rules. A person confirms before anything moves.
-3. A planner turns the specification into paths for the bucket and the load.
+3. A planner turns the specification into paths for the bucket and the load. It is not built yet.
 4. A learned controller follows those paths. Every run draws a different machine, with its own hydraulic delay, dead zone, flow limit, slack in the joints and weights, and stands it on ground drawn at random. The controller is the same for all of them.
 
 The physics is [MuJoCo](https://mujoco.org). The controller is trained with PPO from [Stable-Baselines3](https://stable-baselines3.readthedocs.io).
@@ -41,7 +41,7 @@ Limits of the hydraulics model:
 - Joint play is lost motion when the command reverses. A link does not drop through the gap when its load reverses with no command.
 - Delays and latency are rounded to the 5 ms physics step. The load reading is taken at the start of each step.
 - Masses and force caps are written into the shared MuJoCo model for each machine by name, so a model cannot be shared by scenes that need different machines. Within one scene, repeatability is bit for bit only when the same machines are in it in the same states, because one constraint solve covers every machine: resetting one machine while another keeps running repeats its episode to about 1e-15: with both machines driven by random valve commands, the reset machine's joints differed by at most 1.1e-15 rad from a fresh scene. The scene clock (`data.time`) keeps running through a reset, so a controller that needs a bit-for-bit repeat should time its episode from its own step count.
-- The machine model sets MuJoCo's solver tolerance to 1e-14. One constraint solve covers every machine in a scene, so a solver that stops early lets one machine's motion leak into another's. With one drawn machine driven by random valve commands for 20 s beside a drawn neighbour, compared with the same run with the neighbour still, the first machine's joints moved by up to 1.9e-15 rad at 1e-14 on welded bases and 1.1e-15 rad on released ones (the worst of four pairs). At 1e-12 that was 1.9e-15 and 4.6e-7 rad, at 1e-10 1.9e-7 and 4.0e-6 rad, and at MuJoCo's default of 1e-8 1.1e-5 and 2.3e-4 rad. The tighter tolerance cost no speed beyond the spread between repeated runs. Scores are only comparable when taken in a fixed scene layout or with one machine per scene ([issue 11](../../issues/11)).
+- The machine model sets MuJoCo's solver tolerance to 1e-14. One constraint solve covers every machine in a scene, so a solver that stops early lets one machine's motion leak into another's. With one drawn machine driven by random valve commands for 20 s beside a drawn neighbour, compared with the same run with the neighbour still, the first machine's joints moved by up to 1.8e-15 rad at 1e-14 on welded bases, over six pairs of machines. On released bases four of the six pairs stayed at that level and two reached 3.5e-9 and 8.9e-9 rad, so the tolerance reduces the leak on a released base and does not remove it. The worst pair at 1e-12 moved 2.2e-8 rad welded and 1.6e-7 rad released, at 1e-10 3.4e-8 and 1.4e-6 rad, and at MuJoCo's default of 1e-8 2.0e-5 and 2.7e-4 rad. The tighter tolerance cost no speed beyond the spread between repeated runs. Scores are only comparable when taken in a fixed scene layout or with one machine per scene ([issue 11](../../issues/11)).
 - MuJoCo makes each constraint softer the more easily the bodies move along it, a quantity it computes at the model's reference pose, here the home pose, when a scene is loaded and again whenever the hydraulics layer writes a machine's masses. The softness of the valves, joint limits and track contacts therefore follows the home pose and the drawn masses ([issue 23](../../issues/23)).
 - A large swing step is limited by the swing's force cap as well as by the lag: the swing can accelerate at about 0.7 rad/s² at most.
 - A drawn speed limit above the model's actuator limit is refused. For the arm that rules out more than 1.33 times its nominal speed.
@@ -71,6 +71,7 @@ A feature is **done** when it runs from a clean checkout and its checks pass.
 | Baseline controller | A conventional controller tuned once on the standard machine | Done: follows paths in free air |
 | Rough ground | Slopes, steps and edges of rigid ground. The machine can slide, rock and tip, and the arm and bucket meet the ground | Planned |
 | Carried load | A load with real mass on the bucket | Planned |
+| Planner | Turns a checked specification into paths for the bucket and the load | Planned |
 | Cylinder forces | Joint force limits from the hydraulic cylinders' sizes and positions | Planned |
 | Learned controller | One network that moves a load and props the machine on its bucket without tipping, on any machine drawn | Planned |
 | Training | One command that trains the controller in stages of rising difficulty | Planned |
