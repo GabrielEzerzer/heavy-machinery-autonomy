@@ -529,7 +529,7 @@ def test_an_episode_after_a_reset_repeats_a_fresh_layer_bit_for_bit(stray_steps,
 
 
 SCRATCH = {"_valve", "_demand_in", "_nodes", "_edge_flow", "_weights", "_edge_slope", "_capacity",
-           "_noise_draws", "_rhs"}
+           "_noise_draws", "_rhs", "_state"}
 
 
 def test_a_reset_leaves_every_state_array_as_a_fresh_layer_has_it():

@@ -438,28 +438,41 @@ def test_random_combined_commands_at_the_corners_keep_floor_relief_and_torque_co
     for _ in range(100):
         layer.act(rng.choice([-1.0, 0.0, 1.0], size=(len(machines), 4)))
         for _ in range(layer.steps_per_decision):
-            q = data.qpos[layer._qpos].copy()
-            before = data.qvel[layer._qvel].copy()
-            layer.step()
-            after = data.qvel[layer._qvel]
-            ctrl = data.ctrl[layer._actuators]
-            torque = ctrl - layer._stiff * (after - before)
-            _, lever = c.geometry(q)
-            force = -(layer._pressure @ DISPLACEMENT) * layer._torque_scale
-            loaded = (np.abs(layer._gap) >= 1.0 - 1e-9) | (layer._half_play == 0.0)
-            mismatch.append(np.where(loaded & (ctrl != 0.0), np.abs(torque / lever - force), 0.0))
+            mismatch.append(stepped_force_mismatch(layer))
             pressures.append(layer._pressure.copy())
     pressures, mismatch = np.array(pressures), np.array(mismatch)
     assert np.isfinite(pressures).all()
     assert pressures.min() >= c.CAVITATION_PRESSURE - 1e-6
     assert (pressures - setting).max() < RELIEF_OVERSHOOT
     corners, nominal = mismatch[:, :2, 1:], mismatch[:, 2, 1:]
-    assert np.quantile(corners, 0.99) < 3.0e3 and corners.max() < 60.0e3
-    assert np.quantile(nominal, 0.999) < 1.5e3 and nominal.max() < 10.0e3
-    assert mismatch[..., 0].max() < 2.0e3
+    assert np.quantile(corners, 0.99) < 2.0e3 and corners.max() < 20.0e3
+    assert np.quantile(nominal, 0.999) < 1.0e3 and nominal.max() < 3.0e3
+    assert mismatch[..., 0].max() < 1.0e3
     flips = np.array([chatter_per_node(pressures[:, i]) for i in range(len(machines))])
     assert flips[:2].max() <= 0.025
     assert flips[2].max() <= 0.003
+
+
+def stepped_force_mismatch(layer):
+    data = layer.data
+    q = data.qpos[layer._qpos].copy()
+    before = data.qvel[layer._qvel].copy()
+    layer.step()
+    ctrl = data.ctrl[layer._actuators]
+    torque = ctrl - layer._stiff * (data.qvel[layer._qvel] - before)
+    _, lever = c.geometry(q)
+    force = -(layer._pressure @ DISPLACEMENT) * layer._torque_scale
+    loaded = (np.abs(layer._gap) >= 1.0 - 1e-9) | (layer._half_play == 0.0)
+    return np.where(loaded & (ctrl != 0.0), np.abs(torque / lever - force), 0.0)
+
+
+def test_a_boom_driven_into_its_top_stop_jolts_the_held_arm_only_with_forces_the_oil_has():
+    layer = layer_for(NOMINAL, (0.0, 0.5, 0.8, -0.3))
+    layer.act(command(BOOM, 1.0))
+    mismatch = np.array([stepped_force_mismatch(layer) for _ in range(round(1.5 / DT))])
+    assert layer.data.qpos[layer._qpos][0, BOOM] > JOINT_LIMITS["boom"][1] - 0.01
+    assert mismatch.max() < 3.0e3
+    assert layer.redos > 0
 
 
 def chatter_per_node(pressures):
@@ -515,7 +528,7 @@ def test_energy_closes_with_cavitation_and_outside_forces_once_the_integration_t
     layer = Hydraulics(model, data, machines)
     rng = np.random.default_rng(5)
     stored = layer.oil_energy().copy()
-    damping, growth, actuator = np.zeros(2), np.zeros(2), np.zeros(2)
+    damping, growth, actuator, play = np.zeros(2), np.zeros(2), np.zeros(2), np.zeros(2)
     opened, k = False, 0
     for _ in range(100):
         layer.act(rng.uniform(-1.0, 1.0, (2, 4)))
@@ -528,6 +541,8 @@ def test_energy_closes_with_cavitation_and_outside_forces_once_the_integration_t
             after = data.qvel[layer._qvel]
             torque = data.ctrl[layer._actuators] - layer._stiff * (after - before)
             actuator += (torque * after).sum(1) * DT
+            rod_force = (layer._pressure @ DISPLACEMENT) * layer._torque_scale
+            play -= np.where(layer._stiff > 0.0, 0.0, layer._rod_speed * rod_force).sum(1) * DT
             change = layer._pressure - p0
             damping += (0.5 * v0 * change ** 2).sum(1) * layer._inv_bulk
             growth += (0.5 * layer._pressure ** 2 * (oil_volumes(layer) - v0)).sum(1) * (
@@ -538,7 +553,7 @@ def test_energy_closes_with_cavitation_and_outside_forces_once_the_integration_t
     assert opened
     assert np.all(residual > 0.0)
     assert np.all(np.abs(residual - damping + growth) < 1e-9 * pump)
-    assert np.all(np.abs(layer.work_energy - actuator) < 1e-3 * pump)
+    assert np.all(np.abs(layer.work_energy - actuator - play) < 1e-4 * pump)
 
 
 def test_held_joints_drift_slowly_but_measurably_through_their_leaks():

@@ -13,6 +13,7 @@ import numpy as np
 from hma.hydraulics import circuit as c
 from hma.hydraulics.params import CURVE_SEGMENTS, NOMINAL, RANGES, Machine
 from hma.machine import BODY_NAMES, HOME_KEY, JOINT_NAMES, load_scene, machine_prefix
+from hma.machine.cylinders import MAIN_RELIEF
 from hma.machine.model import COUNTERWEIGHT_MASS
 
 CONTROL_HZ = 10.0
@@ -26,6 +27,10 @@ BRAKE_PILOT = 0.02
 RELIEF_BAND = 3.0 * c.RELIEF_KNEE
 RELIEF_STEP = 0.1 * c.RELIEF_KNEE
 CORRECTOR_PASSES = 6
+REDO_PASSES = 3
+REDO_SHARE = 0.005
+STATE = mujoco.mjtState.mjSTATE_INTEGRATION
+REDO_FORCE = REDO_SHARE * c.AREA.max(1) * MAIN_RELIEF
 SPEED_STEP = 1e-4
 SWING_BLEND = 0.05 * c.SWING_TORQUE * c.SWING_SPEED
 PRIORITY_FIRST = JOINT_NAMES.index(c.PRIORITY[0])
@@ -228,6 +233,9 @@ class Hydraulics:
         self._neutral = np.zeros(n)
         self._rhs = np.zeros((n, NODES, 1 + JOINTS))
         self._rhs[:, :, 1:] = DISPLACEMENT
+        self._state = np.zeros(mujoco.mj_stateSize(model, STATE))
+        self.redos = 0
+        self.capped = 0
         self.pump_energy = np.zeros(n)
         self.lost_energy = np.zeros(n)
         self.work_energy = np.zeros(n)
@@ -471,60 +479,100 @@ class Hydraulics:
         play = self._half_play * np.abs(lever)
         per_play = np.divide(dt, play, out=np.zeros_like(play), where=play > 0.0)
         rod = lever * qd
-        motion = (self._gap, play == 0.0, rod, lever * (qd + dt * self._accel),
-                  self._rod_speed, per_play)
-        predicted = self._engage(*self._forces(solved, force_now, scale), *motion)[0]
-        rise = solved[..., 0] + (solved[..., 1:] @ predicted[..., None])[..., 0]
-        self._held_nodes[:] = False
-        start = drop[:, RELIEFS]
-        reach = start + (rise @ NODE_DROPS)[:, RELIEFS]
-        relief_moves = ((np.maximum(start, reach) > self._relief - RELIEF_BAND)
-                        & (np.abs(reach - start) > RELIEF_STEP))
-        fix = ((pressure + rise < c.CAVITATION_PRESSURE) | (self._cavity > 0.0)).any(1)
-        fix |= relief_moves.any(1)
-        if fix.any():
-            rows = np.flatnonzero(fix)
-            self._correct(rows, system, solved, start, rise, predicted, force_now[rows],
-                          scale[rows], tuple(m[rows] for m in motion))
-
-        held, coupling = self._forces(solved, force_now, scale)
-        _, contact, closing, reach, free_speed, diag, others = self._engage(
-            held, coupling, *motion)
-        self._gap = np.where(closing, np.sign(reach), self._gap)
-
-        stiff = self._stiff
-        stiff[:] = np.where(contact, diag * lever * lever, 0.0)
-        data.ctrl[self._actuators] = np.where(contact, lever * (held - others), 0.0) - stiff * qd
+        rigid = play == 0.0
+        relief_start = drop[:, RELIEFS]
+        saved = (self._edge_flow.copy(), self._weights.copy(), self._rhs.copy(), system.copy(),
+                 solved.copy(), self._gap.copy())
+        mujoco.mj_getState(model, data, self._state, STATE)
         self._neutral = np.where(self._piloted, 0.0, self._neutral + dt)
-        model.dof_armature[qvel] = self._base_armature + stiff * dt
-        model.dof_frictionloss[self._swing_dofs] = self._base_friction + np.where(
-            self._neutral >= c.BRAKE_DELAY, self._brake, 0.0)
-        mujoco.mj_step(model, data)
-        model.dof_armature[qvel] = self._base_armature
-        model.dof_frictionloss[self._swing_dofs] = self._base_friction
+        brake = self._base_friction + np.where(self._neutral >= c.BRAKE_DELAY, self._brake, 0.0)
+        redo = np.zeros(n, bool)
+        redo_held = np.zeros((n, NODES), bool)
+        redo_speed = np.zeros((n, JOINTS))
+        best = (np.full(n, np.inf), redo.copy(), redo_held.copy(), redo_speed.copy(), np.zeros(n, int))
+        cavity = self._cavity
+        for attempt in range(REDO_PASSES + 2):
+            ahead = np.where(redo[:, None], redo_speed, lever * (qd + dt * self._accel))
+            loose = np.where(redo[:, None], redo_speed, self._rod_speed)
+            motion = (self._gap, rigid, rod, ahead, loose, per_play)
+            predicted = self._engage(*self._forces(solved, force_now, scale), *motion)[0]
+            predicted = np.where(redo[:, None], redo_speed, predicted)
+            rise = solved[..., 0] + (solved[..., 1:] @ predicted[..., None])[..., 0]
+            self._held_nodes[:] = False
+            reach = relief_start + (rise @ NODE_DROPS)[:, RELIEFS]
+            relief_moves = ((np.maximum(relief_start, reach) > self._relief - RELIEF_BAND)
+                            & (np.abs(reach - relief_start) > RELIEF_STEP))
+            start_held = np.where(redo[:, None], redo_held,
+                                  (pressure + rise < c.CAVITATION_PRESSURE) | (cavity > 0.0))
+            fix = start_held.any(1) | relief_moves.any(1) | redo
+            if fix.any():
+                rows = np.flatnonzero(fix)
+                self._correct(rows, system, solved, relief_start, start_held[rows], predicted,
+                              force_now[rows], scale[rows], tuple(m[rows] for m in motion),
+                              redo[rows])
+
+            held, coupling = self._forces(solved, force_now, scale)
+            _, contact, closing, reach, free_speed, diag, others = self._engage(
+                held, coupling, *motion)
+            self._gap = np.where(closing, np.sign(reach), self._gap)
+
+            stiff = self._stiff
+            stiff[:] = np.where(contact, diag * lever * lever, 0.0)
+            data.ctrl[self._actuators] = np.where(contact, lever * (held - others), 0.0) - stiff * qd
+            model.dof_armature[qvel] = self._base_armature + stiff * dt
+            model.dof_frictionloss[self._swing_dofs] = brake
+            mujoco.mj_step(model, data)
+            model.dof_armature[qvel] = self._base_armature
+            model.dof_frictionloss[self._swing_dofs] = self._base_friction
+
+            joint_rod = lever * data.qvel[qvel]
+            room = play * (1.0 / dt)
+            free_speed = np.minimum(np.maximum(free_speed, joint_rod - room * (1.0 + self._gap)),
+                                    joint_rod + room * (1.0 - self._gap))
+            speed = np.where(contact, joint_rod, free_speed)
+            change = solved[..., 0] + (solved[..., 1:] @ speed[..., None])[..., 0]
+            held_nodes = self._held_nodes.copy()
+            missing = np.zeros_like(cavity)
+            tracked = (held_nodes | (cavity > 0.0)).any(1)
+            if tracked.any():
+                rows = np.flatnonzero(tracked)
+                missing[rows] = self._balance(system[rows], self._rhs[rows], change[rows],
+                                              speed[rows])
+            wrong = (np.where(held_nodes, cavity + missing < 0.0,
+                              pressure + change < c.CAVITATION_PRESSURE)).any(1)
+            if wrong.any():
+                rows = np.flatnonzero(wrong)
+                sol, held_nodes[rows], missing[rows] = self._hold(
+                    rows, system[rows], held_nodes[rows], speed[rows])
+                change[rows] = sol[..., 0] + (sol[..., 1:] @ speed[rows][..., None])[..., 0]
+            applied = (data.ctrl[self._actuators] - stiff * (data.qvel[qvel] - qd)) / lever
+            final = -((pressure + change) @ DISPLACEMENT) * scale
+            miss = np.where(contact, np.abs(applied - final), 0.0)
+            changed = (held_nodes != self._held_nodes).any(1) | (miss > REDO_FORCE).any(1)
+            if not changed.any() or attempt > REDO_PASSES:
+                break
+            score = (miss / REDO_FORCE).max(1)
+            better = score < best[0]
+            for kept, now in zip(best, (score, redo, redo_held, redo_speed, attempt)):
+                kept[better] = now[better] if np.ndim(now) else now
+            if attempt == REDO_PASSES:
+                self.capped += 1
+                if (best[4] == attempt).all():
+                    break
+                redo, redo_held, redo_speed = (best[1].copy(), best[2].copy(), best[3].copy())
+            else:
+                redo_held[changed] = held_nodes[changed]
+                redo_speed[changed] = speed[changed]
+                redo |= changed
+            self.redos += 1
+            mujoco.mj_setState(model, data, self._state, STATE)
+            self._edge_flow[:], self._weights[:], self._rhs[:] = saved[:3]
+            system[:], solved[:] = saved[3:5]
+            self._gap = saved[5].copy()
 
         self._accel = (data.qvel[qvel] - qd) * (1.0 / dt)
-        joint_rod = lever * data.qvel[qvel]
-        room = play * (1.0 / dt)
-        free_speed = np.minimum(np.maximum(free_speed, joint_rod - room * (1.0 + self._gap)),
-                                joint_rod + room * (1.0 - self._gap))
-        speed = np.where(contact, joint_rod, free_speed)
         self._rod_speed = free_speed
-        change = solved[..., 0] + (solved[..., 1:] @ speed[..., None])[..., 0]
-        held_nodes = self._held_nodes
-        cavity = self._cavity
-        missing = np.zeros_like(cavity)
-        tracked = (held_nodes | (cavity > 0.0)).any(1)
-        if tracked.any():
-            rows = np.flatnonzero(tracked)
-            missing[rows] = self._balance(system[rows], self._rhs[rows], change[rows], speed[rows])
-        wrong = (np.where(held_nodes, cavity + missing < 0.0,
-                          pressure + change < c.CAVITATION_PRESSURE)).any(1)
-        if wrong.any():
-            rows = np.flatnonzero(wrong)
-            sol, held_nodes[rows], missing[rows] = self._hold(
-                rows, system[rows], held_nodes[rows], speed[rows])
-            change[rows] = sol[..., 0] + (sol[..., 1:] @ speed[rows][..., None])[..., 0]
+        self._held_nodes[:] = held_nodes
         missing *= held_nodes | (cavity > 0.0)
         pressure += change
         used = flow + slope * (change @ NODE_DROPS)
@@ -565,7 +613,8 @@ class Hydraulics:
         return (balance - (rhs[..., 1:] @ speed[..., None])[..., 0]) * self.dt
 
     def _hold(self, rows: np.ndarray, matrix: np.ndarray, held: np.ndarray,
-              speed: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+              speed: np.ndarray, fixed: np.ndarray | bool = False
+              ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         rhs = self._rhs[rows]
         pressure, cavity = self._pressure[rows], self._cavity[rows]
         floor = c.CAVITATION_PRESSURE - pressure
@@ -576,7 +625,7 @@ class Hydraulics:
             solved = np.linalg.solve(np.where(held[..., None], IDENTITY, matrix), given)
             delta = solved[..., 0] + (solved[..., 1:] @ speed[..., None])[..., 0]
             missing = self._balance(matrix, rhs, delta, speed)
-            now = np.where(held, cavity + missing > 0.0, delta < floor)
+            now = np.where(fixed, held, np.where(held, cavity + missing > 0.0, delta < floor))
             if (now == held).all() or attempt == NODES - 1:
                 break
             held = now
@@ -605,17 +654,15 @@ class Hydraulics:
         return np.where(contact, ahead, free), contact, closing, reach, free, diag, others
 
     def _correct(self, rows: np.ndarray, system: np.ndarray, solved: np.ndarray,
-                 start: np.ndarray, rise: np.ndarray, speed: np.ndarray, force_now: np.ndarray,
-                 scale: np.ndarray, motion: tuple[np.ndarray, ...]) -> None:
+                 start: np.ndarray, held: np.ndarray, speed: np.ndarray, force_now: np.ndarray,
+                 scale: np.ndarray, motion: tuple[np.ndarray, ...], fixed: np.ndarray) -> None:
         guess = speed[rows]
         relief = self._relief[rows]
         base = start[rows]
         shift = np.zeros_like(base)
-        held = (self._pressure[rows] + rise[rows] < c.CAVITATION_PRESSURE) | (
-            self._cavity[rows] > 0.0)
         matrix = system[rows]
         for attempt in range(CORRECTOR_PASSES):
-            sol, held, _ = self._hold(rows, matrix, held, guess)
+            sol, held, _ = self._hold(rows, matrix, held, guess, fixed[:, None])
             moved = self._engage(*self._forces(sol, force_now, scale), *motion)[0]
             slid = np.abs(moved - guess) > SPEED_STEP
             guess = np.where(slid, moved, guess)
