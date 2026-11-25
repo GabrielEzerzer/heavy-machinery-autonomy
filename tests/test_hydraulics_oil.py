@@ -8,7 +8,15 @@ import pytest
 from hma.hydraulics import NOMINAL, RANGES, Hydraulics, draw_machine
 from hma.hydraulics import circuit as c
 from hma.hydraulics import layer as oil_layer
-from hma.hydraulics.layer import DISPLACEMENT, INFLOW, NODE_DROPS, VOLUME_SLOPE
+from hma.hydraulics.layer import (
+    CHECKS,
+    DISPLACEMENT,
+    DROPS,
+    INFLOW,
+    NODE_DROPS,
+    ORIFICES,
+    VOLUME_SLOPE,
+)
 from hma.machine import (
     BODY_NAMES,
     JOINT_LIMITS,
@@ -439,13 +447,16 @@ def test_random_combined_commands_at_the_corners_keep_floor_relief_and_torque_co
         setting[i, c.PUMPS:] = m.port_relief.ravel()
     setting[:, c.PUMPS:c.PUMPS + 2] = np.inf
     rng = np.random.default_rng(11)
-    pressures, mismatch = [], []
+    pressures, mismatch, backward = [], [], []
     for _ in range(100):
         layer.act(rng.choice([-1.0, 0.0, 1.0], size=(len(machines), 4)))
         for _ in range(layer.steps_per_decision):
+            start = check_drops(layer)
             mismatch.append(stepped_force_mismatch(layer))
+            backward.append(backward_check_flow(layer, start))
             pressures.append(layer._pressure.copy())
     pressures, mismatch = np.array(pressures), np.array(mismatch)
+    assert np.max(backward) < 1e-12
     assert np.isfinite(pressures).all()
     assert pressures.min() >= c.CAVITATION_PRESSURE - 1e-6
     assert (pressures - setting).max() < RELIEF_OVERSHOOT
@@ -469,6 +480,31 @@ def test_a_capped_step_keeps_the_attempt_whose_forces_matched_best(monkeypatch):
             mismatch.append(stepped_force_mismatch(layer))
     assert layer.capped >= 3
     assert np.array(mismatch)[..., SWING].max() < 0.5e3
+
+
+def check_drops(layer):
+    nodes = layer._nodes.copy()
+    nodes[:, :c.NODES] = layer._pressure
+    return (nodes @ DROPS)[:, ORIFICES]
+
+
+def backward_check_flow(layer, start):
+    flow = layer._edge_flow[:, ORIFICES] + layer._edge_slope[:, ORIFICES] * (
+        check_drops(layer) - start)
+    return np.maximum(-flow[:, CHECKS], 0.0)
+
+
+def test_no_check_valve_passes_oil_backwards_when_its_pressure_difference_reverses_in_a_step():
+    layer = layer_for(NOMINAL)
+    rng = np.random.default_rng(19)
+    backward = []
+    for k in range(990):
+        if k % 20 == 0:
+            layer.act(rng.choice([-1.0, 0.0, 1.0], size=(1, 4)))
+        start = check_drops(layer)
+        layer.step()
+        backward.append(backward_check_flow(layer, start))
+    assert np.max(backward) < 1e-12
 
 
 def stepped_force_mismatch(layer):
