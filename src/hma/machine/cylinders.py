@@ -8,6 +8,8 @@ import math
 
 import numpy as np
 
+from hma.machine import kinematics
+
 PINS = {
     "boom_foot": ("upper", (0.5561, -0.1644, 0.033)),
     "boom_rod": ("boom", (-0.999, 0.0, 1.7051)),
@@ -19,16 +21,10 @@ PINS = {
 }
 SIDE_LINK = 0.4922
 H_LINK = 0.4656
-CYLINDER_OFFSETS = {"boom": (-0.25, 0.25), "arm": (0.0,), "bucket": (0.0,)}
-CYLINDER_PINS = {
-    "boom": ("boom_foot", "boom_rod"),
-    "arm": ("arm_head", "arm_rod"),
-    "bucket": ("bucket_head", "coupler"),
-}
 
-BOOM_PIVOT = (0.14, 0.424)
-ARM_PIVOT = (0.0, 4.6)
-BUCKET_PIVOT = (0.0, 2.519)
+BOOM_PIVOT = (float(kinematics.BOOM_PIVOT[0]), float(kinematics.BOOM_PIVOT[2]))
+ARM_PIVOT = (0.0, kinematics.BOOM_LENGTH)
+BUCKET_PIVOT = (0.0, kinematics.ARM_LENGTH)
 BOOM_TURN = math.pi / 2
 
 BORE = {"boom": 0.105, "arm": 0.115, "bucket": 0.100}
