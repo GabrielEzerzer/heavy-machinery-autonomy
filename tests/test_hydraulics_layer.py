@@ -420,12 +420,25 @@ def test_control_rate_must_be_finite_positive_and_divide_the_physics_rate(contro
     {"sensor_latency": -0.01},
     {"lag": np.array([np.nan, 0.1, 0.1, 0.1])},
     {"gain": np.array([1.0, np.inf, 1.0, 1.0])},
+    {"gain": np.array([1.0, 0.0, 1.0, 1.0])},
+    {"deadband": np.array([0.0, -0.1, 0.0, 0.0])},
+    {"backlash": np.array([0.0, 0.0, -0.01, 0.0])},
+    {"link_mass": np.array([1.0, 1.0, -1.0, 1.0, 1.0])},
+    {"counterweight": 0.0},
+    {"load_noise": -0.01},
+    {"curve": NOMINAL.curve[:, ::-1].copy()},
 ])
 def test_reset_refuses_a_machine_with_impossible_values(change):
     layer = layer_for(NOMINAL)
     with pytest.raises(ValueError):
         layer.reset(0, replace(NOMINAL, **change))
     assert layer.machines[0] is NOMINAL
+
+
+def test_a_layer_needs_at_least_one_machine():
+    model = load_scene(1, weld=True)
+    with pytest.raises(ValueError):
+        Hydraulics(model, mujoco.MjData(model), [])
 
 
 def test_a_bad_pose_is_refused_before_anything_is_reset():

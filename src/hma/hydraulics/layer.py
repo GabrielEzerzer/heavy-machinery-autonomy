@@ -90,6 +90,8 @@ def _counterweight_solid(model: mujoco.MjModel) -> _Solid:
 class Hydraulics:
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData, machines: Sequence[Machine],
                  control_hz: float = CONTROL_HZ):
+        if len(machines) == 0:
+            raise ValueError("at least one machine is needed")
         self.model, self.data = model, data
         self.n = len(machines)
         self.dt = float(model.opt.timestep)
@@ -184,14 +186,26 @@ class Hydraulics:
             raise ValueError("delay longer than this layer's command buffer")
         if machine.sensor_latency > (self._sensor_len - 1) * self.dt + 1e-12:
             raise ValueError("sensor latency longer than this layer's sensor buffer")
-        if np.any(machine.lag <= 0) or np.any(machine.deadband >= 1) or machine.flow <= 0:
-            raise ValueError("lag and flow must be positive and deadband below 1")
+        if np.any(machine.lag <= 0) or machine.flow <= 0:
+            raise ValueError("lag and flow must be positive")
+        if np.any(machine.deadband < 0) or np.any(machine.deadband >= 1):
+            raise ValueError("deadband must be at least 0 and below 1")
+        if np.any(machine.gain <= 0) or np.any(machine.speed_limit <= 0):
+            raise ValueError("gain and speed limits must be positive")
+        if np.any(machine.backlash < 0):
+            raise ValueError("backlash must not be negative")
+        if np.any(machine.link_mass <= 0) or machine.counterweight <= 0:
+            raise ValueError("link mass and counterweight factors must be positive")
+        if min(machine.position_noise, machine.velocity_noise, machine.load_noise) < 0:
+            raise ValueError("sensor noise must not be negative")
         if np.any(machine.speed_limit > self.model.actuator_ctrlrange[self._actuators[index], 1]):
             raise ValueError("a speed limit exceeds what the joint's actuator accepts")
         if np.any(machine.force_limit <= 0) or machine.power <= 0:
             raise ValueError("force limits and power must be positive")
         if machine.curve.shape != (JOINTS, CURVE_SEGMENTS + 1):
             raise ValueError(f"curve must have shape {(JOINTS, CURVE_SEGMENTS + 1)}")
+        if np.any(np.diff(machine.curve, axis=1) < 0):
+            raise ValueError("the valve curve must not fall as the spool opens")
         self.machines[index] = machine
         delay_steps = np.round(machine.delay / self.dt).astype(np.intp)
         heads = np.arange(self._command_len)[:, None]
