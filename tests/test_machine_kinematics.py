@@ -16,7 +16,7 @@ from hma.machine import (
 
 LISTED_REACH = 8.27
 LISTED_REACH_AT_GROUND = 8.14
-LISTED_DIG_DEPTH = 5.57
+LISTED_DEPTH = 5.57
 
 
 def random_poses(n: int, seed: int = 0) -> np.ndarray:
@@ -144,4 +144,4 @@ def test_reach_and_depth_against_listed_figures():
     at_ground = radius[np.abs(position[..., 2]) < 0.02].max()
     assert abs(radius.max() / LISTED_REACH - 1) < 0.05
     assert abs(at_ground / LISTED_REACH_AT_GROUND - 1) < 0.05
-    assert abs(-position[..., 2].min() / LISTED_DIG_DEPTH - 1) < 0.05
+    assert abs(-position[..., 2].min() / LISTED_DEPTH - 1) < 0.05
