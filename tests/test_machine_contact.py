@@ -187,6 +187,73 @@ def test_propped_machine_bucket_reaction_matches_statics():
     assert bucket[2] + tracks[2] == pytest.approx(weight[1], rel=0.01)
 
 
+def propping(boom, arm, seconds):
+    model, data = home()
+    pose(model, data, (0.0, -0.5, 1.6, 1.0))
+    command(model, data, "boom", boom)
+    command(model, data, "arm", arm)
+    layer = held(model, data)
+    base = model.body(P + "base").id
+    tip = model.site(P + TIP_SITE).id
+    weight = model.body_subtreemass[base] * G
+    rows = []
+
+    def moments(body):
+        contacts = body_contacts(model, data, body)
+        if not contacts:
+            return np.zeros(3), np.zeros(3)
+        force = np.array([c[1] for c in contacts])
+        weights = np.abs(force[:, 2])
+        return force.sum(0), np.r_[weights @ np.array([c[0] for c in contacts])[:, [0, 2]],
+                                   weights.sum()]
+
+    def record():
+        (fb, mb), (_, mr) = moments("bucket"), moments("base")
+        pressure = max(layer.pump_pressures()[0].max() - NOMINAL.main_relief,
+                       (layer.chamber_pressures()[0] - NOMINAL.port_relief).max())
+        rows.append((data.time, fb[0], fb[2], *mb, *mr, data.subtree_com[base][0],
+                     data.site_xpos[tip][2], pressure))
+
+    run(model, data, seconds, record)
+    return np.array(rows), weight
+
+
+def periods(rows, start, steps):
+    kept = rows[rows[:, 0] > start]
+    return kept[:len(kept) // steps * steps].reshape(-1, steps, rows.shape[1])
+
+
+def reaction_over_hand(rows, weight, start, steps):
+    w = periods(rows, start, steps).sum(1)
+    fx, fz, gx = w[:, 1], w[:, 2], w[:, 9] / steps
+    bx, bz, rx, rz = w[:, 3] / w[:, 5], w[:, 4] / w[:, 5], w[:, 6] / w[:, 8], w[:, 7] / w[:, 8]
+    return fz / ((weight * steps * (gx - rx) + fx * (bz - rz)) / (bx - rx))
+
+
+def test_propped_machine_whose_tip_holds_keeps_contact_and_matches_statics():
+    rows, weight = propping(0.6, -0.15, 4.0)
+    landed = rows[rows[:, 0] > 1.0]
+    assert np.all(landed[:, 2] > 0.0)
+    assert np.ptp(landed[:, 10]) < 0.005
+    assert np.abs(reaction_over_hand(rows, weight, 1.0, 20) - 1.0).max() < 0.02
+
+
+@pytest.mark.parametrize(("boom", "until", "mean_bound", "rms_bound", "ripple_bound"),
+                         [(0.6, 8.0, 0.03, 0.75e-3, 3.5e-3), (1.0, 3.3, 0.07, 1.5e-3, 7.0e-3)])
+def test_propped_machine_whose_tip_slides_hops_within_its_measured_bounds(
+        boom, until, mean_bound, rms_bound, ripple_bound):
+    rows, weight = propping(boom, 0.0, until)
+    start = 2.0 if boom < 1.0 else 1.0
+    assert np.abs(reaction_over_hand(rows, weight, start, 100) - 1.0).max() < mean_bound
+    tip = periods(rows, start, 20)[..., 10]
+    steps = np.arange(20) - 9.5
+    slope = (tip * steps).sum(1, keepdims=True) / (steps * steps).sum()
+    ripple = tip - tip.mean(1, keepdims=True) - slope * steps
+    assert np.sqrt((ripple ** 2).mean()) < rms_bound
+    assert np.ptp(ripple, 1).max() < ripple_bound
+    assert periods(rows, start, 1)[..., 11].max() < -oil_layer.RELIEF_BAND
+
+
 def rigid(model, data, seconds, each=None):
     for _ in range(round(seconds / model.opt.timestep)):
         mujoco.mj_step(model, data)
