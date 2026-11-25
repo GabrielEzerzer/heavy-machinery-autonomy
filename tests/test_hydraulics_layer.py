@@ -546,3 +546,22 @@ def test_curve_gain_applies_before_the_drawn_speed_limit_clips():
     for command in (0.95, 1.0):
         assert steady_speeds(strong, [0, 0, 0, command])[BUCKET] == pytest.approx(top, rel=2e-3)
     assert steady_speeds(strong, [0, 0, 0, 0.9])[BUCKET] == pytest.approx(0.972 * top, rel=2e-3)
+
+
+@pytest.mark.parametrize("machine", [NOMINAL, draw_machine(2)], ids=["nominal", "drawn"])
+def test_reversing_against_a_resisting_load_stays_within_the_power_limit(machine):
+    layer = layer_for(machine)
+    data = layer.data
+    dofs, actuators = layer._qvel[0], layer._actuators[0]
+    cap = machine.force_limit
+    commands = np.random.default_rng(3).choice([-1.0, 1.0], size=(60, 1, 4))
+    power = []
+    for u in commands:
+        layer.act(u)
+        for _ in range(layer.steps_per_decision):
+            data.qfrc_applied[dofs] = -0.95 * cap * np.sign(data.ctrl[actuators])
+            layer.step()
+            force = layer.true_state().loads[0] * cap
+            power.append(np.maximum(force * data.ctrl[actuators], 0.0).sum())
+    assert np.mean(power[200:]) <= 1.02 * machine.power
+    assert np.mean(power[200:]) > 0.7 * machine.power

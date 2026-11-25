@@ -147,6 +147,7 @@ class Hydraulics:
         self._force_limit = np.ones(shape)
         self._inv_force_limit = np.ones(shape)
         self._force = np.zeros(shape)
+        self._force_sign = np.zeros(shape)
         self._force_alpha = 1.0 - np.exp(-self.dt / FORCE_FILTER)
         self._power = np.ones(self.n)
         self._half_play = np.zeros(shape)
@@ -265,7 +266,8 @@ class Hydraulics:
         self._play[index] = 0.0
         mujoco.mj_forward(model, data)
         first = np.stack(self.true_state())[:, index]
-        self._force[index] = first[2] * self._force_limit[index]
+        self._force[index] = np.abs(first[2]) * self._force_limit[index]
+        self._force_sign[index] = np.sign(first[2])
         first += self._rngs[index].uniform(-1.0, 1.0, first.shape) * self._noise[:, index]
         self._sensors[:, :, index] = first
 
@@ -292,7 +294,7 @@ class Hydraulics:
         demand = (speed * self._inv_nominal_speed).sum(axis=1)
         speed *= np.minimum(1.0, self._flow / np.maximum(demand, 1e-12))[:, None]
         np.copysign(speed, spool, out=speed)
-        power = np.maximum(self._force * speed, 0.0).sum(axis=1)
+        power = np.maximum(self._force_sign * self._force * speed, 0.0).sum(axis=1)
         speed *= np.minimum(1.0, self._power / np.maximum(power, 1e-12))[:, None]
         drive = speed * self.dt
         drive += self._play
@@ -307,7 +309,10 @@ class Hydraulics:
         self._sensor_head = (self._sensor_head + 1) % self._sensor_len
         reading = self._sensors[self._sensor_head]
         self._read_into(reading)
-        self._force += self._force_alpha * (reading[2] * self._force_limit - self._force)
+        force = np.abs(reading[2]) * self._force_limit
+        self._force += self._force_alpha * (force - self._force)
+        np.maximum(self._force, force, out=self._force)
+        np.sign(reading[2], out=self._force_sign)
         cursor = self._noise_cursor
         if cursor == 0:
             for i in range(self.n):
