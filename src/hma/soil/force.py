@@ -12,6 +12,7 @@ import numpy as np
 from hma.soil.params import SoilParams
 
 FORCE_CAP = 175.0e3
+V_CAP = 12.0e3
 CAP_SHARPNESS = 4
 EDGE_THICKNESS = 0.02
 RAKE_MARGIN = 0.1
@@ -72,9 +73,9 @@ def passive_coefficient(soil: SoilParams) -> float:
     return math.tan(math.pi / 4 + soil.friction_angle / 2) ** 2
 
 
-def smooth_cap(force: float) -> float:
+def smooth_cap(force: float, cap: float = FORCE_CAP) -> float:
     force = max(force, 0.0)
-    return force / (1.0 + (force / FORCE_CAP) ** CAP_SHARPNESS) ** (1.0 / CAP_SHARPNESS)
+    return force / (1.0 + (force / cap) ** CAP_SHARPNESS) ** (1.0 / CAP_SHARPNESS)
 
 
 def depth_sums(depths: list[float], spoil: list[float],
@@ -93,9 +94,12 @@ def raw_force(soil: SoilParams, sums: tuple[float, float, float, float], rake: f
     separation = (soil.unit_weight * moment * n_gamma
                   + (soil.cohesion * n_cohesion + soil.adhesion * n_adhesion) * firm
                   + load * n_surcharge * wetted)
-    penetration = (soil.penetration_factor * passive_coefficient(soil) * soil.unit_weight
-                   * firm * EDGE_THICKNESS * abs(attack_cos))
-    return separation + penetration
+    return separation + penetration(soil, firm) * abs(attack_cos)
+
+
+def penetration(soil: SoilParams, firm: float) -> float:
+    return (soil.penetration_factor * passive_coefficient(soil) * soil.unit_weight * firm
+            * EDGE_THICKNESS)
 
 
 def cutting_force(soil: SoilParams, depths: np.ndarray, width: float, rake: float,

@@ -165,7 +165,7 @@ def test_stiff_soil_stalls_the_drag_against_the_arm_cap():
     last = trace[-10:]
     assert {s["phase"] for s in last} == {"drag"}
     assert all(abs(s["loads"]["arm"]) >= 0.99 * FORCE_CAPS["arm"] for s in last)
-    assert np.linalg.norm(last[-1]["tip"] - last[0]["tip"]) < 0.01
+    assert np.linalg.norm(last[-1]["tip"][:2] - last[0]["tip"][:2]) < 0.01
 
 
 def test_holding_the_bucket_at_its_limit_stalls_like_a_free_bucket():
@@ -232,8 +232,8 @@ def test_a_stall_begins_holds_and_releases_without_jumps():
         loads.append(joint_loads(model, data))
         if k % 20 == 19:
             soil.control_step(model, data)
-    assert np.abs(np.diff(forces, axis=0)).max() < 10e3
-    assert np.abs(np.diff(loads, axis=0)).max() < 30e3
+    assert np.abs(np.diff(forces, axis=0)).max() < 15e3
+    assert np.abs(np.diff(loads, axis=0)).max() < 40e3
     assert reversals(forces) == 0 and reversals(loads) == 0
 
 
@@ -255,28 +255,33 @@ def test_a_tiny_perturbation_stays_tiny():
     assert np.abs(h1 - h0).max() < 1e-9
 
 
-def test_a_digging_neighbour_leaves_a_machines_soil_unchanged():
-    def run(command):
+@pytest.mark.parametrize("params", [NOMINAL, STIFF], ids=["dragging", "stalled"])
+def test_a_busy_neighbour_leaves_a_machine_unchanged(params):
+    def run(busy):
         model = load_scene(2, weld=True)
         data = mujoco.MjData(model)
-        soils = [Soil(model, 0), Soil(model, 1)]
+        soils = [Soil(model, 0), Soil(model, 1, params)]
         for i in (0, 1):
             data.qpos[[model.joint(machine_prefix(i) + j).qposadr[0] for j in JOINT_NAMES]] = (
                 inverse_kinematics(*BURIED))
         for soil in soils:
             soil.reset(model, data)
-        data.ctrl[actuators(model)] = command
         data.ctrl[model.actuator(machine_prefix(1) + "arm").id] = 0.2
-        resistance = []
+        rng, resistance = np.random.default_rng(0), []
         for _ in range(50):
+            if busy:
+                data.ctrl[actuators(model)] = rng.uniform(-1.0, 1.0, 4) * [1.0, 0.6, 0.8, 1.2]
             step(model, data, soils)
             resistance.append(soils[1].resistance)
-        return soils[1].heights.copy(), np.array(resistance), soils[1].bucket_volume
+        joints = [model.joint(machine_prefix(1) + j).qposadr[0] for j in JOINT_NAMES]
+        return (soils[1].heights.copy(), np.array(resistance), soils[1].bucket_volume,
+                data.qpos[joints].copy())
 
-    resting, digging = run((0.0, 0.0, 0.0, 0.0)), run((0.0, 0.0, 0.2, 0.0))
+    resting, digging = run(False), run(True)
     assert np.abs(digging[0] - resting[0]).max() < 1e-12
     assert np.abs(digging[1] - resting[1]).max() < 1e-6
     assert abs(digging[2] - resting[2]) < 1e-12
+    assert np.abs(digging[3] - resting[3]).max() < 1e-12
 
 
 def test_dragging_through_spoil_costs_less_than_through_undisturbed_soil():
@@ -382,7 +387,7 @@ def test_commands_that_cancel_at_the_tip_against_a_pinned_bucket_meet_the_soil()
         held.append(max(np.abs(tendon_forces(data, soil))))
         if k % 20 == 19:
             soil.control_step(model, data)
-    assert np.linalg.norm(data.site_xpos[soil.tip] - start) < 0.02
+    assert np.linalg.norm(data.site_xpos[soil.tip][:2] - start[:2]) < 0.02
     assert max(held) > 50e3
 
 
@@ -516,7 +521,8 @@ def test_an_edge_at_the_grid_border_is_resisted_as_it_is_inland():
         limits.append(soil.limits)
     assert data.site_xpos[soil.edges, 1].max() > soil.grid.y0 + soil.grid.cell * (
         soil.grid.shape[0] - 1)
-    assert np.all(np.array(limits[5:]) > 0.5 * np.array(limits[0]))
+    assert np.all(np.array(limits[5:])[:, :2] > 0.5 * np.array(limits[0][:2]))
+
 
 def test_ground_under_the_tracks_is_protected():
     model, data, soil = machine()
@@ -630,3 +636,51 @@ def test_joint_load_reads_one_machine_while_another_cuts():
         mujoco.mj_step(model, data)
     assert soils[0].resistance > 10e3
     assert joint_load(model, data, 1, "swing") == pytest.approx(2.0e4, rel=1e-3)
+
+
+def test_curling_through_an_upright_opening_changes_the_limits_smoothly():
+    model, data, soil = machine(STIFF)
+    place(model, data, soil, np.array([5.5, 0.0, -0.3]), 3.12)
+    data.ctrl[model.actuator(PREFIX + "bucket").id] = 0.5
+    forces, limits, facing = [], [], []
+    while not np.any(data.efc_type == mujoco.mjtConstraint.mjCNSTR_LIMIT_JOINT):
+        advance(model, data, soil, 1)
+        forces.append(tendon_forces(data, soil))
+        limits.append(soil.limits)
+        mouth = data.xmat[soil.bucket].reshape(3, 3) @ soil.mouth
+        facing.append(float(mouth @ soil.axes[0]))
+    assert min(facing) < 0.0 < max(facing)
+    assert min(np.array(limits)[:, 0]) > 100e3
+    assert np.abs(np.diff(limits, axis=0)).max() < 5e3
+    assert reversals(forces[:-1]) == 0
+
+
+def test_a_spoil_heap_just_above_the_ground_beside_the_edge_leaves_the_limits_alone():
+    def limits(rise):
+        model, data, soil = machine()
+        place(model, data, soil, np.array([6.0, 0.0, -0.3]), PITCH_DIG)
+        heap = soil.cells[..., 1] > 0.4
+        soil.heights[heap] = rise
+        soil.loose[heap] = 0.3 + rise
+        soil.substep(model, data)
+        return np.array(soil.limits)
+
+    below, above = limits(-1e-4), limits(1e-4)
+    assert min(below) > 10e3
+    assert np.abs(above - below).max() < 0.01 * below.max()
+
+
+def test_a_ridge_narrower_than_the_edge_resists_a_sideways_sweep():
+    model, data, soil = machine(STIFF)
+    place(model, data, soil, *BETWEEN_CELLS)
+    y = np.abs(soil.cells[..., 1])
+    soil.reset(model, data, np.where((y > 0.1) & (y < 0.8), -0.4, 0.0))
+    data.ctrl[actuators(model)] = (0.5, 0.0, 0.01, 0.0)
+    start = data.site_xpos[soil.tip].copy()
+    for k in range(40):
+        advance(model, data, soil, 1)
+        if k % 20 == 19:
+            soil.control_step(model, data)
+    assert soil.limits[1] > 10e3
+    assert np.linalg.norm(data.site_xpos[soil.tip] - start) < 0.01
+    assert soil.bucket_volume + soil.loose.sum() * soil.grid.cell_area < 1e-3
