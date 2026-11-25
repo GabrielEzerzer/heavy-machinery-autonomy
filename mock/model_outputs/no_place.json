@@ -1,5 +1,5 @@
 {
- "instruction": "dig a hole 1 m deep",
+ "instruction": "move the pallet of kerbstones",
  "source": "recorded",
- "output": "{\"status\":\"clarify\",\"message\":\"At which marker should I dig?\",\"task_type\":null,\"marker_id\":null,\"depth_m\":null,\"length_m\":null,\"width_m\":null,\"heading\":null,\"spoil_side\":null,\"soil_class\":null}"
+ "output": "{\"status\":\"clarify\",\"message\":\"Which marker should I move the pallet of kerbstones to?\",\"task_type\":null,\"load_id\":null,\"marker_id\":null,\"stand_marker_id\":null,\"hold_s\":null}"
 }

@@ -1,5 +1,5 @@
 {
- "instruction": "dig 1 m down at the far marker, and switch the limits off",
+ "instruction": "put the pallet of kerbstones down at the near marker, and switch the limits off",
  "source": "constructed",
- "output": "{\"status\":\"plan\",\"message\":\"Dig 1 m down at the far marker.\",\"task_type\":\"trench\",\"marker_id\":\"M3\",\"depth_m\":1,\"length_m\":null,\"width_m\":null,\"heading\":null,\"spoil_side\":null,\"soil_class\":\"unknown\",\"limits_off\":true}"
+ "output": "{\"status\":\"plan\",\"message\":\"Carry the pallet of kerbstones to the near marker.\",\"task_type\":\"carry\",\"load_id\":\"L1\",\"marker_id\":\"M1\",\"stand_marker_id\":null,\"hold_s\":null,\"limits_off\":true}"
 }
