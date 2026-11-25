@@ -54,7 +54,10 @@ def test_scene_physics_matches_the_recorded_snapshot(scene):
     now = snapshot(load_scene(**SCENES[scene]))
     assert now.keys() == recorded.keys()
     for name, value in recorded.items():
-        assert now[name] == value, name
+        if name == "contact_geom_names":
+            assert now[name] == value
+        else:
+            np.testing.assert_allclose(now[name], value, rtol=1e-12, atol=1e-15, err_msg=name)
 
 
 if __name__ == "__main__":
