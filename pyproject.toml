@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "heavy-machinery-autonomy"
 version = "0.0.1"
-description = "A simulation demo: an excavator digs from a plain-English instruction, with one controller for every randomised machine"
+description = "A simulation demo: an excavator carries out a plain-English task on rough ground without tipping, with one controller for every randomised machine"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "PolyForm-Noncommercial-1.0.0 AND Apache-2.0"

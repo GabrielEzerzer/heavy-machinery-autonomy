@@ -16,9 +16,6 @@ JOINT_NAMES = ("swing", "boom", "arm", "bucket")
 BODY_NAMES = ("base", "upper", "boom", "arm", "bucket")
 BASE_JOINT = "base_free"
 TIP_SITE = "bucket_tip"
-EDGE_SITES = ("bucket_edge_right", "bucket_edge_left")
-SOIL_AXES = ("soil_0", "soil_1", "soil_2")
-SOIL_INVWEIGHT = (8.396e-3, 9.241e-4, 5.199e-3)
 TRACK_FEET = "track_"
 ANCHOR = "anchor"
 WELD = "base_weld"
@@ -59,13 +56,6 @@ def tendon_friction(data: mujoco.MjData, tendons: np.ndarray) -> np.ndarray:
     forces = np.bincount(data.efc_id[rows], weights=data.efc_force[rows],
                          minlength=int(tendons.max(initial=-1)) + 1)
     return forces[tendons]
-
-
-def set_soil_softness(model: mujoco.MjModel) -> None:
-    for t in range(model.ntendon):
-        axis = model.tendon(t).name.rpartition("/")[2]
-        if axis in SOIL_AXES:
-            model.tendon_invweight0[t] = SOIL_INVWEIGHT[SOIL_AXES.index(axis)]
 
 
 def ground_shape() -> tuple[int, int]:
@@ -111,12 +101,6 @@ def _machine_spec(index: int, weld: bool) -> mujoco.MjSpec:
         act.set_to_velocity(kv=VALVE_GAIN)
         act.ctrllimited = mujoco.mjtLimited.mjLIMITED_TRUE
         act.ctrlrange = [-SPEED_LIMITS[name], SPEED_LIMITS[name]]
-    for name in SOIL_AXES:
-        spec.worldbody.add_body(name=name, mocap=True).add_site(name=name)
-        soil = spec.add_tendon(name=name, frictionloss=0.0, solref_friction=[2 * TIMESTEP, 1.0],
-                               solimp_friction=[*VALVE_SOLIMP, 0.5, 2.0])
-        soil.wrap_site(name)
-        soil.wrap_site(TIP_SITE)
     return spec
 
 
@@ -131,7 +115,7 @@ def _add_ground(scene: mujoco.MjSpec, index: int, prefix: str, offset: np.ndarra
                        -GROUND_DEPTH]
     scene.worldbody.add_geom(name=prefix + GROUND, type=mujoco.mjtGeom.mjGEOM_HFIELD,
                              hfieldname=prefix + GROUND, pos=centre, contype=0,
-                             conaffinity=1 << index, material="soil", friction=[0.8, 0.005, 1e-4])
+                             conaffinity=1 << index, material=GROUND, friction=[0.8, 0.005, 1e-4])
 
 
 def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
@@ -146,11 +130,11 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
     scene.visual.global_.offwidth = 1280
     scene.visual.global_.offheight = 720
     scene.visual.quality.shadowsize = 4096
-    scene.add_texture(name="soil", type=mujoco.mjtTexture.mjTEXTURE_2D,
+    scene.add_texture(name=GROUND, type=mujoco.mjtTexture.mjTEXTURE_2D,
                       builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER, width=64, height=64,
                       rgb1=[0.55, 0.45, 0.33], rgb2=[0.5, 0.41, 0.3])
-    soil = scene.add_material(name="soil", texrepeat=[12, 12])
-    soil.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "soil"
+    ground = scene.add_material(name=GROUND, texrepeat=[12, 12])
+    ground.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = GROUND
     scene.worldbody.add_light(pos=[0, 0, 30], dir=[0.3, 0.2, -1],
                               type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL, castshadow=1)
     for i in range(n_machines):
@@ -166,7 +150,6 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
                            active=int(weld))
     scene.add_key(name=HOME_KEY)
     model = scene.compile()
-    set_soil_softness(model)
     flat = np.zeros(ground_shape())
     for i in range(n_machines):
         write_ground(model, i, flat)

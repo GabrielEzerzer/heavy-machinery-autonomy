@@ -1,17 +1,17 @@
 # Heavy Machinery Autonomy
 
-A simulation demo. You type a digging task in plain English, and a simulated 12-tonne excavator digs it. One controller, trained in simulation, drives every individual machine of this type with no retuning.
+A simulation demo. You type a task in plain English, and a simulated 12-tonne excavator carries it out on rough ground without tipping over. One controller, trained in simulation, handles simulated machines of this type that each behave differently, with no retuning.
 
-**Status: in development.** The machine model, its hydraulics and the soil step together in one scene, and a conventional controller digs a full cycle through them. The language step runs on its own. No dig planner or learned controller exists yet. The [feature map](#feature-map) lists what is built and what is planned.
+**Status: in development.** The machine model and its hydraulics are built, and a conventional controller follows bucket paths through them. The language step runs on its own and still produces trench plans from an earlier direction of the project. Rough ground, a carried load and the learned controller do not exist yet. An earlier version simulated soil and digging; it was removed and is in the repository's history. The [feature map](#feature-map) lists what is built and what is planned.
 
 ## How it works
 
-1. A GPT model turns an instruction such as "dig 1 m down at the far marker" into a small task specification: which marker, how deep, how long.
-2. Fixed checks accept or refuse the specification: valid fields, within the machine's reach, within trench safety rules. A person confirms before anything moves.
-3. A dig planner turns the specification into paths for the bucket.
-4. A learned controller follows those paths. Every run draws a different machine, with its own hydraulic delay, dead zone, flow limit, slack in the joints, weights and soil. The controller is the same for all of them.
+1. A GPT model turns a plain-English instruction into a small task specification. The task type is being changed: today the specification still describes a trench, with a marker, a depth and a length.
+2. Fixed checks accept or refuse the specification: valid fields, within the machine's reach, within the task's safety rules. A person confirms before anything moves.
+3. A planner turns the specification into paths for the bucket and the load.
+4. A learned controller follows those paths. Every run draws a different machine, with its own hydraulic delay, dead zone, flow limit, slack in the joints and weights, and stands it on ground drawn at random. The controller is the same for all of them.
 
-The physics is [MuJoCo](https://mujoco.org). The soil is a grid of heights with an analytic digging force. The controller is trained with PPO from [Stable-Baselines3](https://stable-baselines3.readthedocs.io).
+The physics is [MuJoCo](https://mujoco.org). The controller is trained with PPO from [Stable-Baselines3](https://stable-baselines3.readthedocs.io).
 
 ### Hydraulics model
 
@@ -40,9 +40,13 @@ Limits of the hydraulics model:
 - Delay and lag are drawn independently. Over 500 drawn machines, the time for a joint to reach 90% of a commanded speed step has a median of 0.95 s and a maximum of 1.53 s, slower than the 680–850 ms measured on the [HEAP][heap] valves for 63% of joints: the ranges are meant to be wider than one measured machine. The nominal machine's 0.30 s is the fastest corner of every range.
 - Joint play is lost motion when the command reverses. A link does not drop through the gap when its load reverses with no command.
 - Delays and latency are rounded to the 5 ms physics step. The load reading is taken at the start of each step.
-- Masses and force caps are written into the shared MuJoCo model for each machine by name, so a model cannot be shared by scenes that need different machines. Within one scene, repeatability is bit for bit only when the same machines are in it in the same states, because one constraint solve covers every machine: resetting one machine while another keeps running repeats its episode to about 1e-15: with both machines cutting soil, the reset machine's joints differed by at most 1.1e-15 rad from a fresh scene. The scene clock (`data.time`) keeps running through a reset, so a controller that needs a bit-for-bit repeat should time its episode from its own step count.
+- Masses and force caps are written into the shared MuJoCo model for each machine by name, so a model cannot be shared by scenes that need different machines. Within one scene, repeatability is bit for bit only when the same machines are in it in the same states, because one constraint solve covers every machine: resetting one machine while another keeps running repeats its episode to about 1e-15: with both machines driven by random valve commands, the reset machine's joints differed by at most 1.1e-15 rad from a fresh scene. The scene clock (`data.time`) keeps running through a reset, so a controller that needs a bit-for-bit repeat should time its episode from its own step count.
+- The machine model sets MuJoCo's solver tolerance to 1e-14. One constraint solve covers every machine in a scene, so a solver that stops early lets one machine's motion leak into another's. With one drawn machine driven by random valve commands for 20 s beside a drawn neighbour, compared with the same run with the neighbour still, the first machine's joints moved by up to 1.9e-15 rad at 1e-14 on welded bases and 1.1e-15 rad on released ones (the worst of four pairs). At 1e-12 that was 1.9e-15 and 4.6e-7 rad, at 1e-10 1.9e-7 and 4.0e-6 rad, and at MuJoCo's default of 1e-8 1.1e-5 and 2.3e-4 rad. The tighter tolerance cost no speed beyond the spread between repeated runs. Scores are only comparable when taken in a fixed scene layout or with one machine per scene ([issue 11](../../issues/11)).
+- MuJoCo makes each constraint softer the more easily the bodies move along it, a quantity it computes at the model's reference pose, here the home pose, when a scene is loaded and again whenever the hydraulics layer writes a machine's masses. The softness of the valves, joint limits and track contacts therefore follows the home pose and the drawn masses ([issue 23](../../issues/23)).
 - A large swing step is limited by the swing's force cap as well as by the lag: the swing can accelerate at about 0.7 rad/s² at most.
 - A drawn speed limit above the model's actuator limit is refused. For the arm that rules out more than 1.33 times its nominal speed.
+
+**Throughput.** On an Intel Core i7-1185G7 laptop processor, in one process, with every machine on a welded base and given random valve commands at 10 Hz, a scene of one machine ran 9,400 to 11,000 physics steps per second through the hydraulics layer, about 50 times faster than real time, and a scene of eight machines 3,100 to 5,100 (25,000 to 41,000 machine steps per second), over repeated 20 s runs. MuJoCo's step took about a fifth of the time with one machine and about half with eight; the rest is the hydraulics layer, written in Python.
 
 ### Base controller
 
@@ -64,19 +68,18 @@ A feature is **done** when it runs from a clean checkout and its checks pass.
 |---|---|---|
 | Machine model | A 12 t class excavator with swing, boom, arm and bucket joints. Each joint takes a speed command and has a force limit. The base can be held still or left free to slide and tip | Done |
 | Hydraulics model | Gives each machine its own delay, sluggishness, dead zone, lever-to-speed curve, flow limit, speed and force limits, slack in the joints, weights, and sensor noise and latency | Done |
-| Soil | A grid of ground heights that the bucket cuts, fills from and dumps onto, with a digging force that depends on the soil | Done |
-| Dig planner | Turns a trench into repeated cycles: cut, drag, curl, lift, swing, dump | Planned |
-| Machine, hydraulics and soil together | One call steps a scene of any number of machines, each with or without soil, through both layers | Done |
-| Baseline controller | A conventional controller tuned once on the standard machine | Done: follows free-air paths and digs a scripted cycle ([results](#a-dig-cycle-with-the-base-controller)); it is not tuned for soil |
-| Learned controller | One network that follows the planner's paths on any machine drawn | Planned |
+| Baseline controller | A conventional controller tuned once on the standard machine | Done: follows paths in free air |
+| Rough ground | Slopes, steps and edges of rigid ground. The machine can slide, rock and tip, and the arm and bucket meet the ground | Planned |
+| Carried load | A load with real mass on the bucket | Planned |
+| Cylinder forces | Joint force limits from the hydraulic cylinders' sizes and positions | Planned |
+| Learned controller | One network that moves a load and props the machine on its bucket without tipping, on any machine drawn | Planned |
 | Training | One command that trains the controller in stages of rising difficulty | Planned |
 | Evaluation | Scores a controller on machines it never saw in training | Planned |
-| Language to task | A GPT model fills a task specification from a plain-English instruction | Done |
+| Language to task | A GPT model fills a task specification from a plain-English instruction | Done for trench tasks; being changed to load handling |
 | Plan checks | Refuses a specification that is malformed, out of reach or against trench safety rules, and asks a person to confirm | Done |
 | Demo screen | The plan, the drawn machine's card, both controllers side by side and the results chart | Planned |
-| Balance on rough ground | The machine can slide and tip, and the controller learns to dig without unsettling it | Planned, after the first working demo |
 
-Not planned: other makes, sizes or arm geometries; soil simulated as grains; buried obstacles.
+Not planned: digging and soil; other makes, sizes or arm geometries.
 
 ## Try it
 
@@ -85,143 +88,16 @@ Python 3.12 or newer.
 ```
 pip install -e .
 python -m hma.machine.demo
-python -m hma.soil.demo
-python -m hma.sim.dig --pairs 0 --view
 python -m hma.task "dig 1 m down at the far marker"
 ```
 
-The first command opens a viewer and moves the arm through its range. The second runs one scripted dig cycle (lower, drag, curl, lift, swing, dump) in nominal soil, driving the joints directly. The third runs the same kind of cycle with the base controller through the hydraulics layer and shows it in one viewer window; without `--view` it runs headless. The fourth asks a GPT model for a plan and checks it. It calls the [Codex CLI](https://github.com/openai/codex), which must be installed and signed in with your own ChatGPT account; this repo holds no API key.
-
-## Soil
-
-Each machine has its own ground: the model's height field, with 10 cm cells, rewritten once per control step.
-
-- **Cutting.** Two sites mark the ends of the bucket's cutting edge, taken from the bucket mesh. Between two physics steps the edge sweeps a four-sided patch, and every cell whose centre lies inside is lowered to the edge's height there, so a fast edge cannot skip cells. An edge sliding along its own length or moving straight down sweeps no area and removes nothing. An edge end that moves faster than 10 m/s between two physics steps, as after a reset or a pose set by hand, cuts nothing that step and starts again from where it is. A bucket placed below ground before a reset cuts nothing until it moves, but the soil holds it from the start.
-- **Bucket.** Soil enters the bucket only while the edge moves towards the bucket's opening, up to the 0.45 m³ heaped capacity of the standard bucket ([Hitachi ZX120 specification sheet KA-EN200ID](https://machineryline.kr/img/pdf/7/3/1688885834710464825/KA-EN200ID_ZX120.pdf)). Soil cut by the back of the bucket, or when it is full, is left ahead of the edge as loose spoil.
-- **Dumping.** With the edge out of the ground, the bucket pours once its lip points more than 45° below horizontal. The rate grows with the tilt past that angle, up to a full bucket in 0.5 s with the lip straight down. The lip passes 45° at a pitch of about 1.48 rad in `inverse_kinematics`, when the opening faces about 5° below horizontal, and points straight down at about 0.75 rad, opening 47° down. The demo's dump pose (0.9 rad) empties a full bucket in about 0.7 s. A lip that turns through the dump angle at the bucket joint's full 1.2 rad/s is at most 0.006 rad past it after one 5 ms physics step, which by this rule sheds about 0.008% of a full bucket in that step. A bucket turned upside down with its edge still in the ground keeps its load: with the edge 5 cm deep and the lip straight down, a full bucket holds all 0.45 m³ for 2 s.
-- **Where soil lands.** Spills and dumps spread over the area under the edge, at least 0.3 m in each direction. They never land on the ground under the tracks: that share goes to the rest of the same area, or to the nearest cells outside the tracks if the whole area is under them.
-- **Settling.** Only loose spoil slides, and only towards neighbours steeper than the soil's friction angle. Cut walls stand, and spoil does not slide under the tracks.
-- **Volume.** Ground, bucket and `lost_volume` always add up to the starting volume. `lost_volume` counts soil that leaves the grid and soil that would pile above the ground's top, 2 m above the starting surface.
-- **Price of a cut.** The resistance is the fundamental earthmoving equation as written in [arXiv:2505.19330](https://arxiv.org/abs/2505.19330), Section 1.2, plus the tooth penetration term of [Egli et al. 2022](https://doi.org/10.1109/LRA.2022.3189834). Its inputs are the cut depth along the edge, the rake of the bucket's lip against the horizontal, and the soil in the bucket as surcharge. The failure angle is the one that minimises the weight factor N<sub>γ</sub> at the current rake (same section, Eq. 16), but never less than the passive angle π/4 − φ/2, read from a table built once per soil. The equation is singular as the rake nears π − φ − δ − β (same paper); past a rake limit 0.1 rad short of that, the factors stay at their value at the limit. The force is capped smoothly at 175 kN.
-- **Spoil.** Cohesion, adhesion and penetration act only on the part of the cut below the loose spoil. Spoil adds its weight and surcharge but no cohesion, so recutting a heap costs far less than cutting the bank: in the stiffest soil a 0.25 m drag meets 134 kN in undisturbed ground and about 2 kN in spoil. The split is taken at each point along the edge, and the deepest ground and the deepest undisturbed ground are found separately, so the force changes smoothly where spoil meets undisturbed ground and as a heap rises past the edge.
-- **How the force acts.** Three MuJoCo friction-loss tendons run from the bucket tip along axes set by the bucket's pose alone: h, horizontal and across the edge; s, horizontal and along the edge; v, vertical. Before every physics step each axis gets its own limit from the pose and the ground, never from the motion or the command:
-  - h: the full separation term plus the penetration term times the horizontal part of the lip, for the deepest ground one cell ahead of, one cell behind and at each point of the edge. The rake is measured from a horizontal direction fixed to the edge, so it changes continuously as the bucket curls past an upright opening.
-  - s: the same, for the deepest ground at each point of the edge and one cell beyond each end. On level ground a sideways sweep costs the same as cutting forward at that depth, and a ridge narrower than the edge still resists it. A buried edge cannot be swung sideways by the swing joint: about 4.6 m from the swing axis, the swing's 34 kN·m force cap pushes the edge sideways with about 7 kN, against an s limit of 48 kN for a cut 0.3 m deep in the nominal soil.
-  - v: the penetration term alone, for the undisturbed ground at the points of the edge, capped smoothly at 12 kN. It is zero in spoil. The cap sits below the smallest upward force the tip can exert while holding a full bucket (9.9 kN of soil) anywhere in the digging envelope, with every joint limited to 0.85 of its nominal force, the lowest the hydraulics model draws. That force was found statically, as the largest upward tip force the boom, arm and bucket joints can each add to gravity within their limits, over 13,651 poses with the tip 3.5 to 9 m from the swing axis and from 1.5 m below to 0.3 m above the ground. Its minimum is 15.4 kN, at full reach, so the cap has a 22% margin.
-
-  All three are zero when no ground around the edge is above it. Friction only resists, so the soil never pushes, and stiff soil stalls the arm against its joint force limits. The machine model sets MuJoCo's solver tolerance to 1e-14. One constraint solve covers every machine in a scene, so a solver that stops early lets one machine's motion leak into another's. With one machine running the demo cycle in each of 16 drawn soils beside a neighbour driven by random joint speed commands, compared with the same run with the neighbour still, the demo machine's joints moved by up to about 2e-12 rad at 1e-14 (the worst over two such setups, one with the neighbour in drawn soils and one in the nominal soil), by up to 2.5e-7 rad at 1e-12, and by up to 1.7e-5 rad at 1e-10. While a bucket cuts or stalls the solver stops after at most 10 of its 100 iterations, so the tolerance is what bounds this leak. The tighter tolerance cost no measurable speed in `hma.sim.bench`. Scores are only comparable when taken in a fixed scene layout or with one machine per scene ([issue 11](../../issues/11)). At the default tolerance the solver can stop after one iteration where the edge starts or stops slipping.
-
-  MuJoCo makes each constraint softer the more easily the bodies move along it, a quantity it computes once at the model's reference pose, here the home pose. For the three soil axes `hma.machine.set_soil_softness` replaces that quantity with constants, one per axis, so the soil's softness does not depend on the home pose or change with a reset: 8.40e-3, 9.24e-4 and 5.20e-3 for h, s and v. They are the nominal machine's values with the edge 0.25 m deep, 6 m from the swing axis, at a bucket pitch of 1.9 rad, applied when a scene is loaded and again whenever the hydraulics layer recomputes the model's constants. At other poses and for drawn machines the true values differ. The valves' and the contacts' softness still follows the home pose ([issue 23](../../issues/23)).
-
-  `Soil.edge_force(data)` gives the force the soil put on the edge in the physics step just taken. After `mj_step`, MuJoCo's constraint forces belong to the step from the previous pose, while `hma.sim.step` and `hma.soil.step` bring positions up to the new pose, so the soil prices the pose the last physics step left.
-- **Stick and slip.** Each axis is Coulomb friction: when the edge stops slipping along an axis, the force on that axis falls from its limit to what holds the bucket still, and it returns to the limit when the edge slips again. When the edge reverses along an axis, the force goes from the limit one way to the limit the other. An axis force can therefore change by up to twice its limit between two physics steps while the limit itself stays put. How large the steps are depends on the motion:
-  - A drag at 0.3 m/s, 0.1 or 0.2 m deep, with up to 3 cm of sideways wobble: once moving, at most 3.4 kN per step in the nominal soil and 7.7 kN in the stiffest, where the vertical axis switches at its cap. Starting that drag from rest with the edge 0.19 m deep, the h force jumps in one step from about 4 kN to its limit: by 26 kN to 30 kN in the nominal soil, and by 99 kN to 103 kN, most of its 109 kN limit, in the stiffest.
-  - Releasing an arm stalled in the stiffest soil 0.25 m deep after pushing for 3 s at its full speed command of 0.8 rad/s: 10 kN in one step.
-  - Holding the boom fully down for 16 s, from five start poses in three soils (no cohesion, nominal, stiffest): 14 to 36 kN.
-  - Random commands on every joint at 10 Hz in the nominal soil (16 runs of 30 s): steps above 30 kN in every run, the largest 294 kN, an h-axis reversal with the bucket 1.9 m deep. These come while the bucket plunges at up to 5 m/s or bounces at the bottom of a plunge, or when a coasting swing stops against the soil.
-  - The limit itself can rise within one step as the edge enters the ground. In the same random runs it rose by more than 10 kN in a step ten times, at tip speeds of 2.3 to 5.1 m/s, and by 45 kN once, when the edge struck the surface at 5.1 m/s and went 0.27 m deep in one step.
-
-  A controller that follows a path at digging speeds meets the first two. The others need a full-speed plunge or a swing coasting to a stop in the ground.
-- **Against the published forces.** A 0.3 m drag through the nominal soil meets about 48 kN on the h axis with an empty bucket and about 56 kN with a full one, and the demo's drag a median of 52 kN. These are below the arm crowd force of 63 kN (SAE) to 65 kN (ISO), and the bucket digging force of 86 kN (SAE) to 99 kN (ISO), on the specification sheet. The stiffest soil, at about 149 kN, stalls the arm.
-- **Weight.** Soil in the bucket weighs on it as a downward force at the bucket's centre of mass.
-- **Soil parameters.** `hma.soil.sample_soil(seed)` draws the six soil parameters of Egli et al. 2022, Table I; `NOMINAL` is the middle of each range.
-- **State.** A `Soil` follows one MuJoCo `MjData` at a time. To reset, reset the simulation state first, then call `soil.reset(model, data)`; with the hydraulics layer, use `hma.sim.reset` ([below](#machine-hydraulics-and-soil-together)). With a released base, the protected ground under the tracks and the collision heights follow the machine once per control period, not every physics step.
-
-Limits:
-
-- Quasi-static. The force has no rate term, and soil in the bucket adds weight but no mass.
-- 2.5D. There is one height per cell, so no overhangs or tunnels.
-- No flow inside the bucket. Its contents are a single volume.
-- No wall collapse. Cut walls stand at any slope; real trench walls can fail.
-- Only the cutting edge meets the soil. The back and sides of the bucket and the arm pass through the ground without force.
-- Analytic digging models of this kind match measured forces to about 20% at best ([Egli, Terenzi and Hutter 2024](https://www.research-collection.ethz.ch/server/api/core/bitstreams/c8a1f541-96da-47ac-82bd-950de01a40ad/content), citing Cannon and Singh 1999 and Luengo et al. 1998). Nothing here is fitted to measurements.
-- The adhesion factor N<sub>ca</sub> is kept at zero or above, which the source does not do. Its negative values at small rakes would make the force negative, so the edge would cut for nothing. For a 0.3 m cut that happens at some rake for 69 of 1000 sampled soils with the penetration term, and for 334 without it; at some depth between 2 cm and 0.5 m, for 97 with it and 528 without. The floor acts below a rake of 0.37 rad in the nominal soil, the rake the demo cuts at, and below up to 0.63 rad in the least frictional soils.
-- These values are assumptions, not taken from a source: the 2 cm edge thickness in the penetration term, the 45° dump angle, the 0.5 s pour time, the 0.3 m smallest spill area, the 175 kN force cap, the 12 kN cap on the vertical axis, treating loose spoil as cohesionless, and a repose angle equal to the friction angle. The force and the cut both use the 0.61 m edge of the bucket mesh, against 0.85 m for the bucket on the specification sheet, so the standard bucket would cut and resist about 40% more per pass.
-- The ground ahead of the edge is priced as flat. The source's factors include the slope of the ground surface; here it is always zero, also on spoil heaps and beside trench walls. At a friction angle of 0.55 rad and a failure angle of 0.614 rad, ground falling away at 0.5 rad would bring the weight factor down to 0.67 of its flat value, so cuts into a falling slope are overpriced and cuts into a rising one underpriced.
-- Soil in the bucket presses on the cut as surcharge in proportion to how much of the edge is at least 5 cm deep, rising linearly from nothing at the surface. The ramp is an assumption that keeps the force continuous as the edge enters the ground. At a rake of 0.8 rad a full bucket of the nominal soil adds 2.1 kN with the edge 1 cm deep and 10.5 kN from 5 cm down.
-- MuJoCo friction is a soft constraint, so a held edge still creeps: at about 0.15 mm/s resting in soil, 0.08 mm/s of it horizontal. With the arm pushing at its force limit into the stiffest soil 0.25 m deep, the edge creeps forward at about 3.4 mm/s with the h force at 82 kN, about 58% of its 142 kN limit, and sinks at about 8.5 mm/s with the v axis at its cap. Creep cuts, and cheaply: see the stalled drag under [Machine, hydraulics and soil together](#machine-hydraulics-and-soil-together).
-- Each joint's speed control is soft at small speeds, so a slow edge never loads its joints fully. Pushing into the stiffest soil 0.25 m deep, an arm speed command of 0.002 rad/s moves the edge forward at about 1.4 mm/s and loads the arm to 41% of its force limit, and one of 0.004 rad/s moves it forward at about 2.6 mm/s and loads it to 77%; the soil gives way at those loads. These are horizontal speeds; the edge also sinks, at about 2.2 times that.
-- The force is set by the pose, not the motion, which costs fidelity in these ways. The numbers are for the nominal soil unless stated.
-  - Each axis resists equally both ways, so backing away from a cut face costs about as much as cutting forward until the edge is a cell clear of it. Backing 5 to 20 cm away from faces priced at 51 and 59 kN, 6.6 m from the swing axis, took between 0.54 and 0.86 times the work of cutting forward that far.
-  - Moving the back of the bucket first is priced as if the lip led. There is no back-of-blade rake.
-  - Diagonal motion pays each axis it moves along, so the total force can reach the root of the sum of the squared limits. Over the demo cycle and over 30 random soils it reaches 1.42 times the h limit, counting every step where the h limit is above 1 kN.
-  - The soil holds a bucket at rest up to the limits on all axes, but vertically only up to the 12 kN cap, so it does not stop a plunge. With the boom held fully down from the demo's start pose, the edge is 3.5, 2.7 and 2.8 m deep after 1.5 s, and 3.6, 2.8 and 2.9 m after 5 s, in a soil with no cohesion or penetration resistance, the nominal soil and the stiffest. From a pitch of 1.0 rad at (6, 0, 0.3) it is 3.8 to 4.1 m deep after 1.5 s. A plunge cuts nothing: the bucket passes through the ground and back out and leaves it as it was. Lifting out pays the vertical cap, plus the h limit wherever the lift moves the edge horizontally. With the edge placed 0.5 m deep in uncut ground and the joints driven at three times their error from `inverse_kinematics` at a pitch of 1.9 rad, towards a target rising at 0.3 m/s, the edge leaves the ground in 1.9 s for about 5 kJ in the nominal soil and 5.7 kJ in the stiffest, with axis forces of up to 25 kN. From a trench already cut, the vertical limit is zero and lifting out costs nothing.
-  - A deep bucket needs the right escape. After 1.5 to 5 s of full boom-down, raising the boom alone or pushing the arm out alone leaves the bucket in the ground after 15 s in all 30 random soils; raising the boom while curling frees it in all 30, in about 1.1 s in the nominal soil. With the edge placed 0.5 m deep at 6.0 m reach and the bucket at pitch 1.9 rad, then 3 s of the arm crowding in at 0.8 rad/s, pushing the arm out alone at 0.8 rad/s leaves the bucket in the ground after 15 s, meaning at least one of the three soil force limits is still above zero, in 22 of 30 soils; every other escape frees it. From drags 0.2 and 0.4 m deep, every escape frees it except pushing the arm out at 0.4 m in one soil.
-  - Raising the boom eases the vertical hold, which lets a bucket pull harder horizontally. In the stiffest soil with the arm crowding in, the steady pull is about 82 kN, and raising the boom slowly adds up to 12 kN; faster lifts the bucket out.
-  - In 7 of 30 random soils (`sample_soil` seeds 2, 4, 7, 9, 13, 14 and 21) the demo's drag runs to its 15 s timeout, where the h limit peaks at 76 to 105 kN, against at most 70 kN in the soils that finish. No curl, lift or swing phase times out, and all 30 complete a dump. While the soil holds the edge, a phase does not wait for the swing to reach its target, since the swing cannot move a buried edge sideways (above); without that rule, the drag and curl timed out in the nominal soil and 29 of the 30, with the swing held 0.0103 rad from its target, just outside the demo's 0.01 rad tolerance.
-- A cell is lowered when the edge passes its centre, not by the area the edge sweeps over it, and this can be exploited repeatably. Plunging the edge onto a row of cell centres and nudging it 1 cm along its travel cuts the whole row. Repeated row by row, that moves 5.7, 4.2 and 2.6 times as much soil per kilojoule as a drag at 3, 5 and 10 cm deep in the nominal soil, and 5.6, 4.7 and 4.2 times in the stiffest. Each crossing takes one row of cells, about 15 litres at 0.25 m deep and 60 litres at 1 m. A reward must not pay for volume cut until cutting follows the area swept ([issue 20](../../issues/20)).
-- Ground under the tracks is never cut. That does not fix [issue 6](../../issues/6): a trench edge just outside the tracks still gives too low a tipping load on a free base.
-- Where the bucket swings past the back of the ground grid below grade, the force switches on in one step as the edge crosses the border: from 0 to 38 kN with the edge 0.23 m deep at a tip speed of 3.0 m/s in the nominal soil, with the bucket entering from behind and the arm commanded at its full 0.8 rad/s ([issue 21](../../issues/21)). The side borders are unchecked.
-- What a score against this soil shows. Soils drawn by `sample_soil` differ in six parameters of one synthetic model. A controller scored on seeds it was not trained on has shown that it copes with parameter values of this model that it has not met. It has not shown that it can dig real ground: neither the comparison with published digging forces nor holding out seeds checks the model against measured soil. Two of the limits above also decide which runs can be scored at all, because below uncut ground the soil neither stops the bucket nor is cut by it, and at the grid border the force is wrong:
-  - A reference path is admissible only if both ends of the cutting edge stay inside the ground grid while below grade, and the edge is never deeper below ground that earlier passes have left uncut than the depth of the pass it belongs to.
-  - A run fails, whatever its tracking error, if the edge goes more than 0.2 m deeper below uncut ground than its reference asks at that moment, or leaves the grid below grade. The 0.2 m is an assumed threshold.
-
-  `Soil.uncut_depth(data)` gives how far the deepest point of a machine's cutting edge is below the ground earlier passes left uncut (0 above it), and `Soil.edge_inside(data)` whether both ends of the edge are inside that machine's grid.
-
-## Machine, hydraulics and soil together
-
-`hma.sim.step(layer, soils, commands)` advances a scene by one control period. `layer` is the scene's one `Hydraulics` layer, covering every machine; `soils` holds a `Soil` for each machine that has ground to dig, so a machine without one is simply left out. The call takes the valve commands (one row per machine), then repeats for each physics step:
-
-1. every soil sets its three axis limits and the weight in its bucket from the pose at the start of the step;
-2. the hydraulics layer turns the commands into joint speeds, steps the physics and reads its sensors;
-3. positions are brought up to the pose the step reached (`mujoco.mj_kinematics`), so the next step's soil, and any caller of `Soil.uncut_depth` or `Soil.edge_inside` after `step`, sees the pose `qpos` describes.
-
-After the last physics step each soil lets its spoil settle and rewrites its height field. The soil goes first because its limits and weight are inputs to the step, like the joint speeds, and the hydraulics layer reads its load signal from the solve of that same step, so the load includes the soil's force. Bringing positions up to date costs about 5% of throughput with one machine and nothing measurable with eight. The load counts the valve's force only: `hma.machine.tendon_friction` picks friction-loss rows by constraint type and tendon id on every call, because the soil's rows come and go as the edge enters and leaves the ground.
-
-`hma.sim.reset(layer, soils, index, machine, pose=None, heights=None)` resets one machine: its soil, then the hydraulics layer, which sets the pose, then the soil again. The hydraulics layer takes its first sensor reading at reset, and soil limits left over from the last episode would carry part of the arm's weight in that reading. The soil in turn records the edge position and the ground under the tracks at reset, so it needs the new pose. Either single order changes the next episode; reset in this order, an episode repeats a fresh scene bit for bit. Resetting one machine leaves a neighbour that keeps cutting as it was: in the tested pair the neighbour's joints, ground heights and bucket moved by at most 2.2e-16, and with the reset machine also cutting, the reset machine repeated a fresh scene to 1.1e-15 rad.
-
-Tests in `tests/test_sim.py` check that a machine's load readings stay right, to 1e-6 of full scale, while its neighbour in the scene cuts; that resetting one machine leaves a cutting neighbour within 1e-12; that same seeds and commands repeat bit for bit; that the soil prices the edge where the last physics step left it, from the first step below grade; that one step settles spoil and writes the height field; that the soil axes keep their fixed softness through resets, drawn machines and another home pose; that a dig and dump through the hydraulics layer conserves volume; that a full command into the stiffest soil stalls at full-scale load under the pump power limit, with the regulator settling without chatter; and that a drag with the slowest valves drawn (0.6 s delay, 0.4 s lag) leaves the edge still through the delay, then does the work the soil's limits ask for over the distance moved, to within 1%.
-
-The soil never does more work than its limits price, but it can do much less. In the tested drag it does 0.09% less, because the soft friction constraint lets the edge slip at just under its limit. A stalled bucket creeps and cuts for about half the priced work: in the stiffest soil 0.3 m deep, with a full arm command for 20 s, the edge crept 67 mm at about 3.4 mm/s with the h force at half its limit, did 5.3 kJ of work on that axis against 10.8 kJ priced, and cut 12 litres. A reward that pays per unit of energy would favour pushing a stalled bucket ([issue 24](../../issues/24)).
-
-**Throughput.** Measured with `python -m hma.sim.bench` on an Intel Core i7-1185G7 laptop processor, in one process, with every machine dragging its bucket through the soil on every control step:
-
-| Scene | Scene steps/s | Machine steps/s | Physics | Hydraulics and loop | Soil |
-|---|---|---|---|---|---|
-| 1 welded machine | 2,010 | 2,010 | 6% | 21% | 73% |
-| 8 machines | 394 | 3,150 | 6% | 6% | 88% |
-
-Repeated runs vary by about 5%. A physics step is 5 ms, so one machine runs about 10 times faster than real time. The soil's cutting and pricing, written in Python, take most of the time.
-
-**Drag start.** Starting a drag from rest, the soil's horizontal force rises by most or all of its limit in one physics step, and the load reading follows in the same step. With the nominal machine's bucket 0.2 m deep, 6.6 m from the swing axis, and a full arm command, the arm reading jumped by 0.31 of full scale in one step in the nominal soil, and by 0.64 in the stiffest, where it reached full scale the next step. At 6.0 m the jumps were 0.39 and 1.0. In the nominal soil the arm dragged the bucket 0.61 m, cutting 0.19 m³ (0.12 m³ of it into the bucket), and stalled as its arc carried the edge down to 0.83 m deep; in the stiffest it stalled at once and crept 0.12 m in 30 s. The pump power regulator did not react in the step of the jump, because the valve was still opening and power demand is the force times the commanded speed. It engaged 0.045 to 0.17 s later as the valve opened, and settled without chatter at a ratio of 0.38, with the valve holding the speed the power allows at full force.
-
-### A dig cycle with the base controller
-
-```
-python -m hma.sim.dig            # nominal pair, then 30 drawn pairs
-python -m hma.sim.dig --free     # also one nominal cycle on a released base
-python -m hma.sim.dig --view     # watch the nominal cycle in one viewer window
-```
-
-`BaseController` follows a bucket-tip path through the hydraulics layer into the soil. From the home pose the path moves the tip over the trench at 6.6 m from the swing axis (5 s), lowers it 0.3 m below grade (3 s), drags it to 4.6 m (8 s), curls (3 s), lifts it to 1.5 m (3 s), swings 1.2 rad (4 s), dumps (6 s) and holds (3 s). The path is admissible by the rule above. The command runs the nominal machine on the nominal soil, then machine and soil seeds 0 to 29 (`draw_machine(seed)`, `sample_soil(seed)`), all on a welded base.
-
-| | Nominal | 30 drawn pairs |
-|---|---|---|
-| Soil out of the trench | 0.346 m³ | median 0.208 m³ |
-| Soil cut outside the trench | 0 | 0 in 28; 0.048 and 0.059 m³ in seeds 12 and 16 |
-| Soil in the pile | 0.346 m³ | median 0.173 m³ |
-| Tip error over the cycle, mean / largest | 1.4 / 4.2 cm | median 69.5 / 162 cm |
-| Stalled | no | 9 |
-| 0.01 m³ or more still in the bucket at the end | no | 2 |
-| Half or less of the soil out reached the pile | no | 4 |
-| Broke the scoring rule | no | 15 |
-| Volume error (ground, bucket and lost) | 3e-16 m³ | at most 1e-15 m³ |
-
-The counts are computed as follows. Soil out of the trench is the ground lowered inside the trench region; soil cut outside it is the ground lowered anywhere else. The pile is the net change in ground volume within 1.5 m of the dump point, and a run counts as missing it when the pile holds half or less of the soil out of the trench. The tip error is the distance between the bucket tip in the world frame and the path, so on a released base it includes base motion; even on a welded base the soft weld lets the base sag about 0.5 mm and tilt, which puts a few millimetres into it. A run stalled if some joint at least 0.02 rad from its stops held at least 0.99 of its full-scale load while moving slower than 0.01 rad/s for 10 consecutive control steps (1 s). A run broke the scoring rule if, after any control step, the deepest point of the edge was more than 0.2 m deeper below uncut ground than the path asked for at that moment (zero while the path is above ground), or the edge was below grade with an end outside the grid.
-
-The nominal cycle leaves a trench 0.31 m deep and a heap 0.41 m high. What goes wrong in the drawn pairs:
-
-- **Too deep (15).** Every cycle that broke the rule did so by depth, 0.23 to 0.42 m deeper than its path asked at that moment; none left the grid. No cycle that kept to the rule went more than 0.16 m too deep. Because the rule follows the path in time, an edge that runs ahead of the path while it lowers counts as well as one that overshoots the pass.
-- **Stalls (9).** All in soils with a cohesion above 65 kPa or a friction angle of at least 0.6 rad. The arm reaches its force limit in the drag or curl (the boom in one cycle), and the controller, which has no notion of force, keeps following the path. These cycles carry 0.05 to 0.23 m³.
-- **Missed pile and soil left in the bucket.** With no integral term, dead zones stop the swing up to 1.7 m from the dump point, so soil lands outside the pile circle (seeds 0, 12, 18 and 21). In seed 12 the bucket's dead zone also stopped its pitch at 1.41 to 1.46 rad, just past the 1.48 rad where pouring starts, so it poured slowly and 0.26 m³ stayed in the bucket; seed 21 kept 0.05 m³.
-- **Tip error.** The large median errors come from the dead zones and the missing integral term, as under [Base controller](#base-controller), more than from the soil.
-
-On a released base the nominal cycle moved 0.345 m³ into the pile, with a tip error of 1.4 cm mean and 4.0 cm largest, and the base moved 6 mm. That run says little about digging on a free base. It loads the scene with the base already released; a run that switches the weld off at run time keeps the track contacts on for good, and steps several times slower ([issue 5](../../issues/5)). Its trench lies well clear of the tracks, so it does not meet the tipping load that is too low where a track overhangs a trench edge ([issue 6](../../issues/6)). And the soil leaves out what [issue 18](../../issues/18) lists, among them that the protected ground under the tracks follows the base only once per control period, and that digging with a released base is otherwise untested.
+The first command opens a viewer and moves the arm through its range. The second asks a GPT model for a trench plan, the task type of the language step until it is changed, and checks it. It calls the [Codex CLI](https://github.com/openai/codex), which must be installed and signed in with your own ChatGPT account; this repo holds no API key.
 
 ## Limits
 
 - Simulation only. Nothing here has been checked against a real excavator.
-- The soil is a height grid and a force formula, not grains.
+- Only the tracks touch the ground. The arm and bucket pass through it without force.
+- The tracks meet the ground at separate contact points, not a continuous surface, so a track end that overhangs a drop tips the machine at too low a load ([issue 6](../../issues/6)).
 - Calibrating the controller to a specific real machine is future work.
 
 ## Licence
