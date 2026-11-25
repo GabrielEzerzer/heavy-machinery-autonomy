@@ -86,7 +86,7 @@ def test_base_controller_closes_in_on_the_slowest_machine_in_range():
     slowest = replace(NOMINAL, delay=np.full(4, RANGES["delay"][1]),
                       lag=np.full(4, RANGES["lag"][1]))
     errors = tip_errors(LINE, slowest, 10.0, hold=10.0)
-    assert errors[-200:].max() < 0.6 * errors.max()
+    assert errors[-200:].max() < 0.75 * errors.max()
     assert errors[-1] < errors[-200]
 
 

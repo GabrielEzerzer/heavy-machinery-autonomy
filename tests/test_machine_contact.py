@@ -96,6 +96,16 @@ def oil_torque(model, data, name, index=0):
     return float((force * lever)[index, JOINT_NAMES.index(name)])
 
 
+def seal_torque(model, data, name, index=0):
+    layer = held(model, data)
+    _, lever = circuit.geometry(data.qpos[layer._qpos])
+    chambers = layer.chamber_pressures()[index]
+    speed = lever[index] * data.qvel[layer._qvel[index]]
+    joint = JOINT_NAMES.index(name)
+    return float(seal_friction(chambers[1:, 0], chambers[1:, 1], speed[1:])[joint - 1]
+                 * abs(lever[index, joint]))
+
+
 def at_relief(model, data, index=0):
     return held(model, data).pump_pressures()[index].max() > NOMINAL.main_relief
 
@@ -153,7 +163,7 @@ def test_pressed_bucket_ground_reaction_matches_statics_at_the_boom_cap():
     run(model, data, 1.0)
     force, centre = resultant(body_contacts(model, data, "bucket"))
     xp = pivot_x(model, data, "boom")
-    tau = abs(oil_torque(model, data, "boom"))
+    tau = abs(oil_torque(model, data, "boom")) - seal_torque(model, data, "boom")
     assert at_relief(model, data)
     for joint in ("arm", "bucket"):
         assert below_port_relief(model, data, joint)

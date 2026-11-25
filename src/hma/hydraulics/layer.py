@@ -496,9 +496,9 @@ class Hydraulics:
         self._neutral = np.where(self._piloted, 0.0, self._neutral + dt)
         brake = self._base_friction + np.where(self._neutral >= c.BRAKE_DELAY, self._brake, 0.0)
         chambers = pressure[:, c.PUMPS:].reshape(n, JOINTS, 2)
-        seal = np.zeros((n, JOINTS))
-        seal[:, 1:] = seal_friction(chambers[:, 1:, 0], chambers[:, 1:, 1], rod[:, 1:])
-        seal *= np.abs(lever)
+        drag = np.zeros((n, JOINTS))
+        drag[:, 1:] = seal_friction(chambers[:, 1:, 0], chambers[:, 1:, 1], rod[:, 1:])
+        seal = drag * np.abs(lever)
         redo = np.zeros(n, bool)
         redo_held = np.zeros((n, NODES), bool)
         redo_speed = np.zeros((n, JOINTS))
@@ -508,7 +508,7 @@ class Hydraulics:
         for attempt in range(REDO_PASSES + 2):
             ahead = np.where(redo[:, None], redo_speed, lever * (qd + dt * self._accel))
             loose = np.where(redo[:, None], redo_speed, self._rod_speed)
-            motion = (self._gap, rigid, rod, ahead, loose, per_play)
+            motion = (self._gap, rigid, rod, ahead, loose, per_play, drag)
             predicted = self._engage(*self._forces(solved, force_now, scale), *motion)[0]
             predicted = np.where(redo[:, None], redo_speed, predicted)
             rise = solved[..., 0] + (solved[..., 1:] @ predicted[..., None])[..., 0]
@@ -658,13 +658,15 @@ class Hydraulics:
     @staticmethod
     def _engage(held: np.ndarray, coupling: np.ndarray, gap: np.ndarray, rigid: np.ndarray,
                 rod: np.ndarray, ahead: np.ndarray, loose: np.ndarray,
-                per_play: np.ndarray) -> tuple[np.ndarray, ...]:
+                per_play: np.ndarray, drag: np.ndarray) -> tuple[np.ndarray, ...]:
         force_next = held - (coupling @ rod[..., None])[..., 0]
         contact = rigid | ((np.abs(gap) >= PLAY_CLOSED) & (gap * force_next >= 0.0))
         guess = np.where(contact, ahead, loose)
         diag = coupling[:, JOINT_INDEX, JOINT_INDEX]
         others = (coupling @ guess[..., None])[..., 0] - diag * guess
-        free = np.divide(held - others, diag, out=rod.copy(), where=diag != 0.0)
+        net = held - others
+        net = np.sign(net) * np.maximum(np.abs(net) - drag, 0.0)
+        free = np.divide(net, diag, out=rod.copy(), where=diag != 0.0)
         reach = gap + (free - rod) * per_play
         closing = ~contact & (np.abs(reach) >= 1.0)
         contact |= closing
