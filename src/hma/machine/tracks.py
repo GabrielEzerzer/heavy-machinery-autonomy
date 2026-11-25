@@ -79,25 +79,10 @@ def _sample_points() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 STATION_U, RAIL_Y, RAIL_POINTS, SAMPLE_POINTS = _sample_points()
 N_FLAT = 4 * LATERAL * STATIONS
 N_SAMPLED = N_FLAT + 8 * LATERAL * ARC_STATIONS
-
-
-def _preference() -> np.ndarray:
-    rank = np.full((INTERVALS, STATIONS_PER_INTERVAL + 1), -1.0)
-    for k in range(INTERVALS):
-        idx = np.arange(STATIONS_PER_INTERVAL + 1) + k * STATIONS_PER_INTERVAL
-        if k == 0:
-            rank[k] = -idx
-        elif k == INTERVALS - 1:
-            rank[k] = idx
-        else:
-            rank[k] = -np.abs(idx - (k + 0.5) * STATIONS_PER_INTERVAL)
-            rank[k, -1] = -np.inf
-    return rank
-
-
-PREFERENCE = _preference()
 INTERVAL_INDEX = (np.arange(INTERVALS)[:, None] * STATIONS_PER_INTERVAL
                   + np.arange(STATIONS_PER_INTERVAL + 1)[None, :])
+MIDDLE = -np.abs(INTERVAL_INDEX - (np.arange(INTERVALS)[:, None] + 0.5) * STATIONS_PER_INTERVAL)
+MIDDLE[:, -1] = -np.inf
 RAIL_OFFSET = (np.arange(4) * STATIONS).reshape(2, 2, 1)
 
 
@@ -201,7 +186,13 @@ def contacts_at(lay: Layout, machines: np.ndarray, pos: np.ndarray, rot: np.ndar
     flat = (rise[:, :N_FLAT] * rot[:, 2, 2, None]).reshape(m, 2, 2, LATERAL, STATIONS).max(axis=3)
     grouped = flat[..., INTERVAL_INDEX]
     best = grouped.max(axis=-1, keepdims=True)
-    key = np.where(grouped >= best - TIE, PREFERENCE, -np.inf)
+    k = np.arange(INTERVALS)
+    touching = best[..., 0] > 0.0
+    first = np.where(touching, k, INTERVALS).min(axis=-1, keepdims=True)
+    last = np.where(touching, k, -1).max(axis=-1, keepdims=True)
+    front, rear = ((k == last) & (k != first))[..., None], ((k == first) & (k != last))[..., None]
+    preference = np.where(front, INTERVAL_INDEX, np.where(rear, -INTERVAL_INDEX, MIDDLE))
+    key = np.where(grouped >= best - TIE, preference, -np.inf)
     station = INTERVAL_INDEX[np.arange(INTERVALS), key.argmax(axis=-1)]
     flat_depth = np.take_along_axis(flat, station, axis=-1)
     keep = (flat_depth > 0.0) & (flat_depth < IDLER_RADIUS)
@@ -360,7 +351,13 @@ def _store_normals(model, data, found, n0):
 
 
 def step(model: mujoco.MjModel, data: mujoco.MjData, nstep: int = 1) -> None:
-    belts = layout(model).belt_qpos.ravel()
+    lay = layout(model)
+    belts = lay.belt_qpos.ravel()
+    if data.eq_active[lay.weld].all():
+        _normals.pop(data, None)
+        mujoco.mj_step(model, data, nstep)
+        data.qpos[belts] = np.remainder(data.qpos[belts], TRACK_PITCH)
+        return
     for _ in range(nstep):
         mujoco.mj_checkPos(model, data)
         mujoco.mj_checkVel(model, data)
@@ -382,7 +379,7 @@ def step(model: mujoco.MjModel, data: mujoco.MjData, nstep: int = 1) -> None:
         mujoco.mj_step2(model, data)
         data.qfrc_applied[:] = applied
         _store_normals(model, data, found, n0)
-        data.qpos[belts] = np.remainder(data.qpos[belts], TRACK_PITCH)
+    data.qpos[belts] = np.remainder(data.qpos[belts], TRACK_PITCH)
 
 
 def _barycentric(point: np.ndarray, tri: np.ndarray) -> np.ndarray | None:

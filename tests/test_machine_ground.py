@@ -20,6 +20,7 @@ from hma.machine.measure import (
     base_frame,
     bucket_tip,
     chart_pose,
+    hand_tipping_load,
     machine_com,
     released,
     run,
@@ -38,6 +39,21 @@ P = machine_prefix(0)
 def test_bucket_pin_load_tips_the_machine_within_ten_percent_of_hand_statics(name):
     heights, pose, hand = tipping_case(name)
     for factor, tips in ((0.9, False), (1.1, True)):
+        model, data = released(heights, friction=(1.0, 1.0), pose=pose, hold=True)
+        angle = tips_under(model, data, factor * hand)
+        assert (angle > 3.0) if tips else (angle < 0.5), (factor, angle)
+
+
+@pytest.mark.parametrize("lip", [1.2, 1.0])
+def test_track_end_over_a_drop_tips_about_the_edge(lip):
+    xs, _ = ground_axes()
+    heights = np.zeros(ground_shape())
+    heights[:, xs > lip + 1e-9] = -1.0
+    pose = (0.0, 0.0, 1.0, 0.5)
+    model, data = released(heights, friction=(1.0, 1.0), pose=pose, hold=True)
+    origin, rot = base_frame(model, data)
+    hand = hand_tipping_load(model, data, origin + rot @ [lip, 0.0, 0.0], rot[:, 1])
+    for factor, tips in ((0.95, False), (1.05, True)):
         model, data = released(heights, friction=(1.0, 1.0), pose=pose, hold=True)
         angle = tips_under(model, data, factor * hand)
         assert (angle > 3.0) if tips else (angle < 0.5), (factor, angle)

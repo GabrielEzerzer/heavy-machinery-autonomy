@@ -2,7 +2,7 @@
 
 A simulation demo. You type a task in plain English, and a simulated 12-tonne excavator carries it out on rough ground without tipping over. One controller, trained in simulation, handles simulated machines of this type that each behave differently, with no retuning.
 
-**Status: in development.** The machine model and its hydraulics are built, and a conventional controller follows bucket paths through them. The language step runs on its own and still produces trench plans from an earlier direction of the project. Rough ground, a carried load, the planner and the learned controller do not exist yet. An earlier version simulated soil and digging; it was removed and is in the repository's history. The [feature map](#feature-map) lists what is built and what is planned.
+**Status: in development.** The machine model, its hydraulics and its tracks on rough rigid ground are built, and a conventional controller follows bucket paths through them. The language step runs on its own and still produces trench plans from an earlier direction of the project. Contact between the arm or bucket and the ground, a carried load, the planner and the learned controller do not exist yet. An earlier version simulated soil and digging; it was removed and is in the repository's history. The [feature map](#feature-map) lists what is built and what is planned.
 
 ## How it works
 
@@ -51,7 +51,16 @@ Limits of the hydraulics model:
 - A large swing step is limited by the swing's force cap as well as by the lag: the swing can accelerate at about 0.7 rad/s² at most.
 - A drawn speed limit above the model's actuator limit is refused. For the arm that rules out more than 1.33 times its nominal speed.
 
-**Throughput.** On an Intel Core i7-1185G7 laptop processor, in one process, with every machine on a welded base and given random valve commands at 10 Hz, a scene of one machine ran 9,400 to 11,000 physics steps per second through the hydraulics layer, about 50 times faster than real time, and a scene of eight machines 3,100 to 5,100 (25,000 to 41,000 machine steps per second), over repeated 20 s runs. MuJoCo's step took about a fifth of the time with one machine and about half with eight; the rest is the hydraulics layer, written in Python.
+**Throughput.** On an Intel Core i7-1185G7 laptop processor, in one process, each machine got random valve commands at 10 Hz, and random travel commands when travelling. Each figure covers three 20 s runs (`python -m hma.machine.measure throughput`), in physics steps per second through the hydraulics layer:
+
+| Scene | Welded base | Released, standing | Released, travelling |
+|---|---|---|---|
+| 1 machine | 6,500–7,800 | 1,130–1,160 | 900–1,080 |
+| 8 machines | 3,000–3,500 | 380–410 | 370–374 |
+
+In the same session the model before tracks ran welded at 6,300–10,000 steps per second for one machine and 3,600–4,700 for eight. On an earlier day it ran 9,400–11,000 and 3,100–5,100, so the laptop's speed varies from day to day. The belt joints and travel valves cost about a fifth on eight welded machines.
+
+A released machine runs about six times slower than a welded one, because its track contacts are found in Python every step ([issue 28](../../issues/28)). That takes about 0.65 ms per step for one machine, where MuJoCo's own step takes about 15 µs.
 
 ### Cylinders
 
@@ -78,10 +87,10 @@ The old caps overstate pushing the boom down, as in propping the machine, by 1.8
 Comparisons with the spec sheet, from `python -m hma.machine.statics`:
 
 - **Digging forces** ([ISO 6015][iso6015]: the force at the bucket teeth at the position of greatest moment, at relief pressure). Bucket: 105.4 kN·m at the model's 1.230 m tip radius is 85.7 kN, against 86 kN (SAE) and 99 kN (ISO) on the spec sheet; 99 kN would need a radius of 1.064 m. Arm: 237.1 kN·m over 3.680 m from the arm pivot to the tip is 64.4 kN, against 65 kN (ISO) and 63 kN (SAE). The spec sheet does not say what makes its ISO and SAE figures differ.
-- **Lift capacity**, without bucket, 2.52 m arm, at the bucket pin. The chart's ratings are 87% of hydraulic capacity or 75% of tipping load, whichever is less (ISO 10567). Where the chart marks a rating as hydraulically limited, 87% of the model's hydraulic capacity is within −0.1% to +5.1% of it: 3,384 against 3,350 kg (4.5 m high, 4.5 m out), 5,457 against 5,460 (3.0, 3.0), 4,112 against 4,070 (3.0, 4.5), 7,949 against 7,890 (1.5, 3.0), 7,032 against 6,730 (ground, 3.0), 4,868 against 4,630 (−1.5, 1.5), 8,838 against 8,540 (−3.0, 1.5) and 7,613 against 7,340 (−3.0, 3.0). Boom raising limits most points; the arm limits the three close to the machine, with its cylinder at main relief.
-- **Tipping**, for the undercarriage: 75% of the model's tipping load over the front exceeds the chart's tipping-limited ratings by 16 to 23% (for example 5,234 against 4,470 kg at 1.5 m high and 4.5 m out, 3,269 against 2,790 at ground level and 6.0 m), and over the side by 24 to 31%. The tipping lines are the outermost track contact points (x = 1.58 m in front, y = ±1.242 m at the side), and the masses are those in the model, 11,900 kg without the bucket. The two points 1.5 m out lie inside the front tipping line, so no load there tips the machine forward.
+- **Lift capacity**, without bucket, 2.52 m arm, at the bucket pin. The chart's ratings are 87% of hydraulic capacity or 75% of tipping load, whichever is less (ISO 10567). Where the chart marks a rating as hydraulically limited, 87% of the model's hydraulic capacity is within +0.6% to +5.5% of it: 3,425 against 3,350 kg (4.5 m high, 4.5 m out), 5,507 against 5,460 (3.0, 3.0), 4,138 against 4,070 (3.0, 4.5), 7,941 against 7,890 (1.5, 3.0), 7,044 against 6,730 (ground, 3.0), 4,883 against 4,630 (−1.5, 1.5), 8,851 against 8,540 (−3.0, 1.5) and 7,526 against 7,340 (−3.0, 3.0). Boom raising limits most points; the arm limits the three close to the machine, with its cylinder at main relief.
+- **Tipping**, for the undercarriage: 75% of the model's tipping load is within −2.7% to +2.1% of every tipping-limited rating on the chart, over the front and over the side. [Machine on the ground](#machine-on-the-ground) lists each entry. The tipping lines come from the track model: x = ±1.44 m through the idler and sprocket centres, and y = ±1.065 m along the line where the rollers meet the track links ([ISO 10567][iso10567]). The masses are those in the model, 11,600 kg without the bucket. The two points 1.5 m out lie inside the front tipping line, so no load there tips the machine forward.
 
-**Propping.** Pushing the boom down with the bucket on level ground ahead of the tracks lifts the front of the tracks wherever the tip is 2.5 to 8 m ahead of the swing centre, with the boom at main relief and the arm and bucket held at main relief. At the best pose for each reach the joints hold 1.18 times the tip force that lifts the front at 2.5 m (arm-limited), 1.86 times at 3 m (boom-limited), 1.93 times at 3.5 m (arm-limited) and 1.5 to 1.7 times from 4 to 8 m (boom-limited). For example, at 5 m the joints hold 52.6 kN and lifting needs 32.1 kN. Holding the arm and bucket at their overload reliefs instead raises the margin by at most 0.17 close in and leaves it unchanged further out. The old caps gave margins of 2.3 to 3.4 times. Nothing here is simulated: the arm and bucket do not touch the ground in the model yet.
+**Propping.** Pushing the boom down with the bucket on level ground ahead of the tracks lifts the front of the tracks wherever the tip is 2.5 to 8 m ahead of the swing centre, with the boom at main relief and the arm and bucket held at main relief. At the best pose for each reach the joints hold 1.29 times the tip force that lifts the front at 2.5 m (arm-limited), 2.03 times at 3 m (bucket-limited), 2.09 times at 3.5 m (arm-limited) and 1.66 to 1.90 times from 4 to 8 m (boom-limited). For example, at 5 m the joints hold 52.7 kN and lifting needs 29.4 kN. Holding the arm and bucket at their overload reliefs instead raises the margin by at most 0.17 close in and leaves it unchanged from 4 m out. The old caps gave margins of 2.5 to 3.7 times. The lifting force is checked in simulation with an upward force at the bucket tip ([Machine on the ground](#machine-on-the-ground)); the arm and bucket do not touch the ground in the model yet.
 
 Left out, with what each would change:
 
@@ -90,6 +99,153 @@ Left out, with what each would change:
 - **End-of-stroke cushions.** The joint limits stand in for the cylinder end stops, with no cushioning.
 - **Geometry.** The source model's two versions place the boom pivot 11 cm apart; the pins follow the meshes, which sit 1.5 to 4.5 cm from the model's joints. The bucket's H-link length, fitted on its mesh at 0.4656 m, is uncertain by about 5 mm.
 - **Rated pressures only.** Cylinder friction, seal drag and the back pressure of the return oil, which lower the real force, are not modelled.
+
+### Machine on the ground
+
+`hma.machine.mass` builds each body's mass, centre of mass and inertia from its parts. `hma.machine.tracks` stands the machine on two driven tracks and replaces `mujoco.mj_step` with `tracks.step`. `hma.machine.ground` draws rough rigid ground from a seed. `python -m hma.machine.measure tipping` and `python -m hma.machine.measure throughput` print the measurements below.
+
+**Mass.** The model weighs the published operating weight, 12,000 kg, with 500 mm shoes, the 2.52 m arm, a 0.45 m³ bucket and the 2,450 kg counterweight ([spec sheet][zx120]).
+
+| Part | Mass, kg | Source |
+|---|---|---|
+| Counterweight; boom with arm cylinder; arm with bucket cylinder; bucket | 2,450; 1,220; 600; 400 | [ZX120 spec sheet][zx120] |
+| Fuel, 250 L | 205 | Tank size from the [spec sheet][zx120]; diesel at 0.82 kg/L, assumed |
+| Operator | 75 | Assumed, the usual operating-weight convention |
+| Track chains with 500 mm shoes, both sides | 1,540 | [Cat 313 GC spec sheet][cat313], a 13 t machine with the same 1,990 mm gauge and shoe width |
+| Two boom cylinders | 240 | [Cat 313 GC spec sheet][cat313] |
+| Lower frame with rollers; swing frame; rest of the upper structure | 2,089; 989; 2,193 | The remaining 5,270 kg, split in the Cat 313 GC's proportions (2,620, 1,240 and 2,750 kg) |
+
+Hitachi's own figures disagree by 147 kg. Its basic machine (9,500 kg) and front (2,220 kg) leave 280 kg for fuel, oils, coolant and operator. Item by item those come to 427 kg: fuel 205, hydraulic oil 113, engine oil 14, coolant 20 and operator 75, at assumed densities. The model keeps the 12,000 kg total.
+
+Within each body the parts are boxes, rings, rods, points and thin shells at estimated positions:
+
+- the upper structure: engine, pumps, tanks, valve, swing drive, batteries and cab;
+- the lower: travel motors, idlers, seven rollers a side ([spec sheet][zx120]), carrier rollers, side frames and the two track loops;
+- the boom, arm, bucket and covers: shells on their meshes.
+
+The boom cylinder barrels (65/120 of the cylinder mass, assumed) ride on the upper structure and the rods on the boom, between the pins in `cylinders`. The bodies come to:
+
+| Body | Mass, kg |
+|---|---|
+| Lower | 3,629 |
+| Upper | 6,041 |
+| Boom | 1,330 |
+| Arm | 600 |
+| Bucket | 400 |
+
+Only the masses from the spec sheets are sourced. The positions of the other parts are estimates, and the lift chart below is the check on them.
+
+**Track contact.** Each track meets the ground as a belt, not as points fixed to the frame. Every step, the height field is sampled:
+
+- under the bottom of each track, at 121 stations 2.4 cm apart over the 2.88 m tumbler distance ([spec sheet][zx120]);
+- at three points across each half of the 500 mm shoe;
+- around each idler and sprocket, on an arc of radius 0.35 m (estimated from the track height).
+
+Each half of a track is split into eight 0.36 m intervals. Each interval gives one contact at its deepest station. When stations tie within 1 mm, as on flat ground, a middle interval takes its middle station, and the front-most and rear-most touching intervals take their outer stations. Each idler arc gives one more contact, so a machine has at most 40.
+
+An edge or step holds the track at the edge, to within one station. The contacts sit on the line where the rollers meet the track links, 7 cm either side of the track centre (assumed). That line is the side tipping line of [ISO 10567][iso10567]. The ground is rigid: at rest the soft contact sinks the machine by under 0.1 mm over 10 s, and adds no energy.
+
+Friction differs along and across the track:
+
+- **Along: 0.45 nominal.** This is the traction factor for crawler tracks on concrete in Caterpillar's handbook ([handbook][catphb]). It is unverified, because the table could not be read.
+- **Across: 0.50 nominal.** This is just below the 0.55 to 0.58 for steel tracks on hard ground in a tracked-vehicles lecture based on Wong ([lecture][umd]).
+- **Drawn ground:** 0.30 to 0.55 along, and 1.11 times that across (assumed).
+
+MuJoCo's soft friction cone pushes a sliding body away from the surface: a box dragged across a plane reached 2 m/s upward, and counter-rotating tracks hopped. So a contact sliding faster than 5 cm/s is frictionless in MuJoCo's solver. For those contacts `tracks.step` applies Coulomb friction itself, elliptic between along and across, from the previous step's normal force. Slower contacts keep MuJoCo's friction, which gives static grip.
+
+**Drive.** Each track has a belt driven through a travel valve built like the joint valves:
+
+- **Commands:** the `travel_left` and `travel_right` actuators take a belt speed in m/s, up to 5.5 km/h (1.53 m/s).
+- **Force cap:** 51 kN per belt, half the 102 kN maximum traction ([spec sheet][zx120]).
+- **Inertia:** each belt carries half the track chain mass, 770 kg.
+- **Parking brake:** with zero command the valve holds the belt, up to the same 51 kN. The spec sheet gives a spring-set travel brake but no capacity, so the cap is assumed.
+
+A later hydraulics stage can drive the same two actuators and set the cap from travel pressure and motor size. Measured on flat ground at friction 0.45/0.50:
+
+- **Straight**, forward and back: the commanded speed to within 1%.
+- **Counter-rotation** at full speed: 0.88 rad/s, against 1.54 rad/s if neither track slipped. Each track pushes 17.8 to 18.5 kN. Wong's firm-ground turning resistance, μ_t W L / 4 over the 1.99 m gauge ([lecture][umd]), gives 21.3 kN at μ_t = 0.50. Wong puts all the friction across the track; the model splits it along and across.
+- **Pivot turn**, one track braked and the other at full speed: 0.44 rad/s about a centre 1.86 m from the swing axis, outside the braked track. The braked track slides forward at about 0.38 m/s.
+- **Drawbar pull** at friction 1.0: the machine keeps full speed against 90% of 102 kN and slows against 110%.
+- **Gradeability** is set by friction, not traction. The machine slides down a slope steeper than the friction angle along the track: 24.2° at the nominal 0.45, tested at 0.95 and 1.05 times atan 0.45. The spec sheet's 35° would need a friction of 0.70. Drawn slopes stop at 20°.
+- **Parked** at 0.45/0.50, the machine creeps:
+
+| Slope | Creep, m/s |
+|---|---|
+| 10° | 1.3e-5 |
+| 20° | 3.3e-5 |
+| 23° | 3.6e-5 |
+| 25.5° | slides |
+| 15° across | 8e-6 |
+| Flat | 3e-11 |
+
+**Rough ground.** `draw_ground(seed)` draws ground for one machine, on its 13 by 12 m height field of 0.1 m cells:
+
+- a plane tilted up to 20° in any direction;
+- 0 to 2 steps of 5 to 40 cm;
+- 0 to 2 kerbs, 10 to 20 cm high and 0.2 to 0.4 m wide;
+- 0 to 2 ruts, 5 to 15 cm deep and 0.3 to 0.6 m wide;
+- 0 to 6 smooth bumps or dips of up to 15 cm, with radii of 0.3 to 1.5 m;
+- a friction pair.
+
+The ranges are assumed for a 12 t machine on a site; none is sourced. Steps, kerbs and ruts run along the grid with their top edge on a grid line. The edge is therefore exact, and the height field's one-cell bevel falls on the low side.
+
+The same seed gives the same ground. `apply_ground` writes a ground into one machine's height field and friction, and `place` sets a machine down at rest on whatever ground it has.
+
+**Checks against hand statics.** Each check in `tests/test_machine_ground.py` brackets a hand calculation: below it nothing happens, above it the machine tips, slides or lifts. In the tipping checks the joints are held at a friction of 1e9 N·m, so these results do not depend on the joint force limits.
+
+| Load at the bucket pin that tips the machine, with bucket | Hand statics, kg | Simulated, kg | Difference |
+|---|---|---|---|
+| Over the front, flat, 6.0 m out | 3,283 | 3,268 | −0.5% |
+| Over the side, flat, 4.5 m out | 3,280 | 3,285 | +0.2% |
+| Over the front, 10° nose down, 6.0 m out | 2,744 | 2,731 | −0.5% |
+| Over the side, 10° cross slope, 4.5 m out | 2,553 | 2,541 | −0.5% |
+
+The tests also bracket these, against the hand figure:
+
+| Check | Bracket |
+|---|---|
+| Boom press-down force that lifts the front of the tracks | 0.9 and 1.1 |
+| Slope where the machine slides | 0.95 and 1.05 times atan of the friction |
+| Cross slope where the machine tips sideways | 0.95 and 1.05 |
+| Tipping load with the front of the tracks over a 1 m drop, 1.2 m and 1.0 m ahead of the swing axis, tipping about the edge | 0.95 and 1.05 |
+
+They also check that:
+
+- a machine on drawn ground comes to rest;
+- the same commands on the same ground repeat bit for bit;
+- a welded machine gets no track contacts, and releasing it writes nothing into the model.
+
+Against the [spec sheet][zx120]'s lift chart, the table gives 75% of the model's tipping load at every rating the chart marks as limited by tipping. It comes from `python -m hma.machine.statics`: no bucket, load at the bucket pin, kg.
+
+| Height, radius (m) | Front: model / chart | Diff | Side: model / chart | Diff |
+|---|---|---|---|---|
+| 4.5, 6.0 | 3,086 / 3,040 | +1.5% | 2,155 / 2,110 | +2.1% |
+| 3.0, 4.5 | | | 3,247 / 3,200 | +1.5% |
+| 3.0, 6.0 | 3,014 / 2,980 | +1.1% | 2,089 / 2,050 | +1.9% |
+| 1.5, 3.0 | | | 5,322 / 5,380 | −1.1% |
+| 1.5, 4.5 | 4,474 / 4,470 | +0.1% | 2,985 / 2,980 | +0.2% |
+| 1.5, 6.0 | 2,899 / 2,880 | +0.7% | 1,982 / 1,960 | +1.1% |
+| 0.0, 3.0 | | | 4,954 / 5,070 | −2.3% |
+| 0.0, 4.5 | 4,253 / 4,280 | −0.6% | 2,789 / 2,810 | −0.7% |
+| 0.0, 6.0 | 2,799 / 2,790 | +0.3% | 1,891 / 1,880 | +0.6% |
+| −1.5, 3.0 | 8,275 / 8,440 | −2.0% | 4,896 / 5,030 | −2.7% |
+| −1.5, 4.5 | 4,162 / 4,200 | −0.9% | 2,707 / 2,740 | −1.2% |
+| −1.5, 6.0 | 2,759 / 2,760 | 0.0% | 1,853 / 1,850 | +0.2% |
+| −3.0, 3.0 | | | 4,990 / 5,120 | −2.5% |
+| −3.0, 4.5 | 4,199 / 4,240 | −1.0% | 2,741 / 2,780 | −1.4% |
+
+Every entry is within 2.7%. With the earlier mass split and sphere contacts, the model was 16 to 23% above the chart over the front and 24 to 31% over the side. The chart's hydraulically limited ratings, and how hard the boom can press down, do depend on the joint force limits, which are still constant caps.
+
+**Left out**, with what each would change ([issue 29](../../issues/29)):
+
+- **Track side faces.** Only the bottom of each track and its idler arcs touch the ground. A kerb or step face pushes on the idler arc only, so a track driven sideways into a kerb rides over it instead of being stopped.
+- **Rollers, recoil springs and track sag.** The track is rigid between its idlers. On a bump shorter than the track it rests on the high points instead of bending around them between rollers. That puts the load spread on rough ground off; the tipping lines are not affected.
+- **Travel hydraulics.** There is no travel circuit, crossover relief, two-speed shift or engine power limit. The travel force is the 102 kN cap at any speed; the real machine has less at high speed and more pull in low gear.
+- **Rolling resistance.** None is modelled: on flat ground the tracks hold speed with about 0.02 N of drive force.
+- **Brake creep.** The parking brake holds through a soft constraint, so a parked machine creeps by up to 3.6e-5 m/s on a slope, about 13 cm an hour. A spring-set brake holds still.
+- **Other ground contact.** The belly, counterweight, boom, arm and bucket pass through the ground. A machine that rolls past about 85° falls through it.
+- **Contact resolution.** An edge between two stations holds the track at the nearer inboard station, up to 2.4 cm in. With the drop exactly 1.0 m ahead, the tipping load was 3.0% under the hand figure. The height field's 0.1 m cells bevel every drop over one cell.
+- **Speed.** A released machine steps about six times slower than a welded one, because the contacts are found in Python ([issue 28](../../issues/28)).
 
 ### Base controller
 
@@ -105,6 +261,10 @@ Left out, with what each would change:
 [iso6015]: https://www.iso.org/standard/12217.html
 [zx5g]: https://www.hitachicm.com/ae/en/machinery/excavators/medium-excavators/product.zx130-5g
 [zx5b]: https://www.hitachicm.com/us/en/products/excavators/medium-large/product.zx130-5b-la
+[cat313]: https://bandtplanthire.co.uk/wp-content/uploads/2023/07/313GC-TECH.pdf
+[iso10567]: https://cdn.standards.iteh.ai/samples/18652/9506b3e367af44b68c0b902437c1eda8/ISO-10567-1992.pdf
+[catphb]: https://www.ringpower.com/media/2086/caterpillarperfhandbook_ed50.pdf
+[umd]: https://spacecraft.ssl.umd.edu/academics/788XF24/788XF24L10.tracks.pdf
 
 ## Feature map
 
@@ -112,10 +272,10 @@ A feature is **done** when it runs from a clean checkout and its checks pass.
 
 | Feature | What it does | Status |
 |---|---|---|
-| Machine model | A 12 t class excavator with swing, boom, arm and bucket joints. Each joint takes a speed command and has a force limit. The base can be held still or left free to slide and tip | Done |
+| Machine model | A 12 t class excavator with swing, boom, arm and bucket joints. Each joint takes a speed command and has a force limit. The base can be held still, or left free on two driven tracks to travel, turn, slide and tip | Done |
 | Hydraulics model | Gives each machine its own delay, sluggishness, dead zone, lever-to-speed curve, flow limit, speed and force limits, slack in the joints, weights, and sensor noise and latency | Done |
 | Baseline controller | A conventional controller tuned once on the standard machine | Done: follows paths in free air |
-| Rough ground | Slopes, steps and edges of rigid ground. The machine can slide, rock and tip, and the arm and bucket meet the ground | Planned |
+| Rough ground | Slopes, steps and edges of rigid ground. The machine can slide, rock and tip, and the arm and bucket meet the ground | In progress: ground drawn from a seed, and the tracks stand, drive, slide and tip on it, checked against hand statics; the arm and bucket do not touch it yet |
 | Carried load | A load with real mass on the bucket | Planned |
 | Planner | Turns a checked specification into paths for the bucket and the load | Planned |
 | Cylinder forces | Joint force limits from the hydraulic cylinders' sizes and positions | In progress: geometry, sizes and static checks done; the simulation still uses constant caps |
@@ -144,7 +304,8 @@ The first command opens a viewer and moves the arm through its range. The second
 
 - Simulation only. Nothing here has been checked against a real excavator.
 - Only the tracks touch the ground. The arm and bucket pass through it without force.
-- The tracks meet the ground at separate contact points, not a continuous surface, so a track end that overhangs a drop tips the machine at too low a load ([issue 6](../../issues/6)).
+- The track model leaves out side faces, rollers and track sag, travel hydraulics and rolling resistance, and its parking brake creeps ([issue 29](../../issues/29)).
+- A released machine steps about six times slower than a welded one ([issue 28](../../issues/28)).
 - Calibrating the controller to a specific real machine is future work.
 
 ## Licence
