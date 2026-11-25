@@ -29,7 +29,7 @@ WAYPOINTS = np.array([
     HOME_POSE,
 ])
 SPEEDS = np.array([0.6, 0.3, 0.6, 0.8])
-GAIN = 2.0
+GAIN = 1.0
 RAMP = 0.02
 TOLERANCE = 0.01
 CONTROL_PERIOD = 0.1

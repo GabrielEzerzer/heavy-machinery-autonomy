@@ -528,6 +528,27 @@ def test_an_episode_after_a_reset_repeats_a_fresh_layer_bit_for_bit(stray_steps,
     assert np.array_equal(episode(layer, 0, machine, commands), fresh)
 
 
+SCRATCH = {"_valve", "_demand_in", "_nodes", "_edge_flow", "_weights", "_edge_slope", "_capacity",
+           "_noise_draws", "_rhs"}
+
+
+def test_a_reset_leaves_every_state_array_as_a_fresh_layer_has_it():
+    machine = draw_machine(5)
+    commands = np.random.default_rng(4).uniform(-1.0, 1.0, size=(12, 4))
+    fresh, used = layer_for(machine), layer_for(machine)
+    episode(used, 0, machine, commands)
+    used.act(np.ones((1, 4)))
+    for _ in range(round(2.0 / DT)):
+        used.data.qfrc_applied[used._qvel[0]] = -2.0e5
+        used.step()
+    assert np.abs(used._rod_speed).max() > 0.0
+    for layer in (fresh, used):
+        layer.reset(0, machine)
+    for name, value in vars(fresh).items():
+        if isinstance(value, np.ndarray) and name not in SCRATCH:
+            assert np.array_equal(value, getattr(used, name)), name
+
+
 def test_resetting_one_machine_leaves_the_other_machines_noise_alone():
     machines = [draw_machine(5), draw_machine(6)]
     commands = np.random.default_rng(6).uniform(-1.0, 1.0, size=(12, 4))

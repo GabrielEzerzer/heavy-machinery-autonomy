@@ -255,7 +255,13 @@ def test_swing_settles_at_the_motor_speed_turns_three_times_in_the_published_tim
     inertia = swing_inertia(layer)
     start = layer.true_state().positions[0, SWING]
     layer.act(np.zeros((1, 4)))
-    steps(layer, c.BRAKE_DELAY + 1.0)
+    ports = []
+    for _ in range(round((c.BRAKE_DELAY + 1.0) / DT)):
+        layer.step()
+        ports.append(np.sort(layer.chamber_pressures()[0, SWING]))
+    ports = np.array(ports)
+    relieving = ports[ports[:, 1] >= NOMINAL.port_relief[SWING, 0]]
+    assert relieving[len(relieving) // 2:, 0].min() > c.TANK_PRESSURE - 0.01e6
     stop = layer.true_state().positions[0, SWING] - start
     braking = c.SWING_DISPLACEMENT * (NOMINAL.port_relief[SWING, 0] - c.TANK_PRESSURE)
     braking /= c.SWING_MECHANICAL
@@ -531,7 +537,7 @@ def test_energy_closes_with_cavitation_and_outside_forces_once_the_integration_t
     residual = pump - layer.work_energy - layer.lost_energy - (layer.oil_energy() - stored)
     assert opened
     assert np.all(residual > 0.0)
-    assert np.all(np.abs(residual - damping + growth) < 1e-3 * pump)
+    assert np.all(np.abs(residual - damping + growth) < 1e-9 * pump)
     assert np.all(np.abs(layer.work_energy - actuator) < 1e-3 * pump)
 
 
