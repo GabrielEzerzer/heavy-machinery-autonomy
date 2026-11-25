@@ -1,11 +1,12 @@
 import dataclasses
 import json
+import math
 import time
 
 import pytest
 
 from conftest import Everywhere, StandIn, recorded, spec_json, task_json
-from hma.task import Capacity, Hazard, Load, Pose, Zone, run_checks, spec_model, validate
+from hma.task import Hazard, Load, Marker, Pose, Zone, run_checks, spec_model, validate
 from hma.task.checks import (
     check_fields,
     check_path,
@@ -144,7 +145,7 @@ def test_reach_measures_from_where_the_machine_will_stand(scene, arm, body):
 def test_reach_finds_a_prop_point_with_boom_and_arm_at_90_to_110_degrees(scene, arm, body):
     raw = task_json(task_type="prop", hold_s=10)
     result, plan = check_reach(plan_for(scene, raw), scene, arm, body)
-    assert result.passed and plan.prop_xy[1] == 0.0 and 3.0 < plan.prop_xy[0] < scene.reach_m
+    assert result.passed and plan.prop_xy[1] == 0.0 and 3.0 < plan.prop_xy[0] < 8.0
     result, plan = check_reach(plan_for(scene, raw), scene, arm, StandIn(angle=120.0))
     assert not result.passed and "90 to 110 degrees" in result.reason
 
@@ -159,7 +160,8 @@ def test_rated_capacity_from_the_manufacturer_chart(scene, body):
     result = rules(scene, spec_json(load_id="L2"), body)
     assert not result.passed
     assert "4000 kg) is over the rated lift capacity of 1130 kg" in result.reason
-    assert "over-side rating of 1530 kg, less the 400 kg bucket" in result.reason
+    assert "over-side rating of 1530 kg at 7.04 m radius and 1.5 m height" in result.reason
+    assert "less the 400 kg bucket" in result.reason
 
 
 def test_a_stronger_model_never_raises_the_chart_rating(scene):
@@ -179,12 +181,12 @@ def test_rated_capacity_from_the_model_hydraulic_side(scene):
     assert rules(scene, spec_json(), StandIn(tipping=1e6, hydraulic=2000.0)).passed
 
 
-def test_nothing_is_lifted_where_the_chart_gives_no_rating(scene, body):
+def test_nothing_is_lifted_where_the_chart_does_not_rate_every_height(scene, body):
     close = dataclasses.replace(
         scene, loads=scene.loads + (Load("L9", "kerb unit", 300.0, 2.9, -0.5, 0.3),)
     )
     result = rules(close, spec_json(load_id="L9"), body)
-    assert not result.passed and "gives no rated load" in result.reason
+    assert not result.passed and "does not rate every height" in result.reason
 
 
 def test_a_load_of_unknown_mass_is_not_lifted(scene, body):
@@ -204,6 +206,47 @@ def test_lifting_needs_one_surface_under_the_machine(scene, body):
     kerb = with_zone(scene, Zone("T", "kerb", box(-3, -1.5, -3, 3), 0.2, 0.0, 0.0))
     result = rules(kerb, spec_json(), body)
     assert not result.passed and "not one surface" in result.reason
+    tilted_ahead = with_zone(scene, Zone("T", "slope", box(1, 10, -10, 10), 0.0, 0.5, 0.0))
+    result = rules(tilted_ahead, spec_json(), body)
+    assert not result.passed and "more than one slope; lifting" in result.reason
+
+
+def test_the_whole_track_footprint_must_be_level_for_lifting(scene, body):
+    slope_ahead = with_zone(scene, Zone("T", "slope", box(1, 10, -10, 10), 0.0, 20.0, 0.0))
+    result = rules(slope_ahead, spec_json(), body)
+    assert not result.passed and "under the tracks tilts the machine 20.0 degrees" in result.reason
+    clear = with_zone(scene, Zone("T", "slope", box(2, 10, -10, 10), 0.0, 20.0, 0.0))
+    result = rules(clear, spec_json(), body)
+    assert "tracks" not in result.reason
+
+
+def edge_rise(scene, a, b, pieces=40):
+    nx, ny = b[1] - a[1], a[0] - b[0]
+    n = math.hypot(nx, ny)
+    rises = []
+    for k in range(pieces + 1):
+        t = k / pieces
+        m = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+        out = scene.ground((m[0] + nx / n * 1e-4, m[1] + ny / n * 1e-4)).height_m
+        inn = scene.ground((m[0] - nx / n * 1e-4, m[1] - ny / n * 1e-4)).height_m
+        rises.append(abs(out - inn))
+    return max(rises)
+
+
+def test_demo_ground_joins_up_where_the_machine_drives_on(scene):
+    for a, b in (
+        ((-4.0, -2.99), (-4.0, 2.99)),
+        ((-8.0, -2.99), (-8.0, 2.99)),
+        ((8.0, -3.99), (8.0, 3.99)),
+        ((14.0, -3.99), (14.0, 3.99)),
+        ((-3.99, 6.0), (5.99, 6.0)),
+    ):
+        assert edge_rise(scene, a, b) < 0.01, (a, b)
+    assert edge_rise(scene, (14.0, 4.01), (14.0, 4.99)) > 1.0
+    bank = [scene.ground((-4.0 - 0.5 * i, 0.0)).height_m for i in range(1, 9)]
+    assert all(h2 < h1 < 0 for h1, h2 in zip(bank, bank[1:], strict=False))
+    assert scene.ground((-6.0, 0.0)).height_m == pytest.approx(-2 * math.tan(math.radians(35)))
+    assert scene.ground((-10.0, 0.0)).height_m == pytest.approx(bank[-1])
 
 
 def test_travel_slope_along_and_across(scene, body):
@@ -223,6 +266,9 @@ def test_propping_slope_limits(scene, body):
     steep = with_zone(scene, Zone("T", "slope", WIDE, 0.0, 20.0, 0.0))
     result = rules(steep, raw, body)
     assert not result.passed and "limit for propping is 15 degrees" in result.reason
+    part = with_zone(scene, Zone("T", "slope", box(1, 10, -10, 10), 0.0, 5.0, 0.0))
+    result = rules(part, raw, body)
+    assert not result.passed and "more than one slope; propping" in result.reason
 
 
 def test_overhead_keep_out_for_machine_bucket_and_load(scene, body):
@@ -234,6 +280,31 @@ def test_overhead_keep_out_for_machine_bucket_and_load(scene, body):
     over_arm = Hazard("T", "test line", HazardKind.overhead, ((2.0, -0.2), (2.0, -0.6)), 0.5)
     result = rules(with_hazard(scene, over_arm), spec_json(), body)
     assert not result.passed and "test line" in result.reason
+    shadow = Hazard("T", "pole", HazardKind.overhead, ((3.5, -2.1),), 0.5)
+    result = rules(with_hazard(scene, shadow), spec_json(), body)
+    assert not result.passed
+    assert "bucket, arm or load comes within 0.0 m of the pole" in result.reason
+
+
+def test_overhead_keep_out_over_the_propping_arm(scene, body):
+    raw = task_json(task_type="prop", hold_s=10)
+    assert rules(scene, raw, body).passed
+    across = Hazard("T", "test line", HazardKind.overhead, ((4.0, -1.0), (4.0, 1.0)), 0.5)
+    result = rules(with_hazard(scene, across), raw, body)
+    assert not result.passed and "bucket pressing" in result.reason and "test line" in result.reason
+
+
+def test_overhead_keep_out_counts_the_arm_held_ahead_for_travel(scene, body):
+    raw = task_json(task_type="travel", marker_id="M2")
+    plan = plan_for(scene, raw)
+    h = math.radians(plan.stand.heading_deg)
+    front = (6.0 + 9.0 * math.cos(h), 1.5 + 9.0 * math.sin(h))
+    result = rules(with_hazard(scene, Hazard("T", "pole", HazardKind.overhead, (front,), 6.0)),
+                   raw, body)
+    assert not result.passed and "arm, held ahead for travel, comes within 0.9 m" in result.reason
+    behind = (-12.0 * math.cos(h), -12.0 * math.sin(h))
+    clear = with_hazard(scene, Hazard("T", "pole", HazardKind.overhead, (behind,), 6.0))
+    assert rules(clear, raw, body).passed
 
 
 def test_buried_keep_out_where_the_bucket_meets_the_ground(scene, body):
@@ -287,6 +358,22 @@ def test_turn_uses_the_propping_rules(scene, body):
     assert not result.passed and "across" in result.reason
 
 
+def test_a_turn_is_checked_at_the_heading_it_ends_on(scene, body):
+    along = with_zone(scene, Zone("T", "slope", WIDE, 0.0, 14.0, 0.0))
+    result = rules(along, task_json(task_type="turn", marker_id="M5"), body)
+    assert not result.passed and "14.0 degrees across them" in result.reason
+
+
+def test_a_turn_is_checked_at_every_heading_it_passes(scene, body):
+    along = with_zone(scene, Zone("T", "slope", WIDE, 0.0, 14.0, 0.0))
+    plan = reached(along, task_json(task_type="turn", marker_id="M6"), Everywhere(), body)
+    result = check_path(plan, along, Everywhere(), body)
+    assert not result.passed and "Turning, at" in result.reason
+    assert "degrees across them; the limit for propping is 10" in result.reason
+    plan = reached(scene, task_json(task_type="turn", marker_id="M6"), Everywhere(), body)
+    assert check_path(plan, scene, Everywhere(), body).passed
+
+
 def test_path_accepts_the_pallet_route_quickly(scene, arm, body):
     plan = reached(scene, spec_json(), arm, body)
     start = time.perf_counter()
@@ -320,15 +407,16 @@ def test_path_refuses_a_keep_out_between_the_ends(scene, arm, body):
     assert not result.passed and "lamp post" in result.reason
 
 
-def test_path_refuses_capacity_between_the_ends(scene, arm):
-    class WeakAboveTheGround(StandIn):
-        def lift_capacity(self, radius_m, height_m):
-            return Capacity(100.0 if height_m > 0.1 else 1e9, 1e9)
-
-    plan = reached(scene, spec_json(), arm, WeakAboveTheGround())
-    assert check_rules(plan, scene, WeakAboveTheGround())[0].passed
-    result = check_path(plan, scene, arm, WeakAboveTheGround())
-    assert not result.passed and "rated lift capacity" in result.reason
+def test_path_refuses_capacity_between_the_ends(scene, arm, body):
+    across = dataclasses.replace(
+        scene,
+        loads=scene.loads + (Load("L9", "kerb unit", 300.0, 4.0, -2.4, 0.3),),
+        markers=scene.markers + (Marker("M9", "other side", 4.0, 2.4),),
+    )
+    plan = reached(across, spec_json(load_id="L9", marker_id="M9"), arm, body)
+    assert check_rules(plan, across, body)[0].passed
+    result = check_path(plan, across, arm, body)
+    assert not result.passed and "does not rate every height" in result.reason
 
 
 def test_path_refuses_a_step_on_the_travel_route(scene, body):

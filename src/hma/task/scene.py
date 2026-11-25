@@ -11,7 +11,7 @@ from functools import cached_property
 Point2 = tuple[float, float]
 EDGE_PIECE_M = 0.25
 EDGE_PROBE_M = 1e-3
-STEP_TOLERANCE_M = 0.01
+SAME_HEIGHT_M = 1e-9
 
 
 class HazardKind(StrEnum):
@@ -67,10 +67,6 @@ class Hazard:
     def __post_init__(self) -> None:
         if len(self.points) not in (1, 2) or self.keep_out_m < 0:
             raise ValueError(f"hazard {self.id} needs one or two points and a keep-out >= 0")
-
-    def distance(self, p: Point2) -> float:
-        a = self.points[0]
-        return distance_to_segment(p, a, self.points[-1])
 
 
 @dataclass(frozen=True)
@@ -128,7 +124,6 @@ class Scene:
     loads: tuple[Load, ...]
     hazards: tuple[Hazard, ...]
     zones: tuple[Zone, ...]
-    reach_m: float
     bucket_width_m: float
 
     def marker(self, marker_id: str) -> Marker | None:
@@ -137,8 +132,11 @@ class Scene:
     def load(self, load_id: str) -> Load | None:
         return next((m for m in self.loads if m.id == load_id), None)
 
+    def zone_at(self, p: Point2) -> Zone | None:
+        return next((z for z in reversed(self.zones) if z.contains(p)), None)
+
     def ground(self, p: Point2) -> Ground:
-        zone = next((z for z in reversed(self.zones) if z.contains(p)), None)
+        zone = self.zone_at(p)
         if zone is None:
             return Ground(0.0, 0.0, 0.0, None)
         return Ground(zone.height(p), zone.slope_deg, zone.downhill_deg, zone.id)
@@ -159,13 +157,18 @@ class Scene:
                     m = lerp2(p, q, 0.5)
                     out = (m[0] + nx * EDGE_PROBE_M, m[1] + ny * EDGE_PROBE_M)
                     inn = (m[0] - nx * EDGE_PROBE_M, m[1] - ny * EDGE_PROBE_M)
-                    rise = abs(self.ground(out).height_m - self.ground(inn).height_m)
-                    if rise > STEP_TOLERANCE_M:
+                    sides = (self.zone_at(out), self.zone_at(inn))
+                    rise = abs(_height(sides[0], m) - _height(sides[1], m))
+                    if rise > SAME_HEIGHT_M:
                         found.append(Step(p, q, rise))
         return tuple(found)
 
     def as_data(self) -> dict:
         return asdict(self)
+
+
+def _height(zone: Zone | None, p: Point2) -> float:
+    return 0.0 if zone is None else zone.height(p)
 
 
 def lerp2(a: Point2, b: Point2, t: float) -> Point2:
@@ -184,7 +187,9 @@ def _box(x0: float, x1: float, y0: float, y1: float) -> tuple[Point2, ...]:
 
 
 RAMP_SLOPE_DEG = 12.0
-PAD_HEIGHT_M = round(6.0 * math.tan(math.radians(RAMP_SLOPE_DEG)), 3)
+PAD_HEIGHT_M = 6.0 * math.tan(math.radians(RAMP_SLOPE_DEG))
+BANK_SLOPE_DEG = 35.0
+CUTTING_DEPTH_M = 4.0 * math.tan(math.radians(BANK_SLOPE_DEG))
 
 DEMO_SCENE = Scene(
     machine=Pose(0.0, 0.0, 0.0),
@@ -194,7 +199,7 @@ DEMO_SCENE = Scene(
         Marker("M3", "pad marker", 17.0, 0.0),
         Marker("M4", "cable marker", 3.3, 4.5),
         Marker("M5", "slope marker", 0.0, 9.0),
-        Marker("M6", "bank marker", -8.0, 0.0),
+        Marker("M6", "bank marker", -6.0, 0.0),
         Marker("M7", "line marker", 6.0, -8.0),
     ),
     loads=(
@@ -211,8 +216,9 @@ DEMO_SCENE = Scene(
         Zone("Z1", "ramp", _box(8.0, 14.0, -4.0, 4.0), 0.0, RAMP_SLOPE_DEG, 180.0),
         Zone("Z2", "raised pad", _box(14.0, 22.0, -5.0, 5.0), PAD_HEIGHT_M, 0.0, 0.0),
         Zone("Z3", "side slope", _box(-4.0, 6.0, 6.0, 13.0), 0.0, 8.0, 90.0),
-        Zone("Z4", "steep bank", _box(-12.0, -4.0, -3.0, 3.0), 0.0, 35.0, 180.0),
+        Zone("Z4", "steep bank", ((-4.0, -3.0), (-4.0, 3.0), (-8.0, 3.0), (-8.0, -3.0)), 0.0,
+             BANK_SLOPE_DEG, 180.0),
+        Zone("Z5", "cutting floor", _box(-14.0, -8.0, -3.0, 3.0), -CUTTING_DEPTH_M, 0.0, 0.0),
     ),
-    reach_m=8.1,
     bucket_width_m=1.0,
 )

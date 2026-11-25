@@ -11,9 +11,10 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 from pydantic import ValidationError
 
-from hma.task.body import BUCKET_KG, Body, Capacity, chart_rating
+from hma.task.body import BUCKET_KG, Body, rating_cells
 from hma.task.reach import Reach
 from hma.task.scene import (
+    Ground,
     Hazard,
     HazardKind,
     Load,
@@ -60,6 +61,7 @@ class Limits:
     min_move_m: float = 0.5
     prop_radius_m: tuple[float, float] = (2.5, 8.5)
     sample_step_m: float = 0.25
+    turn_step_deg: float = 5.0
 
 
 LIMITS = Limits()
@@ -159,12 +161,40 @@ def frame_at(scene: Scene, pose: Pose) -> Frame:
     return Frame(np.array([pose.x_m, pose.y_m, ground.height_m]), axes)
 
 
-def tilt(scene: Scene, pose: Pose) -> tuple[float, float]:
-    ground = scene.ground(pose.xy)
+def slope_tilt(ground: Ground, heading_deg: float) -> tuple[float, float]:
     t = math.tan(math.radians(ground.slope_deg))
-    rel = math.radians(ground.downhill_deg - pose.heading_deg)
+    rel = math.radians(ground.downhill_deg - heading_deg)
     return (abs(math.degrees(math.atan(t * math.cos(rel)))),
             abs(math.degrees(math.atan(t * math.sin(rel)))))
+
+
+def surface(ground: Ground) -> tuple[float, float]:
+    return (0.0, 0.0) if ground.slope_deg == 0 else (ground.slope_deg, ground.downhill_deg % 360)
+
+
+def footprint_points(body: Body, pose: Pose, step: float) -> list[Point2]:
+    x0, x1, y0, y1 = body.footprint()
+    nx, ny = max(1, math.ceil((x1 - x0) / step)), max(1, math.ceil((y1 - y0) / step))
+    c, s = math.cos(math.radians(pose.heading_deg)), math.sin(math.radians(pose.heading_deg))
+    found = []
+    for i in range(nx + 1):
+        x = x0 + (x1 - x0) * i / nx
+        for j in range(ny + 1):
+            y = y0 + (y1 - y0) * j / ny
+            found.append((pose.x_m + c * x - s * y, pose.y_m + s * x + c * y))
+    return found
+
+
+def ahead(pose: Pose, distance: float) -> Point2:
+    h = math.radians(pose.heading_deg)
+    return (pose.x_m + distance * math.cos(h), pose.y_m + distance * math.sin(h))
+
+
+def turn_headings(plan: Plan, limits: Limits = LIMITS) -> list[float]:
+    start = plan.stand.heading_deg
+    delta = (bearing(plan.stand.xy, plan.target.xy) - start + 180.0) % 360.0 - 180.0
+    n = max(1, math.ceil(abs(delta) / limits.turn_step_deg))
+    return [start + delta * k / n for k in range(n + 1)]
 
 
 def segment_gap(a: Point2, b: Point2, c: Point2, d: Point2) -> float:
@@ -294,11 +324,6 @@ def check_reach(
     ), replace(plan, prop_xy=prop)
 
 
-def rated(capacity: Capacity, limits: Limits) -> float:
-    return min(limits.tipping_fraction * capacity.tipping_kg,
-               limits.hydraulic_fraction * capacity.hydraulic_kg)
-
-
 def machine_problem(
     scene: Scene, body: Body, pose: Pose, activity: str, limits: Limits = LIMITS
 ) -> str | None:
@@ -307,24 +332,34 @@ def machine_problem(
         "lifting": (limits.lift_slope_deg, limits.lift_slope_deg),
         "propping": (limits.swing_pitch_deg, limits.swing_roll_deg),
     }[activity]
-    pitch, roll = tilt(scene, pose)
+    grounds = [scene.ground(q) for q in footprint_points(body, pose, limits.sample_step_m)]
+    tilts = [slope_tilt(g, pose.heading_deg) for g in grounds]
+    pitch, roll = max(t[0] for t in tilts), max(t[1] for t in tilts)
     if pitch > pitch_max + 1e-9 or roll > roll_max + 1e-9:
         along = pitch > pitch_max + 1e-9
         return (
-            f"At {where(pose.xy)} the ground tilts the machine {pitch if along else roll:.1f} "
-            f"degrees {'along' if along else 'across'} its tracks; the limit for {activity} is "
-            f"{pitch_max if along else roll_max:g} degrees."
+            f"At {where(pose.xy)} the ground under the tracks tilts the machine "
+            f"{pitch if along else roll:.1f} degrees {'along' if along else 'across'} them; the "
+            f"limit for {activity} is {pitch_max if along else roll_max:g} degrees."
+        )
+    if activity != "travel" and len({surface(g) for g in grounds}) > 1:
+        return (
+            f"At {where(pose.xy)} the tracks rest on ground of more than one slope; {activity} "
+            "needs one even surface under them."
         )
     radius = body.plan_radius()
+    arm_end = ahead(pose, body.travel_reach(limits.carry_height_m))
     for hazard in scene.hazards:
-        if hazard.kind is HazardKind.overhead:
-            gap = hazard_gap(hazard, pose.xy) - radius
-            if gap < hazard.keep_out_m:
-                return (
-                    f"At {where(pose.xy)} the machine comes within {max(gap, 0):.1f} m of the "
-                    f"{hazard.label} ({hazard.id}); its keep-out distance is "
-                    f"{hazard.keep_out_m:g} m."
-                )
+        if hazard.kind is not HazardKind.overhead:
+            continue
+        what, gap = "machine comes", hazard_gap(hazard, pose.xy) - radius
+        if activity == "travel" and hazard_gap(hazard, pose.xy, arm_end) < gap:
+            what, gap = "arm, held ahead for travel, comes", hazard_gap(hazard, pose.xy, arm_end)
+        if gap < hazard.keep_out_m:
+            return (
+                f"At {where(pose.xy)} the {what} within {max(gap, 0):.1f} m of the "
+                f"{hazard.label} ({hazard.id}); its keep-out distance is {hazard.keep_out_m:g} m."
+            )
     for step in scene.steps:
         gap = step.distance(pose.xy) - radius
         if step.height_m > limits.step_m and gap < limits.edge_keep_back_m:
@@ -360,29 +395,33 @@ def lift_problem(
             )
     local = frame_at(scene, plan.stand).to_machine(point)
     radius = math.hypot(local[0], local[1])
-    at = f"{radius:.1f} m from the swing axis and {local[2]:+.1f} m height"
-    chart = chart_rating(radius)
-    if chart is None:
+    cells = rating_cells(radius)
+    if cells is None:
         return (
-            f"At {where(xy)}, {at}, the manufacturer's lifting chart gives no rated load, so "
-            "nothing is lifted there."
+            f"At {where(xy)}, {radius:.1f} m from the swing axis, the manufacturer's lifting "
+            "chart does not rate every height, so nothing is lifted there."
         )
-    limit = chart - BUCKET_KG
-    governs = f"the manufacturer's over-side rating of {chart:.0f} kg"
-    model = body.lift_capacity(radius, local[2])
-    if model is not None and rated(model, limits) - BUCKET_KG < limit:
-        limit = rated(model, limits) - BUCKET_KG
-        governs = (
-            f"{limits.tipping_fraction:.0%} of the model's {model.tipping_kg:.0f} kg tipping load"
-            if limits.tipping_fraction * model.tipping_kg
-            <= limits.hydraulic_fraction * model.hydraulic_kg
-            else f"{limits.hydraulic_fraction:.0%} of the model's {model.hydraulic_kg:.0f} kg "
-            "hydraulic lift capacity"
-        )
+    limit, governs = math.inf, ""
+    for cell in cells:
+        at = f"at {cell.radius_m:g} m radius and {cell.height_m:g} m height"
+        chart = f"the manufacturer's over-side rating of {cell.side_kg:.0f} kg {at}"
+        options = [(cell.side_kg, chart)]
+        model = body.lift_capacity(cell.radius_m, cell.height_m)
+        if model is not None:
+            options.append((limits.tipping_fraction * model.tipping_kg,
+                            f"{limits.tipping_fraction:.0%} of the model's "
+                            f"{model.tipping_kg:.0f} kg tipping load {at}"))
+            options.append((limits.hydraulic_fraction * model.hydraulic_kg,
+                            f"{limits.hydraulic_fraction:.0%} of the model's "
+                            f"{model.hydraulic_kg:.0f} kg hydraulic lift capacity {at}"))
+        for value, text in options:
+            if value - BUCKET_KG < limit:
+                limit, governs = value - BUCKET_KG, text
     if plan.load.mass_kg > limit:
         return (
             f"The {plan.load.label} ({plan.load.mass_kg:g} kg) is over the rated lift capacity of "
-            f"{max(limit, 0):.0f} kg at {at}: {governs}, less the {BUCKET_KG:.0f} kg bucket."
+            f"{max(limit, 0):.0f} kg at {radius:.1f} m from the swing axis: {governs}, less the "
+            f"{BUCKET_KG:.0f} kg bucket."
         )
     return None
 
@@ -410,6 +449,10 @@ def check_rules(
     activity = "lifting" if plan.task_type is TaskType.carry else "propping"
     if problem := machine_problem(scene, body, plan.stand, activity, limits):
         return refuse(problem)
+    if plan.task_type is TaskType.turn:
+        end = replace(plan.stand, heading_deg=turn_headings(plan, limits)[-1])
+        if problem := machine_problem(scene, body, end, "propping", limits):
+            return refuse(problem)
     if plan.task_type is TaskType.carry:
         if plan.load.mass_kg is None:
             return refuse(
@@ -510,11 +553,18 @@ def check_path(
         count += len(points)
         if problem := sweep(plan, scene, reach, body, points, limits):
             return CheckResult("path", False, problem)
+    if plan.task_type is TaskType.turn:
+        headings = turn_headings(plan, limits)
+        count += len(headings)
+        for heading in headings:
+            pose = replace(plan.stand, heading_deg=heading)
+            if problem := machine_problem(scene, body, pose, "propping", limits):
+                return CheckResult("path", False, f"Turning, at {heading:.0f} degrees: {problem}")
     elapsed = time.perf_counter() - start
     if count == 0:
         return CheckResult("path", True, "The task has no route to sample.")
     return CheckResult(
-        "path", True, f"{count} points along the route pass every check ({elapsed * 1000:.0f} ms)."
+        "path", True, f"{count} samples along the route pass every check ({elapsed * 1000:.0f} ms)."
     )
 
 

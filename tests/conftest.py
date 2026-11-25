@@ -48,6 +48,12 @@ class StandIn:
     def plan_radius(self):
         return self.radius
 
+    def footprint(self):
+        return (-1.69, 1.68, -1.34, 1.34)
+
+    def travel_reach(self, height_m):
+        return 8.15
+
     def boom_arm_angles(self, x, y, z):
         return (self.angle,) if 3.0 <= x <= 6.0 else ()
 
