@@ -227,7 +227,10 @@ class Soil:
         lx, ly = self.grid.cell * direction[0], self.grid.cell * direction[1]
         depths = []
         for f in self.fractions:
-            top = self.grid.height(self.heights, a[0] + f * span[0] + lx, a[1] + f * span[1] + ly)
+            x, y = a[0] + f * span[0], a[1] + f * span[1]
+            top = self.grid.height(self.heights, x + lx, y + ly)
+            if top == -math.inf:
+                top = self.grid.height(self.heights, x, y)
             depths.append(max(top - a[2] - f * span[2], 0.0))
         if max(depths) <= 0.0:
             return 0.0, direction, False

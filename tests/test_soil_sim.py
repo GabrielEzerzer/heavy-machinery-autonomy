@@ -342,6 +342,20 @@ def test_the_back_of_the_bucket_spills_instead_of_filling():
     assert soil.total_volume() == pytest.approx(start, abs=1e-12)
 
 
+def test_an_edge_at_the_grid_border_is_resisted_as_it_is_inland():
+    model, data, soil = machine()
+    place(model, data, soil, np.array([0.0, 5.93, -0.25]), PITCH_DIG)
+    start = soil.ground_volume()
+    data.ctrl[model.actuator(PREFIX + "arm").id] = -0.2
+    resistance = []
+    for _ in range(40):
+        advance(model, data, soil, 1)
+        resistance.append(soil.resistance)
+    assert data.site_xpos[soil.edges, 1].max() > soil.grid.y0 + soil.grid.cell * (
+        soil.grid.shape[0] - 1) - soil.grid.cell
+    assert min(resistance[5:]) > 50e3
+    assert start - soil.ground_volume() < 0.005
+
 def test_ground_under_the_tracks_is_protected():
     model, data, soil = machine()
     place(model, data, soil, *BURIED)
