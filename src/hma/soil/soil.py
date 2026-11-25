@@ -30,11 +30,19 @@ CONTROL_HZ = 10.0
 BUCKET_CAPACITY = 0.45
 DUMP_ANGLE = math.pi / 4
 EDGE_SAMPLES = 7
-SPEED_FADE = 0.01
+STEER_SPEED = 0.001
+PREDICTIONS = 4
+SLIP_MARGIN = 0.01
+SLIP_COS = 0.99
 TRAVEL_BLEND = 0.1
 SPILL_AHEAD = 2.0
 SETTLE_PASSES = 10
 ANCHOR_DISTANCE = 1000.0
+MAX_EDGE_SPEED = 10.0
+GROUND_REACH = 2
+PROTECT_TOLERANCE = 1e-3
+CUBE_TURNS = tuple((math.sqrt(2.0 / 3.0) * math.cos(t), math.sqrt(2.0 / 3.0) * math.sin(t))
+                   for t in (0.0, 2.0 * math.pi / 3.0, 4.0 * math.pi / 3.0))
 
 
 def physics_steps(model: mujoco.MjModel, control_hz: float) -> int:
@@ -95,6 +103,7 @@ class Soil:
         self.resistance = 0.0
         self.direction = np.zeros(3)
         self._edge = ([0.0] * 3, [0.0] * 3)
+        self._base_pose: list[float] | None = None
 
     def reset(self, model: mujoco.MjModel, data: mujoco.MjData,
               heights: np.ndarray | None = None) -> None:
@@ -106,6 +115,7 @@ class Soil:
         self.lost_volume = 0.0
         mujoco.mj_forward(model, data)
         self._edge = data.site_xpos[self.edges].tolist()
+        self._base_pose = None
         self._protect(data)
         self._set_resistance(model, data, 0.0, (0.0, 0.0, 0.0))
         data.xfrc_applied[self.bucket] = 0.0
@@ -129,48 +139,34 @@ class Soil:
         a, b = data.site_xpos[self.edges].tolist()
         p, q = self._edge
         self._edge = (a, b)
+        if max(math.dist(a, p), math.dist(b, q)) > MAX_EDGE_SPEED * model.opt.timestep:
+            p, q = a, b
         frame = data.site_xmat[self.tip].tolist()
         lip = (frame[2], frame[5], frame[8])
-        r = data.xmat[self.bucket].tolist()
-        m = self.mouth
-        mouth = [r[3 * i] * m[0] + r[3 * i + 1] * m[1] + r[3 * i + 2] * m[2] for i in range(3)]
-        moved = [(a[i] + b[i] - p[i] - q[i]) / 2 for i in range(3)]
-        removed = self.grid.cut(self.heights, self.loose, self.protected, (p, q, b, a))
-        span = np.array([b[0] - a[0], b[1] - a[1], b[2] - a[2]])
-        if removed > 0.0:
-            forward = moved[0] * mouth[0] + moved[1] * mouth[1] + moved[2] * mouth[2] > 0.0
-            taken = min(removed, BUCKET_CAPACITY - self.bucket_volume) if forward else 0.0
-            self.bucket_volume += taken
-            norm = math.hypot(moved[0], moved[1])
-            stride = self.grid.cell / norm if norm > 1e-12 else 0.0
-            ahead = np.array([moved[0] * stride, moved[1] * stride, 0.0])
-            self.lost_volume += self.grid.deposit(self.heights, self.loose, removed - taken,
-                                                  np.array(a) + SPILL_AHEAD * ahead, span, ahead)
-        actual, intended = self._edge_motion(model, data)
-        speed = math.hypot(*intended)
-        steer = SPEED_FADE / speed if speed > 1e-12 else 0.0
-        u = [actual[i] + steer * intended[i] for i in range(3)]
-        norm = math.hypot(*u)
-        direction = (u[0] / norm, u[1] / norm, u[2] / norm) if norm > 1e-12 else (0.0, 0.0, 0.0)
-        lx, ly = self.grid.cell * direction[0], self.grid.cell * direction[1]
-        depths = []
-        for f in self.fractions:
-            z = a[2] + f * span[2]
-            top = self.grid.height(self.heights, a[0] + f * span[0] + lx, a[1] + f * span[1] + ly)
-            depths.append(max(top - z, 0.0))
-        in_soil = max(depths) > 0.0
+        span = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
         travel = self._travel(span)
+        force, direction, in_soil = 0.0, (0.0, 0.0, 0.0), False
+        if self.grid.clearance(self.heights, (p, q, a, b), GROUND_REACH) <= 0.0:
+            self._cut(data, (p, q, b, a), span)
+            self._weigh(data)
+            motion = self._edge_motion(model, data)
+            for _ in range(PREDICTIONS):
+                force, direction, in_soil = self._plan(motion, a, span, travel, lip)
+                if not in_soil:
+                    break
+                self._set_resistance(model, data, force, direction)
+                mujoco.mj_forward(model, data)
+                motion = self._slip(model, data, force, direction)
+                if motion is None:
+                    break
         if self.bucket_volume > 0.0 and not in_soil and -lip[2] > math.sin(DUMP_ANGLE):
-            below = self.reach * travel
+            below = self.reach * np.array(travel)
             self.lost_volume += self.grid.deposit(self.heights, self.loose, self.bucket_volume,
-                                                  np.array(a) - below / 2, span, below)
+                                                  np.array(a) - below / 2, np.array(span), below)
             self.bucket_volume = 0.0
-        force = 0.0
-        if in_soil and speed > 1e-12:
-            force = math.tanh(speed / SPEED_FADE) * self._resistance(depths, direction, travel, lip)
-        self._set_resistance(model, data, force, direction)
-        data.xfrc_applied[self.bucket] = 0.0
-        data.xfrc_applied[self.bucket, 2] = -self.params.unit_weight * self.bucket_volume
+        if not in_soil:
+            self._set_resistance(model, data, 0.0, direction)
+        self._weigh(data)
 
     def control_step(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
         settle(self.heights, self.loose, self.params.friction_angle, self.grid.cell,
@@ -178,14 +174,68 @@ class Soil:
         self._protect(data)
         write_ground(model, self.index, self.heights)
 
-    def _edge_motion(self, model: mujoco.MjModel,
-                     data: mujoco.MjData) -> tuple[list[float], list[float]]:
+    def _cut(self, data: mujoco.MjData, corners: tuple, span: tuple) -> None:
+        removed = self.grid.cut(self.heights, self.loose, self.protected, corners)
+        if removed <= 0.0:
+            return
+        p, q, b, a = corners
+        moved = [(a[i] + b[i] - p[i] - q[i]) / 2 for i in range(3)]
+        r = data.xmat[self.bucket].tolist()
+        m = self.mouth
+        mouth = [r[3 * i] * m[0] + r[3 * i + 1] * m[1] + r[3 * i + 2] * m[2] for i in range(3)]
+        forward = moved[0] * mouth[0] + moved[1] * mouth[1] + moved[2] * mouth[2] > 0.0
+        held = min(self.bucket_volume + removed, BUCKET_CAPACITY) if forward else self.bucket_volume
+        taken = held - self.bucket_volume
+        self.bucket_volume = held
+        norm = math.hypot(moved[0], moved[1])
+        stride = self.grid.cell / norm if norm > 1e-12 else 0.0
+        ahead = np.array([moved[0] * stride, moved[1] * stride, 0.0])
+        self.lost_volume += self.grid.deposit(self.heights, self.loose, removed - taken,
+                                              np.array(a) + SPILL_AHEAD * ahead, np.array(span),
+                                              ahead)
+
+    def _weigh(self, data: mujoco.MjData) -> None:
+        data.xfrc_applied[self.bucket] = 0.0
+        data.xfrc_applied[self.bucket, 2] = -self.params.unit_weight * self.bucket_volume
+
+    def _edge_motion(self, model: mujoco.MjModel, data: mujoco.MjData) -> list[float]:
         mujoco.mj_jacSite(model, data, self.jac, None, self.tip)
         intended = self.jac[:, self.arm_dofs] @ data.qvel[self.valve_dofs]
-        return (self.jac @ data.qvel).tolist(), intended.tolist()
+        commanded = math.sqrt(float(intended @ intended))
+        steer = STEER_SPEED / commanded if commanded > 1e-12 else 0.0
+        return (self.jac @ data.qvel + steer * intended).tolist()
+
+    def _plan(self, motion: list[float], a: list[float], span: tuple, travel: tuple,
+              lip: tuple) -> tuple[float, tuple[float, float, float], bool]:
+        norm = math.hypot(*motion)
+        if norm < 1e-12:
+            return 0.0, (0.0, 0.0, 0.0), False
+        direction = (motion[0] / norm, motion[1] / norm, motion[2] / norm)
+        lx, ly = self.grid.cell * direction[0], self.grid.cell * direction[1]
+        depths = []
+        for f in self.fractions:
+            top = self.grid.height(self.heights, a[0] + f * span[0] + lx, a[1] + f * span[1] + ly)
+            depths.append(max(top - a[2] - f * span[2], 0.0))
+        if max(depths) <= 0.0:
+            return 0.0, direction, False
+        return self._resistance(depths, direction, travel, lip), direction, True
+
+    def _slip(self, model: mujoco.MjModel, data: mujoco.MjData, force: float,
+              direction: tuple[float, float, float]) -> list[float] | None:
+        velocity = self.jac @ (data.qvel + model.opt.timestep * data.qacc)
+        rows = data.efc_type == mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON
+        held = max((abs(f) for f, t in zip(data.efc_force[rows].tolist(),
+                                           data.efc_id[rows].tolist(), strict=True)
+                    if t in self.tendons), default=0.0)
+        speed = math.sqrt(float(velocity @ velocity))
+        along = float(velocity @ direction)
+        if held < (1.0 - SLIP_MARGIN) * force / math.sqrt(3.0) or along >= SLIP_COS * speed:
+            return None
+        return (velocity + speed * np.array(direction)).tolist()
 
     def _resistance(self, depths: list[float], direction: tuple[float, float, float],
-                    travel: np.ndarray, lip: tuple[float, float, float]) -> float:
+                    travel: tuple[float, float, float],
+                    lip: tuple[float, float, float]) -> float:
         sums = depth_sums(depths, self.width)
         attack = direction[0] * lip[0] + direction[1] * lip[1] + direction[2] * lip[2]
         load = self.params.unit_weight * self.bucket_volume
@@ -199,27 +249,37 @@ class Soil:
         return force
 
     @staticmethod
-    def _travel(span: np.ndarray) -> np.ndarray:
+    def _travel(span: tuple) -> tuple[float, float, float]:
         norm = math.hypot(span[0], span[1])
         if norm < 1e-9:
-            return np.array([1.0, 0.0, 0.0])
-        return np.array([span[1] / norm, -span[0] / norm, 0.0])
+            return (1.0, 0.0, 0.0)
+        return (span[1] / norm, -span[0] / norm, 0.0)
 
     def _set_resistance(self, model: mujoco.MjModel, data: mujoco.MjData, force: float,
                         direction: tuple[float, float, float]) -> None:
         self.resistance = force
         self.direction = np.array(direction)
-        model.tendon_frictionloss[self.tendons] = force
+        model.tendon_frictionloss[self.tendons] = force / math.sqrt(3.0)
         if force > 0.0:
             x, y, z = direction
             side = (y, -x, 0.0) if math.hypot(x, y) > 1e-6 else (0.0, z, -y)
             n = math.hypot(*side)
             sx, sy, sz = side[0] / n, side[1] / n, side[2] / n
-            frame = np.array([direction, (sx, sy, sz),
-                              (y * sz - z * sy, z * sx - x * sz, x * sy - y * sx)])
-            data.mocap_pos[self.anchors] = data.site_xpos[self.tip] - ANCHOR_DISTANCE * frame
+            ux, uy, uz = y * sz - z * sy, z * sx - x * sz, x * sy - y * sx
+            tx, ty, tz = data.site_xpos[self.tip].tolist()
+            anchors = []
+            for c, s in CUBE_TURNS:
+                anchors.append((tx - ANCHOR_DISTANCE * (x / math.sqrt(3.0) + c * sx + s * ux),
+                                ty - ANCHOR_DISTANCE * (y / math.sqrt(3.0) + c * sy + s * uy),
+                                tz - ANCHOR_DISTANCE * (z / math.sqrt(3.0) + c * sz + s * uz)))
+            data.mocap_pos[self.anchors] = anchors
 
     def _protect(self, data: mujoco.MjData) -> None:
+        pose = data.xpos[self.base].tolist() + data.xmat[self.base].tolist()
+        if self._base_pose is not None and max(
+                abs(x - y) for x, y in zip(pose, self._base_pose, strict=True)) < PROTECT_TOLERANCE:
+            return
+        self._base_pose = pose
         frame = data.xmat[self.base].reshape(3, 3)
         local = (self.cells - data.xpos[self.base][:2]) @ frame[:2, :2]
         lo, hi = self.footprint

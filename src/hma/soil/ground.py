@@ -13,6 +13,7 @@ from hma.machine.model import GROUND_DEPTH, GROUND_TOP
 
 INSIDE_TOLERANCE = 1e-9
 SHED_SHARE = 0.125
+SETTLE_TOLERANCE = 1e-5
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,18 @@ class Grid:
         low = heights[cy, cx] * (1 - tx) + heights[cy, cx + 1] * tx
         high = heights[cy + 1, cx] * (1 - tx) + heights[cy + 1, cx + 1] * tx
         return float(low * (1 - ty) + high * ty) + self.z0
+
+    def clearance(self, heights: np.ndarray, points: tuple, reach: int) -> float:
+        nrow, ncol = self.shape
+        xs, ys = [c[0] for c in points], [c[1] for c in points]
+        c0 = max(math.floor((min(xs) - self.x0) / self.cell) - reach, 0)
+        c1 = min(math.ceil((max(xs) - self.x0) / self.cell) + reach, ncol - 1)
+        r0 = max(math.floor((min(ys) - self.y0) / self.cell) - reach, 0)
+        r1 = min(math.ceil((max(ys) - self.y0) / self.cell) + reach, nrow - 1)
+        if c0 > c1 or r0 > r1:
+            return math.inf
+        top = float(heights[r0:r1 + 1, c0:c1 + 1].max())
+        return min(c[2] for c in points) - self.z0 - top
 
     def cut(self, heights: np.ndarray, loose: np.ndarray, protected: np.ndarray,
             corners: tuple) -> float:
@@ -127,6 +140,8 @@ def settle(heights: np.ndarray, loose: np.ndarray, repose: float, cell: float,
         west *= scale[:, 1:]
         north *= scale[:-1, :]
         south *= scale[1:, :]
+        if max(east.max(), west.max(), north.max(), south.max()) < SETTLE_TOLERANCE:
+            break
         moved = np.zeros_like(h)
         moved[:, :-1] -= east
         moved[:, 1:] += east
