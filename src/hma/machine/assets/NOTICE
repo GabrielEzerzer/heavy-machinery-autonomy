@@ -1,8 +1,8 @@
 12 t class excavator model
 
-The meshes (crawler.stl, body.stl, boom.stl, arm.stl, bucket.stl) and the kinematic chain in
-excavator.xml are derived from the zx120_description package in the zx120_ros repository by the
-Public Works Research Institute (PWRI), Japan:
+The meshes (*.obj), the texture (zx120.png) and the kinematic chain in excavator.xml are derived
+from the zx120_description package in the zx120_ros repository by the Public Works Research
+Institute (PWRI), Japan:
 
     https://github.com/pwri-opera/zx120_ros
     commit 952ce99bf86991a6d3cfd351b12e1ab2686850fd
@@ -14,12 +14,20 @@ trademarks of their owners; this model is not endorsed by them.
 Changes made to the source:
 
 - Format conversion: the COLLADA (.dae) meshes for the track, body, boom, arm and bucket links
-  were converted to binary STL, with each link's URDF visual origin applied to the vertices.
-  The texture image and texture coordinates were dropped; links use plain colours instead.
+  were converted to OBJ with their normals and texture coordinates, with each link's URDF
+  visual origin applied. The 4096 x 4096 texture (zx120.png) was reduced to 1024 x 1024 by
+  averaging 4 x 4 pixel blocks. Specular and shininess values for the paint, and a plain steel
+  material for the cylinder rods, are added.
+- The boom, arm and bucket cylinder meshes (zx120-*-cyl1.dae barrels, zx120-*-cyl2.dae rods)
+  and the bucket linkage meshes (zx120-p1.dae side link, zx120-p2.dae H-link) were converted to
+  OBJ and turned so the cylinder axis, or the line between a link's two pin holes, lies along
+  an axis. Each barrel was moved so its base pin sits at the origin, each rod so the far end of
+  the rod does, and each link so one pin hole does. They are drawn only, posed from the joint
+  angles on the pins in
+  hma/machine/cylinders.py, and take no part in the simulation.
 - The URDF was converted to MuJoCo MJCF. Joint origins, axes and the boom, arm and bucket
   limits are taken unchanged from zx120.urdf; the bucket tip site comes from bucket_end_joint.
-- Not used: the cylinder and bucket linkage meshes (zx120-*-cyl*.dae, zx120-p1.dae,
-  zx120-p2.dae), the URDF collision meshes and the Gazebo, ROS control and MoveIt files.
+- Not used: the URDF collision meshes and the Gazebo, ROS control and MoveIt files.
 - Added: a free-floating base with twenty-four sphere-shaped track contact geoms, six along the
   inner and outer edge of each track at the bottom of the track mesh, a box geom carrying the
   counterweight mass in the lower 1 m of the rear of the upper structure, a site at the

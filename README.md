@@ -55,7 +55,7 @@ Limits of the hydraulics model:
 
 ### Cylinders
 
-`hma.machine.cylinders` holds the boom, arm and bucket cylinders: their mounting pins in the model's link frames, their sizes and relief pressures, and each cylinder's length and lever arm (the rate of change of length with joint angle) as functions of the joint angle. The bucket cylinder works through the bucket's four-bar linkage, so its lever arm varies most. `python -m hma.machine.pins <zx120_ros checkout>` rebuilds the pin table from the source model: pins from its `zx120.xacro` before commit 31e8ae6 (the cylinder joints were later removed), the two rod-end pins and both link lengths fitted on its meshes. `python -m hma.machine.statics` prints the comparisons below. **The simulation does not use these limits yet**: joints still stall at the constant caps in the table above, and the mechanism that would apply them is open work.
+`hma.machine.cylinders` holds the boom, arm and bucket cylinders: their mounting pins in the model's link frames, their sizes and relief pressures, and each cylinder's length and lever arm (the rate of change of length with joint angle) as functions of the joint angle. The bucket cylinder works through the bucket's four-bar linkage, so its lever arm varies most. `python -m hma.machine.pins <zx120_ros checkout>` rebuilds the pin table from the source model: pins from its `zx120.xacro` before commit 31e8ae6 (the cylinder joints were later removed), the two rod-end pins and both link lengths fitted on its meshes. The boom's two cylinders sit 0.273 m either side of the boom's centre plane, where the pins in the table lie: the clevises on the upper structure (0.2728 m) and the eyes of the source's two-cylinder boom mesh (0.2728 m at the barrel, 0.2739 m at the rod) agree, and the rod eyes fall within the pin bosses on the boom. `python -m hma.machine.statics` prints the comparisons below. **The simulation does not use these limits yet**: joints still stall at the constant caps in the table above, and the mechanism that would apply them is open work.
 
 | Cylinder | Count, bore, rod | Head / rod area | Stroke over the joint range | Lever arm over the range |
 |---|---|---|---|---|
@@ -224,7 +224,7 @@ python -m hma.machine.demo
 python -m hma.task "put the pallet of kerbstones down at the near marker"
 ```
 
-The first command opens a viewer and moves the arm through its range. The second asks a GPT model for a task specification on the demo scene, checks it and asks you to confirm. It calls the [Codex CLI](https://github.com/openai/codex), which must be installed and signed in with your own ChatGPT account; this repo holds no API key.
+The first command opens a viewer and moves the arm through its range, with the hydraulic cylinders and bucket linkage drawn on their pins. The second asks a GPT model for a task specification on the demo scene, checks it and asks you to confirm. It calls the [Codex CLI](https://github.com/openai/codex), which must be installed and signed in with your own ChatGPT account; this repo holds no API key.
 
 ## Limits
 

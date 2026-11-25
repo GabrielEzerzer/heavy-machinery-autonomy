@@ -9,6 +9,8 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+from hma.machine.scenery import dress_after_heightfields
+
 ASSETS = Path(__file__).parent / "assets"
 MACHINE_XML = ASSETS / "excavator.xml"
 
@@ -118,6 +120,22 @@ def _add_ground(scene: mujoco.MjSpec, index: int, prefix: str, offset: np.ndarra
                              conaffinity=1 << index, material=GROUND, friction=[0.8, 0.005, 1e-4])
 
 
+def _share_look(scene: mujoco.MjSpec) -> None:
+    def shared(name: str) -> str:
+        return name.split("/", 1)[-1]
+
+    for element in [*scene.textures, *scene.materials]:
+        if element.name.startswith(machine_prefix(0)):
+            element.name = shared(element.name)
+        elif "/" in element.name:
+            scene.delete(element)
+    rgb = mujoco.mjtTextureRole.mjTEXROLE_RGB
+    for material in scene.materials:
+        material.textures[rgb] = shared(material.textures[rgb])
+    for geom in scene.geoms:
+        geom.material = shared(geom.material)
+
+
 def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
     if not 1 <= n_machines <= MAX_MACHINES:
         raise ValueError(f"n_machines must be between 1 and {MAX_MACHINES}")
@@ -127,16 +145,6 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
     scene.option.timestep = TIMESTEP
     scene.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
     scene.option.tolerance = SOLVER_TOLERANCE
-    scene.visual.global_.offwidth = 1280
-    scene.visual.global_.offheight = 720
-    scene.visual.quality.shadowsize = 4096
-    scene.add_texture(name=GROUND, type=mujoco.mjtTexture.mjTEXTURE_2D,
-                      builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER, width=64, height=64,
-                      rgb1=[0.55, 0.45, 0.33], rgb2=[0.5, 0.41, 0.3])
-    ground = scene.add_material(name=GROUND, texrepeat=[12, 12])
-    ground.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = GROUND
-    scene.worldbody.add_light(pos=[0, 0, 30], dir=[0.3, 0.2, -1],
-                              type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL, castshadow=1)
     for i in range(n_machines):
         prefix = machine_prefix(i)
         offset = np.array([0.0, i * MACHINE_SPACING, 0.0])
@@ -148,6 +156,10 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
                            objtype=mujoco.mjtObj.mjOBJ_BODY, name1=prefix + "base",
                            name2=prefix + ANCHOR, data=[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0],
                            active=int(weld))
+    _share_look(scene)
+    offsets = [i * MACHINE_SPACING for i in range(n_machines)]
+    footprints = [(*GROUND_X, y + GROUND_Y[0], y + GROUND_Y[1]) for y in offsets]
+    dress_after_heightfields(scene, footprints, [(0.0, y) for y in offsets])
     scene.add_key(name=HOME_KEY)
     model = scene.compile()
     flat = np.zeros(ground_shape())
