@@ -556,7 +556,8 @@ def loaded_run(machine, loads, schedule, seconds, control_hz=10.0):
     for k in range(round(seconds / DT)):
         if k % layer.steps_per_decision == 0:
             layer.act(np.asarray(schedule(k // layer.steps_per_decision), float)[None])
-        data.qfrc_applied[dofs] = loads(data.ctrl[actuators]) * machine.force_limit
+        loads_now = loads(data.ctrl[actuators], data.qvel[dofs])
+        data.qfrc_applied[dofs] = loads_now * machine.force_limit
         layer.step()
         commands.append(data.ctrl[actuators].copy())
         force = layer.true_state().loads[0] * machine.force_limit
@@ -576,21 +577,31 @@ def reversals(commands):
     ([1, 1, 1, 1], [-0.25] * 4, 6.0),
 ], ids=["swing-and-loaded-arm", "end-stop"])
 def test_the_power_limit_settles_without_chatter(command, loads, seconds, control_hz):
-    commands, _ = loaded_run(NOMINAL, lambda ctrl: np.array(loads), lambda k: command, seconds,
-                             control_hz)
+    commands, _ = loaded_run(NOMINAL, lambda ctrl, speed: np.array(loads), lambda k: command,
+                             seconds, control_hz)
     assert reversals(commands[-100:]) == 0
 
 
-@pytest.mark.parametrize("control_hz", [10.0, 20.0])
-@pytest.mark.parametrize("machine", [NOMINAL, draw_machine(2)], ids=["nominal", "drawn"])
-def test_random_reversals_against_a_resisting_load_hold_the_power_over_two_seconds(
-        machine, control_hz):
-    schedule = np.random.default_rng(3).choice([-1.0, 1.0], size=(200, 4))
-    _, power = loaded_run(machine, lambda ctrl: -0.95 * np.sign(ctrl), lambda k: schedule[k],
-                          10.0, control_hz)
+RANDOM_SIGNS = np.random.default_rng(3).choice([-1.0, 1.0], size=(200, 4))
+
+
+@pytest.mark.parametrize("machine, control_hz, schedule, follows, bound", [
+    (NOMINAL, 10.0, lambda k: RANDOM_SIGNS[k], "command", 1.05),
+    (NOMINAL, 20.0, lambda k: RANDOM_SIGNS[k], "command", 1.05),
+    (draw_machine(2), 10.0, lambda k: RANDOM_SIGNS[k], "command", 1.05),
+    (draw_machine(2), 20.0, lambda k: RANDOM_SIGNS[k], "command", 1.05),
+    (NOMINAL, 10.0, lambda k: np.full(4, (-1.0) ** k), "speed", 1.04),
+], ids=["random-nominal-10", "random-nominal-20", "random-drawn-10", "random-drawn-20",
+        "all-flip-speed-load"])
+def test_reversals_against_a_resisting_load_hold_the_power_over_two_seconds(
+        machine, control_hz, schedule, follows, bound):
+    def loads(ctrl, speed):
+        return -0.95 * np.sign(ctrl if follows == "command" else speed)
+
+    _, power = loaded_run(machine, loads, schedule, 10.0, control_hz)
     window = round(2.0 / DT)
     averages = np.convolve(power[200:], np.ones(window) / window, mode="valid")
-    assert averages.max() <= 1.05 * machine.power
+    assert averages.max() <= bound * machine.power
     assert power[200:].mean() > 0.7 * machine.power
 
 
@@ -608,13 +619,18 @@ def episode(layer, index, machine, commands, others=None):
     return np.array(seen)
 
 
+@pytest.mark.parametrize("machine", [draw_machine(5), NOMINAL], ids=["drawn", "nominal"])
 @pytest.mark.parametrize("stray_steps", [0, 3])
-def test_an_episode_after_a_reset_repeats_a_fresh_layer_bit_for_bit(stray_steps):
-    machine = draw_machine(5)
+def test_an_episode_after_a_reset_repeats_a_fresh_layer_bit_for_bit(stray_steps, machine):
     commands = np.random.default_rng(4).uniform(-1.0, 1.0, size=(12, 4))
     fresh = episode(layer_for(machine), 0, machine, commands)
     layer = layer_for(machine)
     episode(layer, 0, machine, commands[::-1])
+    layer.act(np.ones((1, 4)))
+    for _ in range(round(2.0 / DT)):
+        layer.data.qfrc_applied[layer._qvel[0]] = -1.2 * machine.force_limit
+        layer.step()
+    assert layer._ratio[0] < 0.5
     for _ in range(stray_steps):
         layer.step()
     assert np.array_equal(episode(layer, 0, machine, commands), fresh)

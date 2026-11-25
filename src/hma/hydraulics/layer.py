@@ -296,7 +296,7 @@ class Hydraulics:
         speed *= np.minimum(1.0, self._flow / np.maximum(demand, 1e-12))[:, None]
         np.copysign(speed, spool, out=speed)
         power = np.maximum(self._force * speed, 0.0).sum(axis=1)
-        error = np.maximum(1.0 - self._ratio * power / self._power, -1.0)
+        error = 1.0 - self._ratio * power / self._power
         self._ratio = np.minimum(self._ratio + self._ratio_rate * error, 1.0)
         speed *= self._ratio[:, None]
         drive = speed * self.dt
