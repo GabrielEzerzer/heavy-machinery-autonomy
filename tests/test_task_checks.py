@@ -170,14 +170,16 @@ def test_a_stronger_model_never_raises_the_chart_rating(scene):
 
 
 def test_rated_capacity_from_the_model_tipping_side(scene):
-    result = rules(scene, spec_json(), StandIn(tipping=1000.0, hydraulic=1e6))
-    assert not result.passed and "75% of the model's 1000 kg tipping load" in result.reason
+    result = rules(scene, spec_json(), StandIn(tipping=1500.0, hydraulic=1e6))
+    assert not result.passed and "capacity of 725 kg" in result.reason
+    assert "75% of the model's 1500 kg tipping load" in result.reason
     assert rules(scene, spec_json(), StandIn(tipping=2000.0, hydraulic=1e6)).passed
 
 
 def test_rated_capacity_from_the_model_hydraulic_side(scene):
-    result = rules(scene, spec_json(), StandIn(tipping=1e6, hydraulic=900.0))
-    assert not result.passed and "87% of the model's 900 kg hydraulic" in result.reason
+    result = rules(scene, spec_json(), StandIn(tipping=1e6, hydraulic=1300.0))
+    assert not result.passed and "capacity of 731 kg" in result.reason
+    assert "87% of the model's 1300 kg hydraulic" in result.reason
     assert rules(scene, spec_json(), StandIn(tipping=1e6, hydraulic=2000.0)).passed
 
 
@@ -280,6 +282,12 @@ def test_overhead_keep_out_for_machine_bucket_and_load(scene, body):
     over_arm = Hazard("T", "test line", HazardKind.overhead, ((2.0, -0.2), (2.0, -0.6)), 0.5)
     result = rules(with_hazard(scene, over_arm), spec_json(), body)
     assert not result.passed and "test line" in result.reason
+    behind = Hazard("T", "pole", HazardKind.overhead, ((-3.0, 0.0),), 0.5)
+    result = rules(with_hazard(scene, behind), spec_json(), body)
+    assert not result.passed and "the machine comes within 0.4 m of the pole" in result.reason
+    raw = task_json(task_type="travel", marker_id="M2")
+    result = rules(with_hazard(scene, behind), raw, body)
+    assert not result.passed and "At (0.0, 0.0) the machine comes within" in result.reason
     shadow = Hazard("T", "pole", HazardKind.overhead, ((3.5, -2.1),), 0.5)
     result = rules(with_hazard(scene, shadow), spec_json(), body)
     assert not result.passed
@@ -372,6 +380,8 @@ def test_a_turn_is_checked_at_every_heading_it_passes(scene, body):
     assert "degrees across them; the limit for propping is 10" in result.reason
     plan = reached(scene, task_json(task_type="turn", marker_id="M6"), Everywhere(), body)
     assert check_path(plan, scene, Everywhere(), body).passed
+    plan = reached(along, task_json(task_type="turn", marker_id="M1"), Everywhere(), body)
+    assert check_path(plan, along, Everywhere(), body).passed
 
 
 def test_path_accepts_the_pallet_route_quickly(scene, arm, body):

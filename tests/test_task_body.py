@@ -15,6 +15,7 @@ def test_a_chart_radius_reads_that_column_at_every_height():
 
 def test_between_chart_radii_both_neighbours_count():
     assert side(rating_cells(5.0)) == 1850.0
+    assert {c.radius_m for c in rating_cells(5.0)} == {4.5, 5.43, 6.0}
     assert side(rating_cells(6.6)) == 1530.0
 
 
