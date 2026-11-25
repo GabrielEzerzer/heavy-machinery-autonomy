@@ -1,6 +1,6 @@
 """Scenes of 12 t class excavators, each on its own ground of (y, x) heights; names start with
-machine_prefix(i). ctrl is a joint speed in rad/s, sent through a "<joint>_valve" joint: read
-joints by name; actuator_force is not joint load. set_weld(off) leaves track contacts on."""
+machine_prefix(i). ctrl is the torque on each driven joint in N m, which hma.hydraulics computes
+from the oil pressures; set_weld(off) leaves track contacts on."""
 
 from __future__ import annotations
 
@@ -29,12 +29,7 @@ HOME_POSE = (0.0, -0.6, 1.9, 0.6)
 
 LINK_MASSES = {"base": 4500.0, "upper": 5580.0, "boom": 1220.0, "arm": 600.0, "bucket": 400.0}
 COUNTERWEIGHT_MASS = 2450.0
-FORCE_CAPS = {"swing": 34.0e3, "boom": 330.0e3, "arm": 244.0e3, "bucket": 122.0e3}
-SPEED_LIMITS = {"swing": 1.0, "boom": 0.6, "arm": 0.8, "bucket": 1.2}
-VALVE = "_valve"
-VALVE_INERTIA = 1.0e8
-VALVE_GAIN = 5.0e9
-VALVE_SOLIMP = (0.999, 0.9999, 0.001)
+END_STOP_SOLIMP = (0.999, 0.9999, 0.001)
 
 GROUND_CELL = 0.1
 GROUND_HALF = 13.5
@@ -75,19 +70,10 @@ NOMINAL_LEG_ANGLE = 0.5236
 LOAD_HOME = (7.0, 0.0)
 LOAD_POINTS = "load_point_"
 LOAD_POINT_RADIUS = 0.05
-FRICTION_TENDON = int(mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON)
 
 
 def machine_prefix(index: int) -> str:
     return f"m{index}/"
-
-
-def tendon_friction(data: mujoco.MjData, tendons: np.ndarray) -> np.ndarray:
-    tendons = np.asarray(tendons, np.intp)
-    rows = data.efc_type == FRICTION_TENDON
-    forces = np.bincount(data.efc_id[rows], weights=data.efc_force[rows],
-                         minlength=int(tendons.max(initial=-1)) + 1)
-    return forces[tendons]
 
 
 def ground_shape() -> tuple[int, int]:
@@ -120,19 +106,11 @@ def _machine_spec(index: int) -> mujoco.MjSpec:
         joint = spec.joint(name)
         _turn_reference_to_home(joint, home)
         joint.solref_limit = [2 * TIMESTEP, 1.0]
-        joint.solimp_limit = [*VALVE_SOLIMP, 0.5, 2.0]
-        valve = spec.worldbody.add_body(name=name + VALVE, mass=1.0, inertia=[1.0, 1.0, 1.0],
-                                        explicitinertial=True)
-        valve.add_joint(name=name + VALVE, axis=[0.0, 0.0, 1.0], armature=VALVE_INERTIA)
-        tendon = spec.add_tendon(name=name + VALVE, frictionloss=FORCE_CAPS[name],
-                                 solref_friction=[2 * TIMESTEP, 1.0],
-                                 solimp_friction=[*VALVE_SOLIMP, 0.5, 2.0])
-        tendon.wrap_joint(name, 1.0)
-        tendon.wrap_joint(name + VALVE, -1.0)
-        act = spec.add_actuator(name=name, target=name + VALVE, trntype=mujoco.mjtTrn.mjTRN_JOINT)
-        act.set_to_velocity(kv=VALVE_GAIN)
-        act.ctrllimited = mujoco.mjtLimited.mjLIMITED_TRUE
-        act.ctrlrange = [-SPEED_LIMITS[name], SPEED_LIMITS[name]]
+        joint.solimp_limit = [*END_STOP_SOLIMP, 0.5, 2.0]
+        joint.solref_friction = [2 * TIMESTEP, 1.0]
+        joint.solimp_friction = [*END_STOP_SOLIMP, 0.5, 2.0]
+        act = spec.add_actuator(name=name, target=name, trntype=mujoco.mjtTrn.mjTRN_JOINT)
+        act.set_to_motor()
     add_collision_geoms(spec, 1 << index, CONTACT_SOLREF, CONTACT_SOLIMP, STEEL_FRICTION,
                         CONTACT_MARGIN)
     spec.body("bucket").add_site(name=HOOK, pos=list(HOOK_POS), size=[0.04],

@@ -15,6 +15,7 @@ import mujoco
 import numpy as np
 
 MASS = 2000.0
+PROP = 0.6
 POSES = {"standing": (0.0, -0.6, 1.9, 0.6), "propping": (0.0, -0.5, 1.6, 1.0),
          "carrying": (0.0, -1.0, 1.6, 2.3)}
 SCENES = [(n, case) for n in (1, 8) for case in POSES]
@@ -42,7 +43,7 @@ def measure(n: int, case: str, seconds: float, warmup: float) -> tuple[float, in
 
     def decide() -> None:
         if case == "propping":
-            commands[:, 1] = 1.0 / 3.0
+            commands[:, 1] = PROP
         else:
             commands[:, 0] = rng.uniform(-1.0, 1.0, n)
         layer.act(commands)

@@ -4,18 +4,17 @@ import mujoco
 import numpy as np
 import pytest
 
+from hma.hydraulics import NOMINAL, circuit
+from hma.hydraulics.layer import DISPLACEMENT
 from hma.machine import (
-    FORCE_CAPS,
     HOME_KEY,
     JOINT_LIMITS,
     JOINT_NAMES,
-    SPEED_LIMITS,
     TIP_SITE,
     ground_axes,
     ground_shape,
     load_scene,
     machine_prefix,
-    tendon_friction,
     write_ground,
 )
 from hma.machine.collision import LINK_MESH, PIECES, link_triangles
@@ -45,16 +44,18 @@ from hma.machine.model import (
     RING,
     RING_MASS,
     TRACK_FEET,
-    VALVE,
     ground_geoms,
     ring_at_load,
 )
 from hma.machine.render import PARTS
+from scenes import held, lock_joints
 
 P = machine_prefix(0)
 G = 9.81
 GRAVITY_BODIES = ("boom", "arm", "bucket")
 F6 = np.zeros(6)
+LOWER = 0.3
+SERVO_GAIN = 1e8
 
 
 def home(n=1, weld=False):
@@ -71,19 +72,35 @@ def pose(model, data, angles, index=0):
     mujoco.mj_forward(model, data)
 
 
-def command(model, data, name, speed, index=0):
-    data.ctrl[model.actuator(machine_prefix(index) + name).id] = speed
+def command(model, data, name, value, index=0):
+    layer = held(model, data)
+    u = layer._held.copy()
+    u[index, JOINT_NAMES.index(name)] = value
+    layer.act(u)
 
 
 def run(model, data, seconds, each=None):
+    layer = held(model, data)
     for _ in range(round(seconds / model.opt.timestep)):
-        mujoco.mj_step(model, data)
+        layer.step()
         if each is not None:
             each()
 
 
-def valve_load(model, data, name):
-    return float(tendon_friction(data, [model.tendon(P + name + VALVE).id])[0])
+def oil_torque(model, data, name, index=0):
+    layer = held(model, data)
+    _, lever = circuit.geometry(data.qpos[layer._qpos])
+    force = -(layer._pressure @ DISPLACEMENT) * layer._torque_scale
+    return float((force * lever)[index, JOINT_NAMES.index(name)])
+
+
+def at_relief(model, data, index=0):
+    return held(model, data).pump_pressures()[index].max() > NOMINAL.main_relief
+
+
+def below_port_relief(model, data, name, index=0):
+    chambers = held(model, data).chamber_pressures()[index, JOINT_NAMES.index(name)]
+    return bool(np.all(chambers < 0.99 * NOMINAL.port_relief[JOINT_NAMES.index(name)]))
 
 
 def body_contacts(model, data, body):
@@ -119,9 +136,11 @@ def pivot_x(model, data, joint):
     return float(data.xanchor[model.joint(P + joint).id][0])
 
 
-def lower_onto_ground(model, data, speed=0.1, seconds=6.0):
-    command(model, data, "boom", speed)
+def lower_onto_ground(model, data, value=LOWER, seconds=6.0):
+    command(model, data, "boom", value)
     run(model, data, seconds)
+    command(model, data, "boom", 1.0)
+    run(model, data, 1.5)
 
 
 def test_pressed_bucket_ground_reaction_matches_statics_at_the_boom_cap():
@@ -132,17 +151,17 @@ def test_pressed_bucket_ground_reaction_matches_statics_at_the_boom_cap():
     run(model, data, 1.0)
     force, centre = resultant(body_contacts(model, data, "bucket"))
     xp = pivot_x(model, data, "boom")
-    tau = abs(valve_load(model, data, "boom"))
-    assert tau == pytest.approx(FORCE_CAPS["boom"], rel=1e-3)
+    tau = abs(oil_torque(model, data, "boom"))
+    assert at_relief(model, data)
     for joint in ("arm", "bucket"):
-        assert abs(valve_load(model, data, joint)) < 0.99 * FORCE_CAPS[joint]
+        assert below_port_relief(model, data, joint)
     hand = (tau + gravity_moment(model, data, GRAVITY_BODIES, xp)) / (centre[0] - xp)
     assert force[2] == pytest.approx(hand, rel=0.01)
 
 
 def test_propped_machine_bucket_reaction_matches_statics():
     model, data = home()
-    lower_onto_ground(model, data, 0.1, 4.0)
+    lower_onto_ground(model, data, LOWER, 4.0)
     command(model, data, "boom", 0.0)
     run(model, data, 3.0)
     base = model.body(P + "base").id
@@ -156,39 +175,61 @@ def test_propped_machine_bucket_reaction_matches_statics():
     assert bucket[2] + tracks[2] == pytest.approx(weight[1], rel=0.01)
 
 
-def pressed_by_cap(model, data, newtons, mu):
+def rigid(model, data, seconds, each=None):
+    for _ in range(round(seconds / model.opt.timestep)):
+        mujoco.mj_step(model, data)
+        if each is not None:
+            each()
+
+
+def servo(model, data, name, speed):
+    act = model.actuator(P + name).id
+    model.actuator_gainprm[act, 0] = SERVO_GAIN
+    model.actuator_biastype[act] = mujoco.mjtBias.mjBIAS_AFFINE
+    model.actuator_biasprm[act, :3] = [0.0, 0.0, -SERVO_GAIN]
+    data.ctrl[act] = speed
+
+
+def press(model, data, newtons, lever):
+    xp = pivot_x(model, data, "boom")
+    hold = gravity_moment(model, data, GRAVITY_BODIES, xp) - newtons * lever
+    data.ctrl[model.actuator(P + "boom").id] = -hold
+    return xp, hold
+
+
+def pressed_by_torque(model, data, newtons, mu):
     set_friction(model, 0, mu)
     pose(model, data, (0.0, -0.5, 1.6, 1.0))
-    lower_onto_ground(model, data, 0.1, 3.0)
-    command(model, data, "boom", 0.0)
-    run(model, data, 0.5)
+    lock_joints(model, data, names=("arm", "bucket"))
+    servo(model, data, "swing", 0.0)
+    tip = data.site_xpos[model.site(P + TIP_SITE).id]
+    press(model, data, newtons, tip[0] - pivot_x(model, data, "boom"))
+    rigid(model, data, 2.0)
     _, centre = resultant(body_contacts(model, data, "bucket"))
-    xp = pivot_x(model, data, "boom")
-    lever = centre[0] - xp
-    cap = gravity_moment(model, data, GRAVITY_BODIES, xp) - newtons * lever
-    model.tendon_frictionloss[model.tendon(P + "boom" + VALVE).id] = cap
-    command(model, data, "boom", -0.02)
-    run(model, data, 1.0)
-    return (gravity_moment(model, data, GRAVITY_BODIES, xp) - cap) / lever
+    xp, hold = press(model, data, newtons, centre[0] - pivot_x(model, data, "boom"))
+    rigid(model, data, 1.0)
+    _, centre = resultant(body_contacts(model, data, "bucket"))
+    return (gravity_moment(model, data, GRAVITY_BODIES, xp) - hold) / (centre[0] - xp)
 
 
 def drag(model, data, joint, speed, seconds):
-    command(model, data, joint, speed)
+    servo(model, data, joint, speed)
+    act = model.actuator(P + joint).id
     samples = []
 
     def sample():
         f, c = resultant(body_contacts(model, data, "bucket"))
-        samples.append((f[2], math.hypot(f[0], f[1]), abs(valve_load(model, data, "swing")),
+        samples.append((f[2], math.hypot(f[0], f[1]), abs(data.actuator_force[act]),
                         math.hypot(*c[:2])))
 
-    run(model, data, seconds, sample)
+    rigid(model, data, seconds, sample)
     return np.array(samples[len(samples) // 4:])
 
 
 def test_dragged_bucket_slides_at_the_friction_force():
     model, data = home(weld=True)
     mu = 0.4
-    normal = pressed_by_cap(model, data, 8000.0, mu)
+    normal = pressed_by_torque(model, data, 8000.0, mu)
     s = drag(model, data, "swing", 0.02, 4.0)
     radius = s[s[:, 0] > 0, 3].mean()
     assert s[:, 0].mean() == pytest.approx(normal, rel=0.10)
@@ -201,6 +242,14 @@ def hung(mass, angles=(0.0, -1.0, 1.6, 2.3)):
     apply_load(model, 0, block(mass), mujoco.MjData(model))
     pose(model, data, angles)
     hang_load(model, data, 0)
+    return model, data
+
+
+def hung_on_servos(mass):
+    model, data = hung(mass)
+    for joint in JOINT_NAMES:
+        servo(model, data, joint, 0.0)
+    rigid(model, data, 3.0)
     return model, data
 
 
@@ -228,8 +277,7 @@ def test_hanging_load_swings_at_the_compound_pendulum_period():
 
 
 def test_joint_loads_with_a_hanging_load_match_statics():
-    model, data = hung(3000.0)
-    run(model, data, 3.0)
+    model, data = hung_on_servos(3000.0)
     hook = data.site_xpos[model.site(P + "hook").id]
     weight = (model.body_mass[model.body(P + "load").id] + RING_MASS) * G
     block_weight = model.body_mass[model.body(P + "load").id] * G
@@ -239,14 +287,13 @@ def test_joint_loads_with_a_hanging_load_match_statics():
     for joint, bodies in chain.items():
         x = pivot_x(model, data, joint)
         hand = gravity_moment(model, data, bodies, x) + weight * (hook[0] - x)
-        sim = valve_load(model, data, joint)
+        sim = data.actuator_force[model.actuator(P + joint).id]
         assert abs(sim) == pytest.approx(abs(hand), rel=0.01)
 
 
 
 def test_sling_readings_match_statics_and_a_snatch_reads_over_the_rating():
-    model, data = hung(5000.0)
-    run(model, data, 3.0)
+    model, data = hung_on_servos(5000.0)
     block_weight = model.body_mass[model.body(P + "load").id] * G
     legs = leg_tensions(model, data, 0)
     assert legs == pytest.approx(block_weight / 4 / math.cos(math.radians(30.0)), rel=0.01)
@@ -256,8 +303,8 @@ def test_sling_readings_match_statics_and_a_snatch_reads_over_the_rating():
     r0 = model.jnt_dofadr[model.joint(P + RING + "_x").id]
     data.qvel[[v0 + 2, r0 + 2]] = -3.0
     peaks = []
-    run(model, data, 1.0, lambda: peaks.append((leg_tensions(model, data, 0).max(),
-                                                hook_force(model, data, 0))))
+    rigid(model, data, 1.0, lambda: peaks.append((leg_tensions(model, data, 0).max(),
+                                                  hook_force(model, data, 0))))
     leg, hook = np.max(peaks, axis=0)
     assert leg > LEG_WLL and hook > SLING_WLL
     assert np.linalg.norm(data.qvel[v0:v0 + 3]) < 0.5
@@ -300,12 +347,12 @@ def test_bucket_swung_over_the_track_corner_stops_on_it():
     model, data = home(weld=True)
     write_ground(model, 0, np.full(ground_shape(), -5.0))
     pose(model, data, np.radians((45.0, -3.5, 100.0, 40.3)))
-    command(model, data, "arm", SPEED_LIMITS["arm"])
+    command(model, data, "arm", 1.0)
     worst = [0.0]
     run(model, data, 4.0, lambda: worst.append(deepest(model, data)))
     arm = data.qpos[model.joint(P + "arm").qposadr[0]]
     assert arm < JOINT_LIMITS["arm"][1] - 0.1
-    assert abs(valve_load(model, data, "arm")) == pytest.approx(FORCE_CAPS["arm"], rel=1e-3)
+    assert at_relief(model, data)
     touching = {(model.body(model.geom_bodyid[c.geom1]).name,
                  model.body(model.geom_bodyid[c.geom2]).name) for c in data.contact[:data.ncon]}
     assert (P + "base", P + "bucket") in touching
@@ -318,15 +365,15 @@ def test_driving_every_joint_end_to_end_passes_nothing_through_anything(swing):
     pose(model, data, (math.radians(swing), -0.6, 1.9, 0.6))
     periods = {"swing": 7.0, "boom": 5.0, "arm": 3.0, "bucket": 2.0}
     tip = model.site(P + TIP_SITE).id
+    layer = held(model, data)
     worst, fastest, velocity = 0.0, 0.0, np.zeros(6)
     for k in range(round(15.0 / model.opt.timestep)):
         t = k * model.opt.timestep
-        for joint, period in periods.items():
-            command(model, data, joint, math.copysign(SPEED_LIMITS[joint],
-                                                      math.sin(2 * math.pi * t / period)))
+        layer.act(np.array([[math.copysign(1.0, math.sin(2 * math.pi * t / period))
+                             for period in periods.values()]]))
         mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_SITE, tip, velocity, 0)
         fastest = max(fastest, np.linalg.norm(velocity[3:]))
-        mujoco.mj_step(model, data)
+        layer.step()
         worst = min(worst, deepest(model, data))
     assert -worst <= fastest * CONTACT_SOLREF[0] / math.e
 
@@ -351,11 +398,12 @@ def test_each_front_link_lowered_onto_raised_ground_rests_on_it(link, start, edg
     heights[:, xs >= edges[1]] = -5.0
     write_ground(model, 0, heights)
     pose(model, data, start)
-    command(model, data, "boom", 0.15)
-    run(model, data, 8.0)
-    touching = ground_contacts(model, data, link)
-    assert touching and min(c.dist for c in touching) > -0.002
-    assert abs(valve_load(model, data, "boom")) == pytest.approx(FORCE_CAPS["boom"], rel=1e-3)
+    lower_onto_ground(model, data, LOWER, 8.0)
+    touching = []
+    run(model, data, 1.0, lambda: touching.append(ground_contacts(model, data, link)))
+    assert np.mean([bool(c) for c in touching]) > 0.9
+    assert min(c.dist for step in touching for c in step) > -0.002
+    assert at_relief(model, data)
 
 
 def test_ridge_higher_than_the_ground_clearance_high_centres_the_belly():
@@ -385,7 +433,7 @@ def test_swung_counterweight_stops_against_a_mound_beside_the_tracks():
     heights[np.ix_(np.abs(ys) > 1.85, np.abs(xs) < 1.0)] = 1.2
     write_ground(model, 0, heights)
     pose(model, data, (0.0, -0.8, 1.2, 1.0))
-    command(model, data, "swing", 0.6)
+    command(model, data, "swing", 1.0)
     run(model, data, 4.0)
     swing = data.qpos[model.joint(P + "swing").qposadr[0]]
     assert swing < math.radians(45.0)
@@ -394,7 +442,7 @@ def test_swung_counterweight_stops_against_a_mound_beside_the_tracks():
     touching = [c for c in data.contact[:data.ncon]
                 if rear in (c.geom1, c.geom2) and {c.geom1, c.geom2} & ground]
     assert touching and min(c.dist for c in touching) > -0.002
-    assert abs(valve_load(model, data, "swing")) == pytest.approx(FORCE_CAPS["swing"], rel=1e-3)
+    assert at_relief(model, data)
 
 
 def surface_drag(slope_deg, speed, mu=0.4):
@@ -403,8 +451,8 @@ def surface_drag(slope_deg, speed, mu=0.4):
     rise = math.tan(math.radians(slope_deg))
     write_ground(model, 0, np.zeros(ground_shape()) + rise * (xs[None, :] - 5.0))
     up = np.array([-rise, 0.0, 1.0]) / math.hypot(rise, 1.0)
-    pressed_by_cap(model, data, 8000.0, mu)
-    command(model, data, "swing", speed)
+    pressed_by_torque(model, data, 8000.0, mu)
+    servo(model, data, "swing", speed)
     bucket = model.body(P + "bucket").id
     sums = np.zeros(3)
 
@@ -417,8 +465,8 @@ def surface_drag(slope_deg, speed, mu=0.4):
                 tilted = abs(c.frame[:3] @ up) < math.cos(math.radians(5.0))
                 sums[:] += (abs(normal), np.linalg.norm(force - normal * up), tilted * F6[0])
 
-    run(model, data, 1.0)
-    run(model, data, 3.0, sample)
+    rigid(model, data, 1.0)
+    rigid(model, data, 3.0, sample)
     return sums[1] / sums[0], sums[2] / sums[0]
 
 
@@ -432,13 +480,14 @@ def test_slow_drag_slides_at_mu_on_flat_and_sloped_ground(slope):
 def test_bucket_driven_down_at_full_speed_stops_at_the_surface():
     model, data = home(weld=True)
     pose(model, data, (0.8, -1.0, 1.0, 0.3))
-    command(model, data, "boom", SPEED_LIMITS["boom"])
+    command(model, data, "boom", 1.0)
+    layer = held(model, data)
     tip = model.site(P + TIP_SITE).id
     worst, fastest, velocity = 0.0, 0.0, np.zeros(6)
     for _ in range(round(4.0 / model.opt.timestep)):
         mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_SITE, tip, velocity, 0)
         fastest = max(fastest, np.linalg.norm(velocity[3:]))
-        mujoco.mj_step(model, data)
+        layer.step()
         worst = min(worst, deepest(model, data))
     assert -worst <= fastest * CONTACT_SOLREF[0] / math.e
     assert ground_contacts(model, data, "bucket")
@@ -517,6 +566,7 @@ def test_pressed_load_neither_sinks_nor_bounces_back_nor_creeps():
 
 
 LIFT_POSE = (0.0, -0.6, 1.6, 2.3)
+FEATHER = -0.7
 
 
 def lift_cycle(model, data, index=0, mass=2000.0):
@@ -543,15 +593,16 @@ def test_load_is_lifted_carried_swung_and_set_down_on_its_sling(weld):
     load, _, phase = lift_cycle(model, data)
     body = model.body(P + LOAD).id
     start = data.xpos[body].copy()
-    phase("boom", -0.2, 3.0)
-    assert data.xpos[body][2] - start[2] > 2.0
-    assert sling_tension(model, data, 0) == pytest.approx(
-        load.mass * G / math.cos(load.leg_angle), rel=0.01)
-    phase("swing", 0.5, math.pi / 4 / 0.5)
-    phase("boom", 0.2, 4.0)
+    phase("boom", FEATHER, 3.0)
+    assert data.xpos[body][2] - start[2] > 1.5
+    tension = []
+    run(model, data, 3.0, lambda: tension.append(sling_tension(model, data, 0)))
+    assert np.mean(tension) == pytest.approx(load.mass * G / math.cos(load.leg_angle), rel=0.01)
+    phase("swing", 1.0, 2.0)
+    phase("boom", LOWER, 5.0)
     assert sling_tension(model, data, 0) < 1.0
     unhook_load(model, data, 0)
-    phase("boom", -0.2, 2.0)
+    phase("boom", FEATHER, 2.0)
     moved = data.xpos[body] - start
     assert math.hypot(moved[0], moved[1]) > 6.0
     assert data.xpos[body][2] == pytest.approx(load.half[2] + CONTACT_MARGIN, abs=1e-5)
@@ -564,7 +615,7 @@ def test_same_draws_repeat_bit_for_bit():
         model, data = home(weld=True)
         apply_load(model, 0, draw_load(5), mujoco.MjData(model))
         mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
-        pressed_by_cap(model, data, 8000.0, draw_friction(5))
+        pressed_by_torque(model, data, 8000.0, draw_friction(5))
         runs.append(drag(model, data, "swing", 0.05, 2.0))
         runs.append(data.qpos.copy())
     np.testing.assert_array_equal(runs[0], runs[2])
@@ -614,13 +665,13 @@ def test_only_contact_shapes_collide_and_drawn_parts_are_no_geom():
 def test_one_machine_working_in_contact_does_not_change_its_neighbour(weld):
     alone, data = home(1, weld=weld)
     _, solo, phase = lift_cycle(alone, data)
-    phase("boom", -0.2, 3.0)
+    phase("boom", FEATHER, 3.0)
     pair, data = home(2, weld=weld)
     pose(pair, data, (0.0, -0.5, 1.6, 1.0))
-    command(pair, data, "boom", 0.1)
-    command(pair, data, "swing", 0.1)
     _, shared, phase = lift_cycle(pair, data, index=1)
-    phase("boom", -0.2, 3.0)
+    command(pair, data, "boom", LOWER)
+    command(pair, data, "swing", LOWER)
+    phase("boom", FEATHER, 3.0)
     touched = []
     run(pair, data, 0.1, lambda: touched.append(bool(ground_contacts(pair, data, "bucket"))))
     assert any(touched)
