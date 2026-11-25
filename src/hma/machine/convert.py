@@ -38,10 +38,8 @@ CYLINDERS = {
     "arm": ("zx120-arm-cyl1.dae", "zx120-arm-cyl2.dae"),
     "bucket": ("zx120-bucket-cyl1.dae", "zx120-bucket-cyl2.dae"),
 }
-LINKAGE = {
-    "side_link": ("zx120-p1.dae", (0.0, 0.0), (0.254, -0.422)),
-    "bucket_link": ("zx120-p2.dae", (0.0042, 0.0054), (0.4204, 0.2191)),
-}
+LINKAGE = {"side_link": ("zx120-p1.dae", (0.25, -0.42), 0.0455),
+           "bucket_link": ("zx120-p2.dae", (0.41, 0.23), 0.065)}
 TEXTURE = "zx120.png"
 TEXTURE_SIZE = 1024
 PAINT = {"specular": "0.3", "shininess": "0.35"}
@@ -195,12 +193,39 @@ def cylinder_parts(meshes_dir: Path) -> dict[str, Mesh]:
     return out
 
 
+def fit_ring(points: np.ndarray, seed: np.ndarray, radius: float,
+             window: float = 0.25) -> np.ndarray:
+    xz = np.unique(np.round(points[:, [0, 2]], 4), axis=0)
+    xz = xz[np.linalg.norm(xz - seed, axis=1) < window]
+    best, rng = None, np.random.default_rng(0)
+    for _ in range(4000):
+        a, b, c = xz[rng.choice(len(xz), 3, replace=False)]
+        m = 2 * np.array([b - a, c - a])
+        if abs(np.linalg.det(m)) < 1e-9:
+            continue
+        centre = np.linalg.solve(m, [b @ b - a @ a, c @ c - a @ a])
+        r = np.linalg.norm(a - centre)
+        if abs(r - radius) > 0.02:
+            continue
+        inliers = np.abs(np.linalg.norm(xz - centre, axis=1) - r) < 0.002
+        if best is None or inliers.sum() > best.sum():
+            best = inliers
+    ring = xz[best]
+    sol = np.linalg.lstsq(np.c_[2 * ring, np.ones(len(ring))], (ring**2).sum(1), rcond=None)[0]
+    return sol[:2]
+
+
+def link_holes(verts: np.ndarray, seed: tuple[float, float], radius: float) -> list[np.ndarray]:
+    return [fit_ring(verts, np.array(at), radius, 0.12) for at in ((0.0, 0.0), seed)]
+
+
 def linkage_parts(meshes_dir: Path) -> dict[str, Mesh]:
     out = {}
-    for name, (filename, a, b) in LINKAGE.items():
-        a, b = np.array(a), np.array(b)
+    for name, (filename, seed, radius) in LINKAGE.items():
+        mesh = read_dae(meshes_dir / filename)
+        a, b = link_holes(mesh.verts, seed, radius)
         rot = axis_frame(b - a, np.array([1.0, 0.0, 0.0]))
-        out[name] = read_dae(meshes_dir / filename).transformed(rot, -rot @ [a[0], 0.0, a[1]])
+        out[name] = mesh.transformed(rot, -rot @ [a[0], 0.0, a[1]])
     return out
 
 

@@ -20,8 +20,10 @@ Changes made to the source:
   material for the cylinder rods, are added.
 - The boom, arm and bucket cylinder meshes (zx120-*-cyl1.dae barrels, zx120-*-cyl2.dae rods)
   and the bucket linkage meshes (zx120-p1.dae side link, zx120-p2.dae H-link) were converted to
-  OBJ and moved so that one pin sits at the origin with the line to the other pin along an
-  axis. They are drawn only, posed from the joint angles on the pins in
+  OBJ and turned so the cylinder axis, or the line between a link's two pin holes, lies along
+  an axis. Each barrel was moved so its base pin sits at the origin, each rod so the far end of
+  the rod does, and each link so one pin hole does. They are drawn only, posed from the joint
+  angles on the pins in
   hma/machine/cylinders.py, and take no part in the simulation.
 - The URDF was converted to MuJoCo MJCF. Joint origins, axes and the boom, arm and bucket
   limits are taken unchanged from zx120.urdf; the bucket tip site comes from bucket_end_joint.

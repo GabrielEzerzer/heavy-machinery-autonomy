@@ -6,6 +6,7 @@ import subprocess
 import numpy as np
 
 from hma.machine import pins
+from hma.machine.convert import LINKAGE
 
 TURN_RPY = (0.0, 0.0, np.pi / 2)
 TURN = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
@@ -65,7 +66,7 @@ def _checkout(root):
     xacro.write_text(f'<robot xmlns:xacro="http://ros.org/wiki/xacro">{joints}</robot>')
     for _, mesh, _, radius in pins.MESH_BOSSES.values():
         _write_dae(desc / "meshes" / mesh, [_ring(BOSS_CENTRE[mesh], radius)])
-    for mesh, _, radius in pins.LINK_MESHES.values():
+    for mesh, _, radius in LINKAGE.values():
         rings = [_ring((0.0, 0.0), radius), _ring(LINK_END[mesh], radius)]
         _write_dae(desc / "meshes" / mesh, rings)
     git = ["git", "-C", str(root), "-c", "user.name=test", "-c", "user.email=test@example.com"]
@@ -87,6 +88,6 @@ def test_pins_command_reads_a_checkout(tmp_path, monkeypatch, capsys):
     for name, (_, mesh, _, _) in pins.MESH_BOSSES.items():
         x, z = BOSS_CENTRE[mesh]
         np.testing.assert_allclose(found[name][1], TURN @ (x, 0.0, z), atol=1e-4)
-    for name, (mesh, _, _) in pins.LINK_MESHES.items():
+    for name, (mesh, _, _) in LINKAGE.items():
         np.testing.assert_allclose(lengths[name], np.hypot(*LINK_END[mesh]), atol=1e-6)
-        assert f"{name} link length {lengths[name]:.4f} m" in out
+        assert f"{name} length {lengths[name]:.4f} m" in out
