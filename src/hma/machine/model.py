@@ -44,7 +44,7 @@ MACHINE_SPACING = 14.0
 MAX_MACHINES = 31
 
 TIMESTEP = 0.005
-SOLVER_TOLERANCE = 1e-10
+SOLVER_TOLERANCE = 1e-12
 
 
 def machine_prefix(index: int) -> str:
