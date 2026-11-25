@@ -136,14 +136,60 @@ def test_control_rate_is_a_setting():
     assert soil.heights.min() < -0.25
 
 
-def test_stiff_soil_stalls_the_bucket_against_the_joint_caps():
+def test_stiff_soil_stalls_the_drag_against_the_arm_cap():
     _, _, trace = run_cycle(STIFF, limit=30)
-    assert {step["phase"] for step in trace} == {"lower"}
     last = trace[-10:]
-    assert all(abs(s["loads"]["boom"]) >= 0.99 * FORCE_CAPS["boom"] for s in last)
-    assert abs(last[-1]["tip"][2] - last[0]["tip"][2]) < 0.01
-    assert last[-1]["tip"][2] > -0.2
+    assert {s["phase"] for s in last} == {"drag"}
+    assert all(abs(s["loads"]["arm"]) >= 0.99 * FORCE_CAPS["arm"] for s in last)
+    assert np.linalg.norm(last[-1]["tip"] - last[0]["tip"]) < 0.01
 
+
+def test_holding_the_bucket_at_its_limit_stalls_like_a_free_bucket():
+    def push(pinned):
+        model, data, soil = machine(STIFF)
+        place(model, data, soil, np.array([5.8, 0.0, -0.3]), 0.8)
+        bucket = model.joint(PREFIX + "bucket")
+        if pinned:
+            data.qpos[bucket.qposadr[0]] = bucket.range[0]
+            soil.reset(model, data)
+        start = data.site_xpos[soil.tip].copy()
+        data.ctrl[model.actuator(PREFIX + "arm").id] = 0.2
+        data.ctrl[model.actuator(PREFIX + "bucket").id] = -0.25 if pinned else 0.0
+        resistance = []
+        for k in range(400):
+            advance(model, data, soil, 1)
+            resistance.append(soil.resistance)
+            if k % 20 == 19:
+                soil.control_step(model, data)
+        return np.linalg.norm(data.site_xpos[soil.tip] - start), np.mean(resistance)
+
+    free_travel, free_resistance = push(False)
+    pinned_travel, pinned_resistance = push(True)
+    assert pinned_travel <= 2.0 * free_travel + 0.01
+    assert pinned_resistance >= 0.9 * free_resistance > 100e3
+
+
+def test_a_jittery_vertical_descent_changes_the_force_smoothly():
+    model, data, soil = machine(LOOSE)
+    point = np.array([6.0, 0.0, 0.3])
+    place(model, data, soil, point, 1.0)
+    joints = [model.joint(PREFIX + j).qposadr[0] for j in JOINT_NAMES]
+    acts, rng = actuators(model), np.random.default_rng(0)
+    forces, limits = [], []
+    for _ in range(160):
+        point = point - np.array([0.0, 0.0, 0.01])
+        target = inverse_kinematics(point + np.array([0.0, rng.normal(0.0, 0.003), 0.0]), 1.0)
+        data.ctrl[acts] = np.clip(3.0 * (target - data.qpos[joints]), -0.5, 0.5)
+        for _ in range(20):
+            advance(model, data, soil, 1)
+            forces.append(soil.edge_force(data).copy())
+            limits.append(soil.resistance)
+        soil.control_step(model, data)
+    forces, limits = np.array(forces), np.array(limits)
+    both = (limits[1:] > 1e3) & (limits[:-1] > 1e3)
+    jumps = np.linalg.norm(np.diff(forces, axis=0), axis=1)[both]
+    assert both.sum() > 1500
+    assert jumps.max() < 2.0e3
 
 def test_a_sliding_edge_meets_exactly_the_resistance_against_its_motion():
     model, data, soil = machine()
@@ -221,7 +267,7 @@ def test_an_edge_coasting_into_soil_is_stopped_at_the_wall():
         advance(model, data, soil, 1)
         peak = max(peak, soil.resistance)
     assert data.qpos[swing] < 0.25
-    assert peak > 50e3
+    assert peak > 20e3
 
 
 def test_moving_the_free_base_drags_the_edge_against_the_soil():

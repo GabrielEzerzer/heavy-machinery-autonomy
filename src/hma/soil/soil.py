@@ -31,10 +31,11 @@ BUCKET_CAPACITY = 0.45
 DUMP_ANGLE = math.pi / 4
 EDGE_SAMPLES = 7
 STEER_SPEED = 0.001
-PREDICTIONS = 4
+PREDICTIONS = 5
 SLIP_MARGIN = 0.01
 SLIP_COS = 0.99
 TRAVEL_BLEND = 0.1
+BACK_ONSET = 0.5
 SPILL_AHEAD = 2.0
 SETTLE_PASSES = 10
 ANCHOR_DISTANCE = 1000.0
@@ -104,6 +105,7 @@ class Soil:
         self.direction = np.zeros(3)
         self._edge = ([0.0] * 3, [0.0] * 3)
         self._base_pose: list[float] | None = None
+        self._side = (0.0, 0.0, 0.0)
 
     def reset(self, model: mujoco.MjModel, data: mujoco.MjData,
               heights: np.ndarray | None = None) -> None:
@@ -116,6 +118,7 @@ class Soil:
         mujoco.mj_forward(model, data)
         self._edge = data.site_xpos[self.edges].tolist()
         self._base_pose = None
+        self._side = (0.0, 0.0, 0.0)
         self._protect(data)
         self._set_resistance(model, data, 0.0, (0.0, 0.0, 0.0))
         data.xfrc_applied[self.bucket] = 0.0
@@ -145,20 +148,32 @@ class Soil:
         lip = (frame[2], frame[5], frame[8])
         span = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
         travel = self._travel(span)
+        r = data.xmat[self.bucket].tolist()
+        m = self.mouth
+        mouth = tuple(r[3 * i] * m[0] + r[3 * i + 1] * m[1] + r[3 * i + 2] * m[2] for i in range(3))
+        if travel[0] * mouth[0] + travel[1] * mouth[1] < 0.0:
+            travel = (-travel[0], -travel[1], 0.0)
         force, direction, in_soil = 0.0, (0.0, 0.0, 0.0), False
         if self.grid.clearance(self.heights, (p, q, a, b), GROUND_REACH) <= 0.0:
-            self._cut(data, (p, q, b, a), span)
+            self._cut((p, q, b, a), span, mouth)
             self._weigh(data)
-            motion = self._edge_motion(model, data)
+            motion, last, best = self._edge_motion(model, data), None, (-2.0, 0.0, direction)
             for _ in range(PREDICTIONS):
-                force, direction, in_soil = self._plan(motion, a, span, travel, lip)
+                force, direction, in_soil = self._plan(motion, a, span, travel, lip, mouth)
                 if not in_soil:
                     break
                 self._set_resistance(model, data, force, direction)
                 mujoco.mj_forward(model, data)
-                motion = self._slip(model, data, force, direction)
-                if motion is None:
+                velocity = self._slip(model, data, force, direction)
+                if velocity is None:
                     break
+                aligned = float(velocity @ direction)
+                if aligned > best[0]:
+                    best = (aligned, force, direction)
+                motion, last = self._aim(np.array(direction), velocity, last)
+            else:
+                _, force, direction = best
+                self._set_resistance(model, data, force, direction)
         if self.bucket_volume > 0.0 and not in_soil and -lip[2] > math.sin(DUMP_ANGLE):
             below = self.reach * np.array(travel)
             self.lost_volume += self.grid.deposit(self.heights, self.loose, self.bucket_volume,
@@ -174,15 +189,12 @@ class Soil:
         self._protect(data)
         write_ground(model, self.index, self.heights)
 
-    def _cut(self, data: mujoco.MjData, corners: tuple, span: tuple) -> None:
+    def _cut(self, corners: tuple, span: tuple, mouth: tuple) -> None:
         removed = self.grid.cut(self.heights, self.loose, self.protected, corners)
         if removed <= 0.0:
             return
         p, q, b, a = corners
         moved = [(a[i] + b[i] - p[i] - q[i]) / 2 for i in range(3)]
-        r = data.xmat[self.bucket].tolist()
-        m = self.mouth
-        mouth = [r[3 * i] * m[0] + r[3 * i + 1] * m[1] + r[3 * i + 2] * m[2] for i in range(3)]
         forward = moved[0] * mouth[0] + moved[1] * mouth[1] + moved[2] * mouth[2] > 0.0
         held = min(self.bucket_volume + removed, BUCKET_CAPACITY) if forward else self.bucket_volume
         taken = held - self.bucket_volume
@@ -206,7 +218,7 @@ class Soil:
         return (self.jac @ data.qvel + steer * intended).tolist()
 
     def _plan(self, motion: list[float], a: list[float], span: tuple, travel: tuple,
-              lip: tuple) -> tuple[float, tuple[float, float, float], bool]:
+              lip: tuple, mouth: tuple) -> tuple[float, tuple[float, float, float], bool]:
         norm = math.hypot(*motion)
         if norm < 1e-12:
             return 0.0, (0.0, 0.0, 0.0), False
@@ -218,10 +230,10 @@ class Soil:
             depths.append(max(top - a[2] - f * span[2], 0.0))
         if max(depths) <= 0.0:
             return 0.0, direction, False
-        return self._resistance(depths, direction, travel, lip), direction, True
+        return self._resistance(depths, direction, travel, lip, mouth), direction, True
 
     def _slip(self, model: mujoco.MjModel, data: mujoco.MjData, force: float,
-              direction: tuple[float, float, float]) -> list[float] | None:
+              direction: tuple[float, float, float]) -> np.ndarray | None:
         velocity = self.jac @ (data.qvel + model.opt.timestep * data.qacc)
         rows = data.efc_type == mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON
         held = max((abs(f) for f, t in zip(data.efc_force[rows].tolist(),
@@ -231,20 +243,32 @@ class Soil:
         along = float(velocity @ direction)
         if held < (1.0 - SLIP_MARGIN) * force / math.sqrt(3.0) or along >= SLIP_COS * speed:
             return None
-        return (velocity + speed * np.array(direction)).tolist()
+        return velocity / speed
+
+    @staticmethod
+    def _aim(direction: np.ndarray, heading: np.ndarray,
+             last: tuple[np.ndarray, np.ndarray] | None) -> tuple[list[float], tuple]:
+        residual = heading - direction
+        step = residual
+        if last is not None:
+            dx, dr = direction - last[0], residual - last[1]
+            norm = float(dr @ dr)
+            if norm > 1e-12:
+                step = residual - float(residual @ dr) / norm * (dx + dr)
+        return (direction + step).tolist(), (direction, residual)
 
     def _resistance(self, depths: list[float], direction: tuple[float, float, float],
-                    travel: tuple[float, float, float],
-                    lip: tuple[float, float, float]) -> float:
+                    travel: tuple[float, float, float], lip: tuple[float, float, float],
+                    mouth: tuple[float, float, float]) -> float:
         sums = depth_sums(depths, self.width)
         attack = direction[0] * lip[0] + direction[1] * lip[1] + direction[2] * lip[2]
         load = self.params.unit_weight * self.bucket_volume
-        along = direction[0] * travel[0] + direction[1] * travel[1]
-        forward = 0.5 * (1.0 + math.tanh(along / TRAVEL_BLEND))
-        plate_along = -(lip[0] * travel[0] + lip[1] * travel[1])
+        along = direction[0] * mouth[0] + direction[1] * mouth[1] + direction[2] * mouth[2]
+        cutting = 0.5 * (1.0 + math.tanh((along + BACK_ONSET) / TRAVEL_BLEND))
+        plate = lip[0] * travel[0] + lip[1] * travel[1]
         force = 0.0
-        for sign, weight in ((1.0, forward), (-1.0, 1.0 - forward)):
-            rake = math.atan2(-lip[2], -sign * plate_along)
+        for sign, weight in ((1.0, cutting), (-1.0, 1.0 - cutting)):
+            rake = math.atan2(-lip[2], sign * plate)
             force += weight * smooth_cap(raw_force(self.params, sums, rake, attack, load))
         return force
 
@@ -262,9 +286,14 @@ class Soil:
         model.tendon_frictionloss[self.tendons] = force / math.sqrt(3.0)
         if force > 0.0:
             x, y, z = direction
-            side = (y, -x, 0.0) if math.hypot(x, y) > 1e-6 else (0.0, z, -y)
+            px, py, pz = self._side
+            k = px * x + py * y + pz * z
+            side = (px - k * x, py - k * y, pz - k * z)
+            if math.hypot(*side) < 0.1:
+                side = (y, -x, 0.0) if math.hypot(x, y) > 0.1 else (0.0, z, -y)
             n = math.hypot(*side)
             sx, sy, sz = side[0] / n, side[1] / n, side[2] / n
+            self._side = (sx, sy, sz)
             ux, uy, uz = y * sz - z * sy, z * sx - x * sz, x * sy - y * sx
             tx, ty, tz = data.site_xpos[self.tip].tolist()
             anchors = []

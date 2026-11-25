@@ -1,6 +1,6 @@
 """Resistance of soil to the bucket's cutting edge: the fundamental earthmoving equation
-(separation) plus a tooth penetration term, smoothly capped per axis so three axes stay below
-FORCE_CAP. Within SINGULAR_MARGIN of the singular rake, separation ramps up to BACK_GAIN times."""
+(separation) plus a tooth penetration term, smoothly capped at FORCE_CAP.
+Within SINGULAR_MARGIN of the singular rake, separation ramps up to BACK_GAIN times."""
 
 from __future__ import annotations
 
@@ -10,8 +10,7 @@ import numpy as np
 
 from hma.soil.params import SoilParams
 
-FORCE_CAP = 300.0e3
-AXIS_CAP = FORCE_CAP / math.sqrt(3.0)
+FORCE_CAP = 175.0e3
 CAP_SHARPNESS = 4
 EDGE_THICKNESS = 0.02
 RAKE_MARGIN = 0.1
@@ -51,7 +50,7 @@ def passive_coefficient(soil: SoilParams) -> float:
 
 def smooth_cap(force: float) -> float:
     force = max(force, 0.0)
-    return force / (1.0 + (force / AXIS_CAP) ** CAP_SHARPNESS) ** (1.0 / CAP_SHARPNESS)
+    return force / (1.0 + (force / FORCE_CAP) ** CAP_SHARPNESS) ** (1.0 / CAP_SHARPNESS)
 
 
 def depth_sums(depths: list[float], width: float) -> tuple[float, float, float]:
