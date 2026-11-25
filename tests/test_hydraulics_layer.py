@@ -15,14 +15,16 @@ from hma.machine import (
     machine_prefix,
 )
 from hma.machine.model import COUNTERWEIGHT_MASS, VALVE_GAIN, VALVE_INERTIA, _machine_spec
+from scenes import dig_pit
 
 DT = 0.005
+BOOM_UP = (0.0, -1.1, 1.9, 0.6)
 BUCKET = JOINT_NAMES.index("bucket")
 SWING = JOINT_NAMES.index("swing")
 
 
 def layer_for(machine, n=1, weld=True, control_hz=10.0):
-    model = load_scene(n, weld=weld)
+    model = dig_pit(load_scene(n, weld=weld), n)
     data = mujoco.MjData(model)
     return Hydraulics(model, data, [machine] * n, control_hz=control_hz)
 
@@ -339,7 +341,7 @@ def test_a_speed_limit_beyond_the_actuator_is_refused():
 def test_mass_changes_match_the_compiler_for_the_same_masses():
     machine = replace(only("mass"), com_shift=np.zeros((len(BODY_NAMES), 3)))
     layer = layer_for(machine)
-    spec = _machine_spec(0, True)
+    spec = _machine_spec(0)
     for k, name in enumerate(BODY_NAMES):
         mesh = next(g for g in spec.body(name).geoms if g.type == mujoco.mjtGeom.mjGEOM_MESH)
         own = LINK_MASSES[name] - (COUNTERWEIGHT_MASS if name == "upper" else 0.0)
@@ -559,8 +561,10 @@ def test_curve_gain_applies_before_the_drawn_speed_limit_clips():
     assert steady_speeds(strong, [0, 0, 0, 0.9])[BUCKET] == pytest.approx(0.972 * top, rel=2e-3)
 
 
-def loaded_run(machine, loads, schedule, seconds, control_hz=10.0):
+def loaded_run(machine, loads, schedule, seconds, control_hz=10.0, pose=None):
     layer = layer_for(machine, control_hz=control_hz)
+    if pose is not None:
+        layer.reset(0, machine, pose=pose)
     data = layer.data
     dofs, actuators = layer._qvel[0], layer._actuators[0]
     commands, power = [], []
@@ -583,13 +587,13 @@ def reversals(commands):
 
 
 @pytest.mark.parametrize("control_hz", [10.0, 20.0])
-@pytest.mark.parametrize("command, loads, seconds", [
-    ([1, 0, 1, 0], [0, 0, -0.9, 0], 2.5),
-    ([1, 1, 1, 1], [-0.25] * 4, 6.0),
+@pytest.mark.parametrize("command, loads, seconds, pose", [
+    ([1, 0, 1, 0], [0, 0, -0.9, 0], 2.5, None),
+    ([1, 1, 1, 1], [-0.25] * 4, 6.0, BOOM_UP),
 ], ids=["swing-and-loaded-arm", "end-stop"])
-def test_the_power_limit_settles_without_chatter(command, loads, seconds, control_hz):
+def test_the_power_limit_settles_without_chatter(command, loads, seconds, pose, control_hz):
     commands, _ = loaded_run(NOMINAL, lambda ctrl, speed: np.array(loads), lambda k: command,
-                             seconds, control_hz)
+                             seconds, control_hz, pose)
     assert reversals(commands[-100:]) == 0
 
 

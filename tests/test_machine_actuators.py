@@ -8,26 +8,30 @@ from hma.machine import (
     JOINT_LIMITS,
     JOINT_NAMES,
     LINK_MASSES,
-    TIP_SITE,
     load_scene,
     machine_prefix,
 )
+from hma.machine.load import apply_load, block, hang_load
 from hma.machine.model import SPEED_LIMITS
+from scenes import dig_pit
 
 PAYLOAD = 1200.0
+SLUNG_CURL = 1.45
 DRIFT_LIMIT_DEG_S = 0.1
 PREFIX = machine_prefix(0)
 
 
 class Machine:
     def __init__(self, pose=None, payload=0.0):
-        self.model = load_scene(1, weld=True)
+        self.model = dig_pit(load_scene(1, weld=True))
         self.data = mujoco.MjData(self.model)
         mujoco.mj_resetDataKeyframe(self.model, self.data, self.model.key(HOME_KEY).id)
-        self.payload = payload
         if pose is not None:
             for name, value in zip(JOINT_NAMES, pose, strict=True):
                 self.data.qpos[self.joint(name).qposadr[0]] = value
+        if payload:
+            apply_load(self.model, 0, block(payload), mujoco.MjData(self.model))
+            hang_load(self.model, self.data, 0)
         mujoco.mj_forward(self.model, self.data)
 
     def joint(self, name):
@@ -43,14 +47,8 @@ class Machine:
         self.data.ctrl[self.model.actuator(PREFIX + name).id] = speed
 
     def run(self, seconds, load=None):
-        tip = self.model.site(PREFIX + TIP_SITE).id
-        bucket = self.model.body(PREFIX + "bucket").id
         for _ in range(round(seconds / self.model.opt.timestep)):
             self.data.qfrc_applied[:] = 0.0
-            if self.payload:
-                mujoco.mj_applyFT(self.model, self.data, np.array([0.0, 0.0, -9.81 * self.payload]),
-                                  np.zeros(3), self.data.site_xpos[tip].copy(), bucket,
-                                  self.data.qfrc_applied)
             if load is not None:
                 self.data.qfrc_applied[self.joint(load[0]).dofadr[0]] += load[1]
             mujoco.mj_step(self.model, self.data)
@@ -105,7 +103,7 @@ def test_ten_hertz_proportional_control_settles_on_each_joint(name, step):
     assert max(abs(e) for e in errors[-20:]) < 2e-3
 
 
-@pytest.mark.parametrize("pose", [(0.0, 0.0, 0.6, 0.0), (0.0, 0.3, 0.8, 0.3)])
+@pytest.mark.parametrize("pose", [(0.0, 0.0, 0.6, 2.3), (0.0, 0.3, 0.8, 2.0)])
 def test_zero_command_drift_under_full_payload(pose):
     machine = Machine(pose, payload=PAYLOAD)
     machine.run(0.5)
@@ -118,7 +116,9 @@ def test_zero_command_drift_under_full_payload(pose):
 @pytest.mark.parametrize("name", ["boom", "arm", "bucket"])
 def test_each_joint_lifts_and_holds_the_loaded_arm_across_its_range(name):
     lo, hi = JOINT_LIMITS[name]
-    pose = dict(zip(JOINT_NAMES, (0.0, 0.0, 0.8, 0.5), strict=True))
+    if name == "bucket":
+        lo = SLUNG_CURL
+    pose = dict(zip(JOINT_NAMES, (0.0, 0.0, 1.6, 2.3), strict=True))
     pose[name] = lo + 0.15
     machine = Machine(tuple(pose.values()), payload=PAYLOAD)
     speed = SPEED_LIMITS[name]
@@ -138,7 +138,7 @@ def test_each_joint_lifts_and_holds_the_loaded_arm_across_its_range(name):
 
 
 def boom_arm_bucket_motion(mass_scale):
-    machine = Machine(payload=PAYLOAD)
+    machine = Machine((0.0, -0.6, 1.9, 2.0), payload=PAYLOAD)
     for body in LINK_MASSES:
         index = machine.model.body(PREFIX + body).id
         machine.model.body_mass[index] *= mass_scale
