@@ -279,7 +279,7 @@ def test_every_draw_lies_in_its_range():
         m = draw_machine(seed, EFFECTS)
         for name in ("delay", "lag", "deadband", "gain", "spool_flow", "pump_flow",
                      "bulk_modulus", "pump_volume", "brake", "backlash", "link_mass",
-                     "counterweight", "sensor_latency", "pressure_offset"):
+                     "counterweight", "sensor_latency", "pressure_offset", "seal_friction"):
             assert within(getattr(m, name), name)
         assert within(m.power, "power", c.ENGINE_POWER)
         assert within(m.dead_volume[1:], "dead_volume")

@@ -564,7 +564,8 @@ def test_energy_closes_with_cavitation_and_outside_forces_once_the_integration_t
     assert opened
     assert np.all(residual > 0.0)
     assert np.all(np.abs(residual - damping + growth) < 1e-9 * pump)
-    assert np.all(np.abs(layer.work_energy - actuator - play) < 1e-4 * pump)
+    assert np.all(np.abs(layer.work_energy - actuator) < 1e-4 * pump)
+    assert np.all(play > 0.0)
 
 
 def test_held_joints_drift_slowly_but_measurably_through_their_leaks():

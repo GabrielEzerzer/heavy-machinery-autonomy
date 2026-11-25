@@ -220,6 +220,7 @@ class Hydraulics:
         self._edge_slope[:] = 0.0
         self._brake = np.zeros(n)
         self._half_play = np.zeros(shape)
+        self._seal_scale = np.zeros(n)
         self._latency_steps = np.zeros(n, np.intp)
         self._noise = np.zeros((4, n, 1))
         self._offset = np.zeros((n, JOINTS, 2))
@@ -232,6 +233,7 @@ class Hydraulics:
         self._pump = np.zeros((n, c.PUMPS))
         self._gap = np.zeros(shape)
         self._rod_speed = np.zeros(shape)
+        self._piston_speed = np.zeros(shape)
         self._accel = np.zeros(shape)
         self._cavity = np.zeros((n, NODES))
         self._held_nodes = np.zeros((n, NODES), bool)
@@ -285,6 +287,8 @@ class Hydraulics:
             raise ValueError("leakage and brake torque must not be negative")
         if np.any(machine.backlash < 0):
             raise ValueError("backlash must not be negative")
+        if machine.seal_friction < 0:
+            raise ValueError("the seal friction factor must not be negative")
         if np.any(machine.link_mass <= 0) or machine.counterweight <= 0:
             raise ValueError("link mass and counterweight factors must be positive")
         if min(machine.position_noise, machine.velocity_noise, machine.pressure_noise) < 0:
@@ -320,6 +324,7 @@ class Hydraulics:
         self._leakage[index] = machine.leakage.ravel()
         self._brake[index] = machine.brake
         self._half_play[index] = machine.backlash / 2.0
+        self._seal_scale[index] = machine.seal_friction
         self._latency_steps[index] = round(machine.sensor_latency / self.dt)
         self._noise[:, index, 0] = (machine.position_noise, machine.velocity_noise,
                                     machine.pressure_noise, machine.pressure_noise)
@@ -399,6 +404,7 @@ class Hydraulics:
         self._pump[index] = c.STANDBY_FLOW
         self._gap[index] = np.where(force >= 0.0, 1.0, -1.0)
         self._rod_speed[index] = 0.0
+        self._piston_speed[index] = 0.0
         self._accel[index] = 0.0
         self._cavity[index] = 0.0
         self._held_nodes[index] = False
@@ -497,7 +503,8 @@ class Hydraulics:
         brake = self._base_friction + np.where(self._neutral >= c.BRAKE_DELAY, self._brake, 0.0)
         chambers = pressure[:, c.PUMPS:].reshape(n, JOINTS, 2)
         drag = np.zeros((n, JOINTS))
-        drag[:, 1:] = seal_friction(chambers[:, 1:, 0], chambers[:, 1:, 1], rod[:, 1:])
+        drag[:, 1:] = seal_friction(chambers[:, 1:, 0], chambers[:, 1:, 1],
+                                    self._piston_speed[:, 1:]) * self._seal_scale[:, None]
         seal = drag * np.abs(lever)
         redo = np.zeros(n, bool)
         redo_held = np.zeros((n, NODES), bool)
@@ -589,6 +596,7 @@ class Hydraulics:
 
         self._accel = (data.qvel[qvel] - qd) * (1.0 / dt)
         self._rod_speed = free_speed
+        self._piston_speed = speed
         self._held_nodes[:] = held_nodes
         missing *= held_nodes | (cavity > 0.0)
         pressure += change
@@ -599,8 +607,9 @@ class Hydraulics:
         hydraulic = speed * (pressure @ DISPLACEMENT)
         hydraulic[:, SWING] *= flow_scale
         mechanical = speed * (pressure @ DISPLACEMENT) * scale
-        self.lost_energy += lost + (mechanical - hydraulic).sum(1) * dt
-        self.work_energy -= mechanical.sum(1) * dt
+        loose_rods = np.where(contact, 0.0, mechanical)
+        self.lost_energy += lost + (mechanical - hydraulic - loose_rods).sum(1) * dt
+        self.work_energy -= np.where(contact, mechanical, 0.0).sum(1) * dt
         gap = self._gap + np.where(contact, 0.0, (free_speed - joint_rod) * per_play)
         self._gap = np.minimum(np.maximum(gap, -1.0, out=gap), 1.0, out=gap)
         self.pump_power = (pressure[:, :c.PUMPS] * self._pump).sum(1)

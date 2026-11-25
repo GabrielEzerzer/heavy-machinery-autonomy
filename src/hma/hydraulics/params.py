@@ -40,6 +40,7 @@ RANGES = {
     "motor_leakage": (0.5 * LITRE / 60.0 / SWING_RELIEF, 1.6 * LITRE / 60.0 / SWING_RELIEF),
     "brake": (1.0 * SWING_TORQUE, 1.5 * SWING_TORQUE),
     "backlash": (0.0, math.radians(0.5)),
+    "seal_friction": (1.0, 1.4),
     "link_mass": (0.9, 1.1),
     "com_shift": (0.0, 0.05),
     "counterweight": (0.9, 1.1),
@@ -48,7 +49,8 @@ RANGES = {
 }
 NOISE = {"position": 0.02, "velocity": 0.05, "pressure": 0.1e6}
 
-EFFECTS = ("delay", "valve", "flow", "reliefs", "oil", "holding", "backlash", "mass", "sensors")
+EFFECTS = ("delay", "valve", "flow", "reliefs", "oil", "holding", "backlash", "friction", "mass",
+           "sensors")
 GROUPS = {
     "delay": ("delay", "lag"),
     "valve": ("deadband", "curve", "gain", "spool_flow"),
@@ -57,6 +59,7 @@ GROUPS = {
     "oil": ("bulk_modulus", "dead_volume", "pump_volume"),
     "holding": ("leakage", "brake"),
     "backlash": ("backlash",),
+    "friction": ("seal_friction",),
     "mass": ("link_mass", "com_shift", "counterweight"),
     "sensors": ("sensor_latency", "position_noise", "velocity_noise", "pressure_noise",
                 "pressure_offset"),
@@ -82,6 +85,7 @@ class Machine:
     leakage: np.ndarray
     brake: float
     backlash: np.ndarray
+    seal_friction: float
     link_mass: np.ndarray
     com_shift: np.ndarray
     counterweight: float
@@ -135,6 +139,7 @@ NOMINAL = Machine(
                      _middle("motor_leakage")),
     brake=_middle("brake"),
     backlash=np.zeros(len(JOINT_NAMES)),
+    seal_friction=RANGES["seal_friction"][0],
     link_mass=np.ones(len(BODY_NAMES)),
     com_shift=np.zeros((len(BODY_NAMES), 3)),
     counterweight=1.0,
@@ -196,6 +201,7 @@ def draw_machine(seed: int, effects: tuple[str, ...] = EFFECTS) -> Machine:
         "velocity_noise": NOISE["velocity"],
         "pressure_noise": NOISE["pressure"],
         "pressure_offset": rng.uniform(*RANGES["pressure_offset"], size=ports),
+        "seal_friction": float(rng.uniform(*RANGES["seal_friction"])),
     }
     kept = {name: drawn[name] for group in effects for name in GROUPS[group]}
     return replace(NOMINAL, seed=seed, **kept)

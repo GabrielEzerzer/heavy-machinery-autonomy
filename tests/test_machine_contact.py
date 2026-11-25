@@ -19,8 +19,8 @@ from hma.machine import (
     write_ground,
 )
 from hma.machine.collision import LINK_MESH, PIECES, link_triangles
-from hma.machine.cylinders import seal_friction
 from hma.machine.contact import STEEL_FRICTION_RANGE, draw_friction, set_friction
+from hma.machine.cylinders import seal_friction
 from hma.machine.load import (
     LEG_WLL,
     RANGES,
@@ -211,8 +211,10 @@ def propping(boom, arm, seconds):
         (fb, mb), (_, mr) = moments("bucket"), moments("base")
         pressure = max(layer.pump_pressures()[0].max() - NOMINAL.main_relief,
                        (layer.chamber_pressures()[0] - NOMINAL.port_relief).max())
+        up = data.xmat[base].reshape(3, 3)[:, 2]
         rows.append((data.time, fb[0], fb[2], *mb, *mr, data.subtree_com[base][0],
-                     data.site_xpos[tip][2], pressure))
+                     data.site_xpos[tip][2], pressure, math.degrees(math.acos(up[2])),
+                     *data.site_xpos[tip][:2]))
 
     run(model, data, seconds, record)
     return np.array(rows), weight
@@ -225,6 +227,7 @@ def periods(rows, start, steps):
 
 def reaction_over_hand(rows, weight, start, steps):
     w = periods(rows, start, steps).sum(1)
+    assert np.all(w[:, 5] > 0.0) and np.all(w[:, 8] > 0.0)
     fx, fz, gx = w[:, 1], w[:, 2], w[:, 9] / steps
     bx, bz, rx, rz = w[:, 3] / w[:, 5], w[:, 4] / w[:, 5], w[:, 6] / w[:, 8], w[:, 7] / w[:, 8]
     return fz / ((weight * steps * (gx - rx) + fx * (bz - rz)) / (bx - rx))
@@ -233,9 +236,11 @@ def reaction_over_hand(rows, weight, start, steps):
 def test_propped_machine_whose_tip_holds_keeps_contact_and_matches_statics():
     rows, weight = propping(0.6, -0.15, 4.0)
     landed = rows[rows[:, 0] > 1.0]
+    assert landed[-1, 12] > 10.0
+    assert np.hypot(*(landed[:, 13:15] - landed[0, 13:15]).T).max() < 0.003
     assert np.all(landed[:, 2] > 0.0)
     assert np.ptp(landed[:, 10]) < 0.005
-    assert np.abs(reaction_over_hand(rows, weight, 1.0, 20) - 1.0).max() < 0.02
+    assert np.abs(reaction_over_hand(rows, weight, 1.5, 20) - 1.0).max() < 0.01
 
 
 @pytest.mark.parametrize(("boom", "until", "mean_bound", "rms_bound", "ripple_bound"),
@@ -244,6 +249,9 @@ def test_propped_machine_whose_tip_slides_hops_within_its_measured_bounds(
         boom, until, mean_bound, rms_bound, ripple_bound):
     rows, weight = propping(boom, 0.0, until)
     start = 2.0 if boom < 1.0 else 1.0
+    assert rows[-1, 12] > 15.0
+    sliding = rows[rows[:, 0] > start]
+    assert np.hypot(*(sliding[-1, 13:15] - sliding[0, 13:15])) > 0.3
     assert np.abs(reaction_over_hand(rows, weight, start, 100) - 1.0).max() < mean_bound
     tip = periods(rows, start, 20)[..., 10]
     steps = np.arange(20) - 9.5
@@ -395,9 +403,11 @@ def bounce(model, data, layer, seconds):
     swing = np.abs(swing)
     peaks = np.flatnonzero((swing[1:-1] >= swing[:-2]) & (swing[1:-1] > swing[2:])) + 1
     t = (peaks + 1) * model.opt.timestep
-    kept = (t > 1.0) & (t < 3.3) & (swing[peaks] > 0.01)
+    start, end = 1.0, 3.3
+    kept = (t > start) & (t < end) & (swing[peaks] > 0.01)
+    window = slice(round(start / model.opt.timestep), round(end / model.opt.timestep))
     return np.polyfit(t[kept], swing[peaks][kept], 1)[0], np.median(np.diff(t[kept])), np.mean(
-        boom_seals[200:660])
+        boom_seals[window])
 
 
 def test_hung_load_bounce_dies_at_the_rate_the_boom_seals_give_by_hand(monkeypatch):
