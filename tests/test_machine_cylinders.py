@@ -91,3 +91,18 @@ def test_digging_forces_match_the_spec_sheet():
 def test_hydraulic_lift_capacity_matches_a_starred_chart_entry():
     rated = 0.87 * lift(Machine(), 1.5, 3.0, MAIN_RELIEF)["hydraulic"]
     assert rated == pytest.approx(7890, rel=0.03)
+
+
+def test_total_mass_and_centre_follow_a_bucket_removed_at_run_time():
+    machine = Machine()
+    machine.pose(0.0, -0.3, 1.5, 0.5, with_bucket=False)
+    model, data = machine.model, machine.data
+    mass = sum(model.body_mass[b] for b in machine.subtree)
+    moment = sum(model.body_mass[b] * data.xipos[b] for b in machine.subtree)
+    total, com = machine.total()
+    machine.done()
+    assert machine.bodies["bucket"] in machine.subtree
+    assert total == pytest.approx(mass)
+    assert total == pytest.approx(float(model.body_subtreemass[machine.bodies["base"]])
+                                  - machine.bucket_mass)
+    np.testing.assert_allclose(com, moment / mass, atol=1e-12)

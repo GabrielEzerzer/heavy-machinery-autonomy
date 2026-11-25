@@ -13,7 +13,7 @@ from hma.machine import JOINT_LIMITS, TIP_SITE, load_scene, machine_prefix
 from hma.machine.cylinders import MAIN_RELIEF, PORT_RELIEF, joint_torque_limits
 
 CHART = {
-    (4.5, 3.0): ("*3350", "*3350"), (4.5, 4.5): ("3040", "2110"),
+    (4.5, 4.5): ("*3350", "*3350"), (4.5, 6.0): ("3040", "2110"),
     (3.0, 3.0): ("*5460", "*5460"), (3.0, 4.5): ("*4070", "3200"), (3.0, 6.0): ("2980", "2050"),
     (1.5, 3.0): ("*7890", "5380"), (1.5, 4.5): ("4470", "2980"), (1.5, 6.0): ("2880", "1960"),
     (0.0, 3.0): ("*6730", "5070"), (0.0, 4.5): ("4280", "2810"), (0.0, 6.0): ("2790", "1880"),
@@ -34,9 +34,15 @@ class Machine:
         self.joints = {j: self.model.joint(p + j) for j in ("swing", "boom", "arm", "bucket")}
         self.dofs = {j: int(jt.dofadr[0]) for j, jt in self.joints.items()}
         self.bodies = {b: self.model.body(p + b).id for b in ("base", "arm", "bucket")}
+        self.subtree = [b for b in range(self.model.nbody) if self._under(b, self.bodies["base"])]
         self.tip = self.model.site(p + TIP_SITE).id
         self.g = -float(self.model.opt.gravity[2])
         self.bucket_mass = float(self.model.body_mass[self.bodies["bucket"]])
+
+    def _under(self, body: int, root: int) -> bool:
+        while body != root and body != 0:
+            body = int(self.model.body_parentid[body])
+        return body == root
 
     def pose(self, swing: float, boom: float, arm: float, bucket: float, with_bucket: bool) -> None:
         m, d = self.model, self.data
@@ -48,8 +54,9 @@ class Machine:
         mujoco.mj_forward(m, d)
 
     def total(self) -> tuple[float, np.ndarray]:
-        base = self.bodies["base"]
-        return float(self.model.body_subtreemass[base]), self.data.subtree_com[base].copy()
+        mass = self.model.body_mass[self.subtree]
+        total = float(mass.sum())
+        return total, (mass[:, None] * self.data.xipos[self.subtree]).sum(0) / total
 
     def point_jacobian(self, point: np.ndarray, body: str) -> np.ndarray:
         jac = np.zeros((3, self.model.nv))
@@ -137,7 +144,8 @@ def lift(machine: Machine, height: float, radius: float, arm_pressure: float) ->
         room[joint] = force_room(machine.bias(joint), per_kg, *caps(joint, q, pressures))
     hydraulic = min(room.values())
     mass, com = machine.total()
-    front = mass * (FRONT_LINE - com[0]) / (point[0] - FRONT_LINE)
+    front = (mass * (FRONT_LINE - com[0]) / (point[0] - FRONT_LINE)
+             if point[0] > FRONT_LINE else None)
     machine.pose(np.pi / 2, boom, arm, 0.0, False)
     mass, com = machine.total()
     side_point = machine.anchor("bucket")
@@ -198,10 +206,12 @@ def main() -> None:
         if main_ is None:
             print(f"  {height:5.1f} {radius:5.1f} | {front:>6s} {side:>6s} | out of reach")
             continue
+        tip = ("inside tipping line" if main_["front_tip"] is None
+               else f"{TIPPING_SHARE * main_['front_tip']:6.0f}")
         print(f"  {height:5.1f} {radius:5.1f} | {front:>6s} {side:>6s} | "
               f"{HYDRAULIC_SHARE * main_['hydraulic']:6.0f} / "
               f"{HYDRAULIC_SHARE * port['hydraulic']:6.0f} {main_['limited_by']:5s} | "
-              f"{TIPPING_SHARE * main_['front_tip']:6.0f} {TIPPING_SHARE * main_['side_tip']:6.0f}")
+              f"{tip} {TIPPING_SHARE * main_['side_tip']:6.0f}")
     print("\nPropping: tip force the joints can hold against what lifts the front of the tracks")
     cases = {"main relief on arm and bucket": {"arm": (MAIN_RELIEF,) * 2,
                                                "bucket": (MAIN_RELIEF,) * 2},
