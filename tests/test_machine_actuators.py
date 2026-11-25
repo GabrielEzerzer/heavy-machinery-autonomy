@@ -13,6 +13,7 @@ from hma.machine import (
     machine_prefix,
 )
 from hma.machine.model import SPEED_LIMITS
+from hma.machine.tracks import step
 
 PAYLOAD = 1200.0
 DRIFT_LIMIT_DEG_S = 0.1
@@ -53,7 +54,7 @@ class Machine:
                                   self.data.qfrc_applied)
             if load is not None:
                 self.data.qfrc_applied[self.joint(load[0]).dofadr[0]] += load[1]
-            mujoco.mj_step(self.model, self.data)
+            step(self.model, self.data)
 
 
 def test_stalled_joint_resumes_at_commanded_speed_without_lunging():

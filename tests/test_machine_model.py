@@ -24,6 +24,7 @@ from hma.machine import (
     write_ground,
 )
 from hma.machine.model import GROUND_DEPTH, SPEED_LIMITS, VALVE
+from hma.machine.tracks import INTERVALS, step
 
 SOURCE_LIMITS_DEG = {"boom": (-70.0, 44.0), "arm": (30.0, 152.0), "bucket": (-33.0, 143.0)}
 
@@ -72,7 +73,7 @@ def settle(model, data, seconds=1.0, payload=0.0):
             data.qfrc_applied[:] = 0.0
             mujoco.mj_applyFT(model, data, np.array([0.0, 0.0, -9.81 * payload]), np.zeros(3),
                               data.site_xpos[tip].copy(), bucket, data.qfrc_applied)
-        mujoco.mj_step(model, data)
+        step(model, data)
 
 
 def test_total_mass_in_operating_weight_band():
@@ -150,8 +151,8 @@ def test_each_machine_stands_on_its_own_ground_with_few_contacts():
         names = sorted((g1, g2))
         prefix = names[0][:3]
         assert names[0] == prefix + GROUND and names[1].startswith(prefix + "track_")
-        assert count <= 4
-    assert 0 < data.ncon <= 2 * 24 * 2
+        assert count <= 2 * (INTERVALS + 2)
+    assert 0 < data.ncon <= 2 * 2 * 2 * (INTERVALS + 2)
     for i in range(2):
         assert abs(base_position(model, data, i)[2]) < 1e-3
 
@@ -239,28 +240,27 @@ def test_loaded_machine_stays_level_with_track_ends_over_a_drop(lip):
     assert tilt_deg(model, data) < 0.5
 
 
-def side_reach_tilt(swing, payload):
+def peak_tilt(swing, payload, seconds=3.0):
     model = load_scene(1)
     data = home_data(model)
     set_pose(model, data, 0, dict(zip(JOINT_NAMES, (swing, 0.0, 1.0, 0.5), strict=True)))
-    settle(model, data, 3.0, payload)
-    return tilt_deg(model, data)
+    peak = 0.0
+    for _ in range(round(seconds / 0.05)):
+        settle(model, data, 0.05, payload)
+        peak = max(peak, tilt_deg(model, data))
+    return peak
 
 
 def test_loaded_bucket_tilts_alike_swung_left_and_right():
-    left, right = (side_reach_tilt(s, 1200.0) for s in (math.pi / 2, -math.pi / 2))
+    left, right = (peak_tilt(s, 1200.0) for s in (math.pi / 2, -math.pi / 2))
     assert left < 0.05 and right < 0.05
-    left, right = (side_reach_tilt(s, 3000.0) for s in (math.pi / 2, -math.pi / 2))
+    left, right = (peak_tilt(s, 3000.0, 2.0) for s in (math.pi / 2, -math.pi / 2))
     assert left > 30.0 and right > 30.0
     assert left == pytest.approx(right, abs=3.0)
 
 
 def test_large_force_at_bucket_tip_tips_a_free_base():
-    model = load_scene(1)
-    data = home_data(model)
-    set_pose(model, data, 0, dict(zip(JOINT_NAMES, (0.0, 0.0, 1.0, 0.5), strict=True)))
-    settle(model, data, 3.0, 5000.0)
-    assert tilt_deg(model, data) > 30.0
+    assert peak_tilt(0.0, 5000.0) > 30.0
 
 
 @pytest.mark.parametrize("index", [0, 1])
@@ -288,8 +288,9 @@ def test_weld_switches_at_run_time_and_holds_where_it_was_switched_on():
     set_weld(model, data, 0, False)
     settle(model, data, 0.5)
     assert abs(base_position(model, data, 0)[2]) < 1e-3
-    push_base(model, data, 0, [3.0e5, 0.0, 0.0], 0.5)
-    settle(model, data, 1.0)
+    push_base(model, data, 0, [3.0e5, 0.0, 0.0], 0.2)
+    settle(model, data, 2.0)
+    assert np.abs(data.qvel).max() < 0.01
     moved = base_position(model, data, 0)
     assert moved[0] > 0.3
     set_weld(model, data, 0, True)

@@ -9,11 +9,11 @@ from hma.machine import (
     BODY_NAMES,
     FORCE_CAPS,
     JOINT_NAMES,
-    LINK_MASSES,
     SPEED_LIMITS,
     load_scene,
     machine_prefix,
 )
+from hma.machine.mass import Solid, body_parts, combine, full_inertia
 from hma.machine.model import COUNTERWEIGHT_MASS, VALVE_GAIN, VALVE_INERTIA, _machine_spec
 
 DT = 0.005
@@ -340,11 +340,18 @@ def test_mass_changes_match_the_compiler_for_the_same_masses():
     machine = replace(only("mass"), com_shift=np.zeros((len(BODY_NAMES), 3)))
     layer = layer_for(machine)
     spec = _machine_spec(0, True)
+    parts = body_parts()
     for k, name in enumerate(BODY_NAMES):
-        mesh = next(g for g in spec.body(name).geoms if g.type == mujoco.mjtGeom.mjGEOM_MESH)
-        own = LINK_MASSES[name] - (COUNTERWEIGHT_MASS if name == "upper" else 0.0)
-        mesh.mass = own * machine.link_mass[k]
-    spec.geom("counterweight").mass = COUNTERWEIGHT_MASS * machine.counterweight
+        scaled = [Solid(p.mass * machine.link_mass[k], p.com, p.inertia * machine.link_mass[k])
+                  for p in parts[name]]
+        if name == "upper":
+            cw = parts[name][-1]
+            assert cw.mass == COUNTERWEIGHT_MASS
+            scaled[-1] = Solid(cw.mass * machine.counterweight, cw.com,
+                               cw.inertia * machine.counterweight)
+        solid = combine(scaled)
+        body = spec.body(name)
+        body.mass, body.ipos, body.fullinertia = solid.mass, solid.com, full_inertia(solid)
     compiled = spec.compile()
 
     def tensor(model, body):
@@ -454,9 +461,9 @@ def test_load_readings_follow_friction_rows_that_appear_and_vanish():
         np.testing.assert_allclose(loads * caps, data.qfrc_constraint[dofs], rtol=1e-9, atol=1e-6)
         if 30 <= k < 90:
             assert loads[0, SWING] == 0.0
-        if k >= 25:
+        if k >= 45:
             assert loads[1, SWING] == pytest.approx(-0.5, rel=1e-3)
-    assert rows_seen == {7, 8}
+    assert rows_seen == {11, 12}
 
 
 def test_each_reading_carries_one_noise_draw_however_often_it_is_observed():

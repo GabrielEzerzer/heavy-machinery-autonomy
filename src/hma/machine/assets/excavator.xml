@@ -16,30 +16,6 @@
     <body name="base">
       <freejoint name="base_free" />
       <geom name="crawler" type="mesh" mesh="crawler" material="crawler_paint" contype="0" conaffinity="0" group="1" />
-      <geom name="track_left_0" type="sphere" pos="-1.59288 0.737477 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_left_1" type="sphere" pos="-1.59288 1.24165 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_left_2" type="sphere" pos="-0.958357 0.737477 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_left_3" type="sphere" pos="-0.958357 1.24165 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_left_4" type="sphere" pos="-0.323832 0.737477 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_left_5" type="sphere" pos="-0.323832 1.24165 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_left_6" type="sphere" pos="0.310693 0.737477 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_left_7" type="sphere" pos="0.310693 1.24165 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_left_8" type="sphere" pos="0.945218 0.737477 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_left_9" type="sphere" pos="0.945218 1.24165 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_left_10" type="sphere" pos="1.57974 0.737477 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_left_11" type="sphere" pos="1.57974 1.24165 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_right_0" type="sphere" pos="-1.59288 -0.737477 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_right_1" type="sphere" pos="-1.59288 -1.24165 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_right_2" type="sphere" pos="-0.958357 -0.737477 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_right_3" type="sphere" pos="-0.958357 -1.24165 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_right_4" type="sphere" pos="-0.323832 -0.737477 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_right_5" type="sphere" pos="-0.323832 -1.24165 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_right_6" type="sphere" pos="0.310693 -0.737477 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_right_7" type="sphere" pos="0.310693 -1.24165 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_right_8" type="sphere" pos="0.945218 -0.737477 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_right_9" type="sphere" pos="0.945218 -1.24165 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_right_10" type="sphere" pos="1.57974 -0.737477 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
-      <geom name="track_right_11" type="sphere" pos="1.57974 -1.24165 0.1" size="0.1" mass="0" rgba="0.2 0.6 0.9 0.4" group="3" friction="0.8 0.005 0.0001" />
       <body name="upper" pos="0 0 1" quat="1 0 0 0">
         <joint name="swing" axis="0 0 1" />
         <geom name="body" type="mesh" mesh="body" material="body_paint" contype="0" conaffinity="0" group="1" />

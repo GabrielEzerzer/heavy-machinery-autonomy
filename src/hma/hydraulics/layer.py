@@ -22,12 +22,14 @@ from hma.machine import (
     BODY_NAMES,
     HOME_KEY,
     JOINT_NAMES,
+    TRAVEL_NAMES,
     VALVE,
     load_scene,
     machine_prefix,
     tendon_friction,
 )
 from hma.machine.model import COUNTERWEIGHT_MASS
+from hma.machine.tracks import place, step
 
 CONTROL_HZ = 10.0
 JOINTS = len(JOINT_NAMES)
@@ -167,7 +169,8 @@ class Hydraulics:
         for i, machine in enumerate(machines):
             self.reset(i, machine)
 
-    def reset(self, index: int, machine: Machine, pose: Sequence[float] | None = None) -> None:
+    def reset(self, index: int, machine: Machine, pose: Sequence[float] | None = None,
+              at: Sequence[float] = (0.0, 0.0, 0.0)) -> None:
         if pose is not None:
             pose = np.asarray(pose, float)
             if pose.shape != (JOINTS,) or not np.all(np.isfinite(pose)):
@@ -218,7 +221,7 @@ class Hydraulics:
         self.model.tendon_frictionloss[self._tendons[index]] = machine.force_limit
         self._apply_mass(index, machine)
         mujoco.mj_setConst(self.model, self._scratch)
-        self._reset_state(index, pose)
+        self._reset_state(index, pose, at)
 
     def _draw_noise(self, index: int) -> None:
         shape = (self.steps_per_decision, 3, JOINTS)
@@ -252,7 +255,8 @@ class Hydraulics:
             self.model.body_inertia[body] = values
             self.model.body_iquat[body] = quat
 
-    def _reset_state(self, index: int, pose: Sequence[float] | None) -> None:
+    def _reset_state(self, index: int, pose: Sequence[float] | None,
+                     at: Sequence[float]) -> None:
         model, data = self.model, self.data
         key = model.key(HOME_KEY).id
         for joint in self._own_joints[index]:
@@ -267,6 +271,8 @@ class Hydraulics:
         if pose is not None:
             data.qpos[self._qpos[index]] = pose
         data.ctrl[self._actuators[index]] = 0.0
+        data.ctrl[[model.actuator(machine_prefix(index) + t).id for t in TRAVEL_NAMES]] = 0.0
+        place(model, data, index, *at)
         self._commands[:, index] = 0.0
         self._held[index] = 0.0
         self._spool[index] = 0.0
@@ -314,7 +320,7 @@ class Hydraulics:
 
     def step(self) -> None:
         self.data.ctrl[self._actuators] = self.joint_speed_commands()
-        mujoco.mj_step(self.model, self.data)
+        step(self.model, self.data)
         self._sensor_head = (self._sensor_head + 1) % self._sensor_len
         reading = self._sensors[self._sensor_head]
         self._read_into(reading)

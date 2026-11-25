@@ -19,6 +19,7 @@ from hma.machine.model import (
     load_scene,
     machine_prefix,
 )
+from hma.machine.tracks import step
 
 WAYPOINTS = np.array([
     HOME_POSE,
@@ -51,7 +52,7 @@ def motion(model: mujoco.MjModel, data: mujoco.MjData, n_machines: int) -> Itera
         while np.abs(data.qpos[qpos] - target).max() > TOLERANCE and data.time < deadline:
             error = target - data.qpos[qpos]
             data.ctrl[acts] = np.clip(GAIN * error, -SPEEDS, SPEEDS)
-            mujoco.mj_step(model, data, control_steps)
+            step(model, data, control_steps)
             yield index
     data.ctrl[:] = 0.0
 

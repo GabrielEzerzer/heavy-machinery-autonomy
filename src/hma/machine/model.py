@@ -1,6 +1,6 @@
 """Scenes of 12 t class excavators, each on its own ground of (y, x) heights; names start with
-machine_prefix(i). ctrl is a joint speed in rad/s, sent through a "<joint>_valve" joint: read
-joints by name; actuator_force is not joint load. set_weld(off) leaves track contacts on."""
+machine_prefix(i). ctrl is a joint speed in rad/s or a track speed in m/s, sent through a "_valve"
+joint: read joints by name. Step scenes with hma.machine.tracks.step, not mujoco.mj_step."""
 
 from __future__ import annotations
 
@@ -9,6 +9,9 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+from hma.machine import mass, tracks
+from hma.machine.mass import body_solids, full_inertia
+
 ASSETS = Path(__file__).parent / "assets"
 MACHINE_XML = ASSETS / "excavator.xml"
 
@@ -16,15 +19,15 @@ JOINT_NAMES = ("swing", "boom", "arm", "bucket")
 BODY_NAMES = ("base", "upper", "boom", "arm", "bucket")
 BASE_JOINT = "base_free"
 TIP_SITE = "bucket_tip"
-TRACK_FEET = "track_"
+TRAVEL_NAMES = tuple(tracks.TRAVEL + side for side in tracks.SIDES)
 ANCHOR = "anchor"
 WELD = "base_weld"
 GROUND = "ground"
 HOME_KEY = "home"
 HOME_POSE = (0.0, -0.6, 1.9, 0.6)
 
-LINK_MASSES = {"base": 4500.0, "upper": 5580.0, "boom": 1220.0, "arm": 600.0, "bucket": 400.0}
-COUNTERWEIGHT_MASS = 2450.0
+COUNTERWEIGHT_MASS = mass.COUNTERWEIGHT_MASS
+LINK_MASSES = {name: solid.mass for name, solid in body_solids().items()}
 FORCE_CAPS = {"swing": 34.0e3, "boom": 330.0e3, "arm": 244.0e3, "bucket": 122.0e3}
 SPEED_LIMITS = {"swing": 1.0, "boom": 0.6, "arm": 0.8, "bucket": 1.2}
 VALVE = "_valve"
@@ -74,33 +77,51 @@ def _turn_reference_to_home(joint: mujoco.MjsJoint, angle: float) -> None:
     joint.ref = angle
 
 
+def _valve(spec: mujoco.MjSpec, name: str, joint: str, cap: float, limit: float) -> None:
+    valve = spec.worldbody.add_body(name=name + VALVE, mass=1.0, inertia=[1.0, 1.0, 1.0],
+                                    explicitinertial=True)
+    valve.add_joint(name=name + VALVE, axis=[0.0, 0.0, 1.0], armature=VALVE_INERTIA)
+    tendon = spec.add_tendon(name=name + VALVE, frictionloss=cap,
+                             solref_friction=[2 * TIMESTEP, 1.0],
+                             solimp_friction=[*VALVE_SOLIMP, 0.5, 2.0])
+    tendon.wrap_joint(joint, 1.0)
+    tendon.wrap_joint(name + VALVE, -1.0)
+    act = spec.add_actuator(name=name, target=name + VALVE, trntype=mujoco.mjtTrn.mjTRN_JOINT)
+    act.set_to_velocity(kv=VALVE_GAIN)
+    act.ctrllimited = mujoco.mjtLimited.mjLIMITED_TRUE
+    act.ctrlrange = [-limit, limit]
+
+
+def _add_belt(spec: mujoco.MjSpec, side: str) -> None:
+    y = tracks.side_sign(side) * tracks.GAUGE / 2
+    name = tracks.BELT + side
+    belt = spec.body("base").add_body(name=name, mass=1e-3, inertia=[1e-6] * 3,
+                                      explicitinertial=True)
+    belt.add_joint(name=name, type=mujoco.mjtJoint.mjJNT_SLIDE, axis=[1.0, 0.0, 0.0],
+                   armature=tracks.BELT_ARMATURE)
+    half_height = tracks.IDLER_RADIUS
+    belt.add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_BOX, pos=[0.0, y, half_height],
+                  size=[tracks.TUMBLER + tracks.IDLER_RADIUS, tracks.SHOE_WIDTH / 2, half_height],
+                  contype=0, conaffinity=0, group=3, rgba=[0.2, 0.6, 0.9, 0.3])
+    _valve(spec, tracks.TRAVEL + side, name, tracks.TRACTION, tracks.TRAVEL_SPEED)
+
+
 def _machine_spec(index: int, weld: bool) -> mujoco.MjSpec:
     spec = mujoco.MjSpec.from_file(str(MACHINE_XML))
-    for body, mass in LINK_MASSES.items():
-        mesh_geom = next(g for g in spec.body(body).geoms if g.type == mujoco.mjtGeom.mjGEOM_MESH)
-        mesh_geom.mass = mass - (COUNTERWEIGHT_MASS if body == "upper" else 0.0)
-    spec.geom("counterweight").mass = COUNTERWEIGHT_MASS
-    for geom in spec.body("base").geoms:
-        if geom.name.startswith(TRACK_FEET):
-            geom.contype = 0 if weld else 1 << index
-            geom.conaffinity = 0
+    for name, solid in body_solids().items():
+        body = spec.body(name)
+        body.explicitinertial = True
+        body.mass = solid.mass
+        body.ipos = solid.com
+        body.fullinertia = full_inertia(solid)
     for name, home in zip(JOINT_NAMES, HOME_POSE, strict=True):
         joint = spec.joint(name)
         _turn_reference_to_home(joint, home)
         joint.solref_limit = [2 * TIMESTEP, 1.0]
         joint.solimp_limit = [*VALVE_SOLIMP, 0.5, 2.0]
-        valve = spec.worldbody.add_body(name=name + VALVE, mass=1.0, inertia=[1.0, 1.0, 1.0],
-                                        explicitinertial=True)
-        valve.add_joint(name=name + VALVE, axis=[0.0, 0.0, 1.0], armature=VALVE_INERTIA)
-        tendon = spec.add_tendon(name=name + VALVE, frictionloss=FORCE_CAPS[name],
-                                 solref_friction=[2 * TIMESTEP, 1.0],
-                                 solimp_friction=[*VALVE_SOLIMP, 0.5, 2.0])
-        tendon.wrap_joint(name, 1.0)
-        tendon.wrap_joint(name + VALVE, -1.0)
-        act = spec.add_actuator(name=name, target=name + VALVE, trntype=mujoco.mjtTrn.mjTRN_JOINT)
-        act.set_to_velocity(kv=VALVE_GAIN)
-        act.ctrllimited = mujoco.mjtLimited.mjLIMITED_TRUE
-        act.ctrlrange = [-SPEED_LIMITS[name], SPEED_LIMITS[name]]
+        _valve(spec, name, name, FORCE_CAPS[name], SPEED_LIMITS[name])
+    for side in tracks.SIDES:
+        _add_belt(spec, side)
     return spec
 
 
@@ -115,7 +136,9 @@ def _add_ground(scene: mujoco.MjSpec, index: int, prefix: str, offset: np.ndarra
                        -GROUND_DEPTH]
     scene.worldbody.add_geom(name=prefix + GROUND, type=mujoco.mjtGeom.mjGEOM_HFIELD,
                              hfieldname=prefix + GROUND, pos=centre, contype=0,
-                             conaffinity=1 << index, material=GROUND, friction=[0.8, 0.005, 1e-4])
+                             conaffinity=1 << index, material=GROUND,
+                             friction=[tracks.NOMINAL_FRICTION[0], 0.005, 1e-4])
+    scene.add_numeric(name=prefix + tracks.FRICTION, size=2, data=list(tracks.NOMINAL_FRICTION))
 
 
 def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
@@ -127,6 +150,8 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
     scene.option.timestep = TIMESTEP
     scene.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
     scene.option.tolerance = SOLVER_TOLERANCE
+    scene.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
+    scene.option.impratio = tracks.IMPRATIO
     scene.visual.global_.offwidth = 1280
     scene.visual.global_.offheight = 720
     scene.visual.quality.shadowsize = 4096
@@ -169,6 +194,14 @@ def write_ground(model: mujoco.MjModel, index: int, heights: np.ndarray) -> None
     ).ravel()
 
 
+def write_friction(model: mujoco.MjModel, index: int, along: float, across: float) -> None:
+    if not all(np.isfinite(v) and v > 0 for v in (along, across)):
+        raise ValueError("friction coefficients must be finite and positive")
+    adr = int(model.numeric(machine_prefix(index) + tracks.FRICTION).adr[0])
+    model.numeric_data[adr:adr + 2] = (along, across)
+    model.geom_friction[model.geom(machine_prefix(index) + GROUND).id, 0] = along
+
+
 def ground_axes() -> tuple[np.ndarray, np.ndarray]:
     nrow, ncol = ground_shape()
     return np.linspace(*GROUND_X, ncol), np.linspace(*GROUND_Y, nrow)
@@ -183,11 +216,6 @@ def set_weld(model: mujoco.MjModel, data: mujoco.MjData, index: int, on: bool) -
         data.mocap_pos[mocap] = data.xpos[base]
         data.mocap_quat[mocap] = data.xquat[base]
         data.qvel[_base_dofs(model, index)] = 0.0
-    else:
-        for geom in range(model.ngeom):
-            if model.geom(geom).name.startswith(prefix + TRACK_FEET):
-                model.geom_contype[geom] = 1 << index
-        model.body_contype[base] |= 1 << index
     data.eq_active[model.equality(prefix + WELD).id] = int(on)
 
 

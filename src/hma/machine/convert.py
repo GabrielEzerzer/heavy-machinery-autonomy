@@ -38,9 +38,6 @@ COLORS = {
     "arm": "0.93 0.62 0.12 1",
     "bucket": "0.30 0.30 0.32 1",
 }
-TRACK_FOOTPRINT_DEPTH = 0.05
-TRACK_FEET_ALONG = 6
-TRACK_FOOT_RADIUS = 0.1
 COUNTERWEIGHT_DEPTH = 0.6
 COUNTERWEIGHT_HEIGHT = 1.0
 
@@ -145,18 +142,6 @@ def link_meshes(urdf: ET.Element, meshes_dir: Path) -> dict[str, tuple[np.ndarra
     return out
 
 
-def track_feet(crawler: np.ndarray) -> list[tuple[str, np.ndarray]]:
-    bottom = crawler[:, 2] < crawler[:, 2].min() + TRACK_FOOTPRINT_DEPTH
-    pts = crawler[bottom]
-    xs = np.linspace(pts[:, 0].min(), pts[:, 0].max(), TRACK_FEET_ALONG)
-    inner, outer = np.abs(pts[:, 1]).min(), np.abs(pts[:, 1]).max()
-    feet = []
-    for name, side in (("track_left", 1.0), ("track_right", -1.0)):
-        for k, (x, y) in enumerate((x, y) for x in xs for y in (inner, outer)):
-            feet.append((f"{name}_{k}", np.array([x, side * y, TRACK_FOOT_RADIUS])))
-    return feet
-
-
 def counterweight_box(body: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     rear = body[:, 0].min()
     pts = body[body[:, 0] < rear + COUNTERWEIGHT_DEPTH]
@@ -179,10 +164,6 @@ def build_mjcf(urdf: ET.Element, meshes: dict[str, tuple[np.ndarray, np.ndarray]
     ET.SubElement(base, "freejoint", name="base_free")
     ET.SubElement(base, "geom", name="crawler", type="mesh", mesh="crawler",
                   material="crawler_paint", contype="0", conaffinity="0", group="1")
-    for name, centre in track_feet(meshes["track_link"][0]):
-        ET.SubElement(base, "geom", name=name, type="sphere", pos=fmt(centre),
-                      size=fmt(np.array([TRACK_FOOT_RADIUS])), mass="0",
-                      rgba="0.2 0.6 0.9 0.4", group="3", friction="0.8 0.005 0.0001")
 
     parent = base
     for urdf_joint, name in JOINTS.items():

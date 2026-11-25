@@ -11,6 +11,7 @@ from hma.machine.model import (
     LINK_MASSES,
     SPEED_LIMITS,
     TIP_SITE,
+    TRAVEL_NAMES,
     VALVE,
     WELD,
     ground_axes,
@@ -19,8 +20,10 @@ from hma.machine.model import (
     machine_prefix,
     set_weld,
     tendon_friction,
+    write_friction,
     write_ground,
 )
+from hma.machine.tracks import place, step
 
 __all__ = [
     "BODY_NAMES",
@@ -33,6 +36,7 @@ __all__ = [
     "LINK_MASSES",
     "SPEED_LIMITS",
     "TIP_SITE",
+    "TRAVEL_NAMES",
     "VALVE",
     "WELD",
     "forward_kinematics",
@@ -41,7 +45,10 @@ __all__ = [
     "inverse_kinematics",
     "load_scene",
     "machine_prefix",
+    "place",
     "set_weld",
+    "step",
     "tendon_friction",
+    "write_friction",
     "write_ground",
 ]
