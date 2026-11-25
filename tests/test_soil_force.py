@@ -1,9 +1,10 @@
 import math
 
 import numpy as np
+import pytest
 
 from hma.soil import FORCE_CAP, NOMINAL, SoilParams, cutting_force, sample_soil
-from hma.soil.force import BACK_GAIN, fee_factors, rake_limit
+from hma.soil.force import BACK_GAIN, failure_angle, fee_factors, rake_limit
 
 WIDTH = 0.61
 STIFF = SoilParams(105.0e3, 105.0e3, 0.8, 22.0e3, 0.4, 300.0)
@@ -76,3 +77,19 @@ def test_spoil_costs_its_weight_without_cohesion_and_blends_continuously():
     weight_only = SoilParams(0.0, 0.0, STIFF.friction_angle, STIFF.unit_weight,
                              STIFF.steel_friction_angle, 0.0)
     assert values[-1] == force(weight_only, depth, rake, load=0.0)
+
+
+def test_the_failure_angle_minimises_the_weight_factor():
+    def n_gamma(soil, rake, beta):
+        phi, delta = soil.friction_angle, soil.steel_friction_angle
+        return ((1 / math.tan(rake) + 1 / math.tan(beta)) * math.sin(phi + beta)
+                / (2 * math.sin(delta + rake + phi + beta)))
+
+    for soil in SOILS:
+        for rake in np.linspace(0.2, rake_limit(soil), 9):
+            beta = failure_angle(soil, rake)
+            assert fee_factors(soil, rake)[0] == pytest.approx(n_gamma(soil, rake, beta))
+            best = n_gamma(soil, rake, beta)
+            for other in np.linspace(0.02, math.pi - soil.friction_angle
+                                     - soil.steel_friction_angle - rake - 0.02, 50):
+                assert best <= n_gamma(soil, rake, other) * (1 + 1e-4)
