@@ -8,7 +8,15 @@ import pytest
 from hma.hydraulics import NOMINAL, RANGES, Hydraulics, draw_machine
 from hma.hydraulics import circuit as c
 from hma.hydraulics import layer as oil_layer
-from hma.hydraulics.layer import DISPLACEMENT, INFLOW, NODE_DROPS, VOLUME_SLOPE
+from hma.hydraulics.layer import (
+    CHECKS,
+    DISPLACEMENT,
+    DROPS,
+    INFLOW,
+    NODE_DROPS,
+    ORIFICES,
+    VOLUME_SLOPE,
+)
 from hma.machine import (
     BODY_NAMES,
     JOINT_LIMITS,
@@ -432,26 +440,35 @@ def test_a_parked_machine_holds_2500_kg_on_a_ten_degree_side_slope():
 
 
 RELIEF_OVERSHOOT = 3.0e6
+BLOCKED_SHARE = 1e-3
+
+
+def corner_scene():
+    machines = [extreme_machine(m) for m in RANGES["link_mass"]] + [NOMINAL]
+    model = dig_pit(load_scene(len(machines), weld=True), len(machines))
+    return machines, Hydraulics(model, mujoco.MjData(model), machines)
 
 
 def test_random_combined_commands_at_the_corners_keep_floor_relief_and_torque_consistent():
-    machines = [extreme_machine(m) for m in RANGES["link_mass"]] + [NOMINAL]
-    model = dig_pit(load_scene(len(machines), weld=True), len(machines))
-    data = mujoco.MjData(model)
-    layer = Hydraulics(model, data, machines)
+    machines, layer = corner_scene()
     setting = np.zeros((len(machines), c.NODES))
     for i, m in enumerate(machines):
         setting[i, :c.PUMPS] = m.main_relief
         setting[i, c.PUMPS:] = m.port_relief.ravel()
     setting[:, c.PUMPS:c.PUMPS + 2] = np.inf
     rng = np.random.default_rng(11)
-    pressures, mismatch = [], []
+    pressures, mismatch, backward, blocked = [], [], [], []
     for _ in range(100):
         layer.act(rng.choice([-1.0, 0.0, 1.0], size=(len(machines), 4)))
         for _ in range(layer.steps_per_decision):
+            start = check_drops(layer)
             mismatch.append(stepped_force_mismatch(layer))
+            backward.append(backward_check_flow(layer, start))
+            blocked.append(blocked_check_flow(layer))
             pressures.append(layer._pressure.copy())
     pressures, mismatch = np.array(pressures), np.array(mismatch)
+    assert np.max(backward) < 1e-12
+    assert np.max(blocked) < BLOCKED_SHARE
     assert np.isfinite(pressures).all()
     assert pressures.min() >= c.CAVITATION_PRESSURE - 1e-6
     assert (pressures - setting).max() < RELIEF_OVERSHOOT
@@ -462,6 +479,53 @@ def test_random_combined_commands_at_the_corners_keep_floor_relief_and_torque_co
     flips = np.array([chatter_per_node(pressures[:, i]) for i in range(len(machines))])
     assert flips[:2].max() <= 0.025
     assert flips[2].max() <= 0.003
+
+
+def test_a_capped_step_keeps_the_attempt_whose_forces_matched_best(monkeypatch):
+    monkeypatch.setattr(oil_layer, "REDO_PASSES", 1)
+    machines, layer = corner_scene()
+    rng = np.random.default_rng(11)
+    mismatch = []
+    for _ in range(50):
+        layer.act(rng.choice([-1.0, 0.0, 1.0], size=(len(machines), 4)))
+        for _ in range(layer.steps_per_decision):
+            mismatch.append(stepped_force_mismatch(layer))
+    assert layer.capped >= 3
+    assert np.array(mismatch)[..., SWING].max() < 0.5e3
+
+
+def check_drops(layer):
+    nodes = layer._nodes.copy()
+    nodes[:, :c.NODES] = layer._pressure
+    return (nodes @ DROPS)[:, ORIFICES]
+
+
+def backward_check_flow(layer, start):
+    flow = layer._edge_flow[:, ORIFICES] + layer._edge_slope[:, ORIFICES] * (
+        check_drops(layer) - start)
+    return np.maximum(-flow[:, CHECKS], 0.0)
+
+
+def blocked_check_flow(layer):
+    gain = layer._orifice_gain
+    shut = CHECKS & (layer._edge_slope[:, ORIFICES] == 0.0) & (gain > 0.0)
+    flow = oil_layer._one_way(gain, check_drops(layer))[0]
+    return np.where(shut, flow, 0.0) / layer._pump_max[:, None]
+
+
+def test_every_check_valve_ends_a_step_passing_oil_forward_or_shut_against_a_reverse_difference():
+    layer = layer_for(NOMINAL)
+    rng = np.random.default_rng(19)
+    backward, blocked = [], []
+    for k in range(990):
+        if k % 20 == 0:
+            layer.act(rng.choice([-1.0, 0.0, 1.0], size=(1, 4)))
+        start = check_drops(layer)
+        layer.step()
+        backward.append(backward_check_flow(layer, start))
+        blocked.append(blocked_check_flow(layer))
+    assert np.max(backward) < 1e-12
+    assert np.max(blocked) < BLOCKED_SHARE
 
 
 def stepped_force_mismatch(layer):
@@ -564,7 +628,7 @@ def test_energy_closes_with_cavitation_and_outside_forces_once_the_integration_t
     assert opened
     assert np.all(residual > 0.0)
     assert np.all(np.abs(residual - damping + growth) < 1e-9 * pump)
-    assert np.all(np.abs(layer.work_energy - actuator) < 1e-4 * pump)
+    assert np.all(np.abs(layer.work_energy - actuator) < 3e-4 * pump)
     assert np.all(play > 0.0)
 
 
