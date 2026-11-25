@@ -111,7 +111,6 @@ def reach_load_point(machine: Machine, radius: float, height: float) -> tuple[fl
             if best is None or err < best[0]:
                 best = (err, boom, arm)
     _, boom, arm = best
-    step = 0.01
     for _ in range(60):
         machine.pose(0.0, boom, arm, 0.0, False)
         x, _, z = machine.anchor("bucket")
@@ -121,10 +120,12 @@ def reach_load_point(machine: Machine, radius: float, height: float) -> tuple[fl
         jac = machine.point_jacobian(machine.anchor("bucket"), "arm")
         j2 = jac[np.ix_([0, 2], [machine.dofs["boom"], machine.dofs["arm"]])]
         boom, arm = np.array([boom, arm]) - np.linalg.lstsq(j2, r, rcond=None)[0]
-        step = np.linalg.norm(r)
+    machine.pose(0.0, boom, arm, 0.0, False)
+    x, _, z = machine.anchor("bucket")
+    miss = float(np.hypot(x - radius, z - height))
     lo_b, hi_b = JOINT_LIMITS["boom"]
     lo_a, hi_a = JOINT_LIMITS["arm"]
-    if step > 1e-4 or not (lo_b <= boom <= hi_b and lo_a <= arm <= hi_a):
+    if miss > 1e-4 or not (lo_b <= boom <= hi_b and lo_a <= arm <= hi_a):
         return None
     return float(boom), float(arm)
 

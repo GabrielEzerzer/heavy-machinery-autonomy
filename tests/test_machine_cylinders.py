@@ -17,7 +17,7 @@ from hma.machine.cylinders import (
     pin_on_child,
     xz,
 )
-from hma.machine.statics import Machine, digging, lift
+from hma.machine.statics import CHART, Machine, digging, lift, reach_load_point
 
 
 def sweep(joint, n=2001):
@@ -106,3 +106,13 @@ def test_total_mass_and_centre_follow_a_bucket_removed_at_run_time():
     assert total == pytest.approx(float(model.body_subtreemass[machine.bodies["base"]])
                                   - machine.bucket_mass)
     np.testing.assert_allclose(com, moment / mass, atol=1e-12)
+
+
+def test_every_chart_point_is_reached_at_the_pose_found():
+    machine = Machine()
+    for height, radius in CHART:
+        pose = reach_load_point(machine, radius, height)
+        assert pose is not None, (height, radius)
+        machine.pose(0.0, *pose, 0.0, False)
+        x, _, z = machine.anchor("bucket")
+        assert abs(x - radius) < 1e-4 and abs(z - height) < 1e-4
