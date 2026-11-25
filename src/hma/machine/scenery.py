@@ -8,6 +8,8 @@ from functools import lru_cache
 import mujoco
 import numpy as np
 
+from hma.machine import kinematics
+
 SKY_TOP = (0.42, 0.6, 0.82)
 SKY_HORIZON = (0.86, 0.89, 0.91)
 DIRT_DARK = np.array([0.42, 0.34, 0.25])
@@ -15,10 +17,17 @@ DIRT_LIGHT = np.array([0.66, 0.56, 0.43])
 DIRT_TILE = 14.0
 DIRT_PIXELS = 1024
 DIRT_SEED = 7
-SITE_STEPS = (0.0, 2.0, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 400.0)
+DIRT_GRAIN = 4.0
+SITE_STEPS = (0.0, 2.0, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0, 640.0, 1280.0)
 SITE_DROP = 0.0
 SUN_DIR = (-0.45, 0.3, -0.85)
-SUN_DISTANCE = 12.0
+SUN_BACKOFF = 20.0
+SHADOW_MARGIN = 0.5
+SHOULDER = np.array([kinematics.BOOM_PIVOT[0], 0.0,
+                     kinematics.SWING_HEIGHT + kinematics.BOOM_PIVOT[2]])
+REACH = kinematics.BOOM_LENGTH + kinematics.ARM_LENGTH + kinematics.BUCKET_LENGTH + SHADOW_MARGIN
+NEAR, FAR = 0.1, 3000.0
+FOG_START, FOG_END = 60.0, 900.0
 
 
 @lru_cache(maxsize=1)
@@ -27,10 +36,12 @@ def dirt_pixels() -> bytes:
     k = np.fft.fftfreq(DIRT_PIXELS)
     radius = np.hypot(*np.meshgrid(k, k))
     radius[0, 0] = 1.0
-    field = np.fft.ifft2(np.fft.fft2(rng.standard_normal((DIRT_PIXELS,) * 2)) / radius**1.4).real
+    cutoff = DIRT_TILE / DIRT_GRAIN / DIRT_PIXELS
+    shape = (1.0 - np.exp(-((radius / cutoff) ** 2))) / radius**1.4
+    field = np.fft.ifft2(np.fft.fft2(rng.standard_normal((DIRT_PIXELS,) * 2)) * shape).real
     field = (field - field.mean()) / field.std()
-    grain = rng.standard_normal(field.shape) * 0.35
-    shade = np.clip(0.5 + 0.18 * field + 0.12 * grain, 0.0, 1.0)[..., None]
+    grain = rng.standard_normal(field.shape) * 0.25
+    shade = np.clip(0.5 + 0.15 * field + 0.12 * grain, 0.0, 1.0)[..., None]
     rgb = DIRT_DARK + shade * (DIRT_LIGHT - DIRT_DARK)
     return np.round(rgb * 255).astype(np.uint8).tobytes()
 
@@ -63,23 +74,30 @@ def _surround(footprints: list[tuple[float, float, float, float]]) -> list[tuple
     return cells
 
 
-def dress(scene: mujoco.MjSpec, footprints: list[tuple[float, float, float, float]]) -> None:
-    """footprints: (x0, x1, y0, y1) of each machine's heightfield, which uses the "ground" material.
-    Call it after the heightfields exist: flat ground casts no shadow, which keeps shadows clean."""
-    x0, x1 = min(f[0] for f in footprints), max(f[1] for f in footprints)
-    y0, y1 = min(f[2] for f in footprints), max(f[3] for f in footprints)
-    centre = np.array([(x0 + x1) / 2, (y0 + y1) / 2, 1.0])
-    scene.stat.center = centre.tolist()
-    scene.stat.extent = float(np.hypot(x1 - x0, y1 - y0)) / 2
+def _sun_box(swing_axes: list[tuple[float, float]]) -> tuple[np.ndarray, float, float]:
+    shoulders = np.array([(x, y, 0.0) for x, y in swing_axes]) + SHOULDER
+    centre = (shoulders.min(axis=0) + shoulders.max(axis=0)) / 2
+    sun = np.array(SUN_DIR) / np.linalg.norm(SUN_DIR)
+    along = (shoulders - centre) @ sun
+    across = np.linalg.norm(shoulders - centre - np.outer(along, sun), axis=1)
+    return centre, float(across.max()) + REACH, float(np.abs(along).max()) + REACH + SUN_BACKOFF
+
+
+def dress_after_heightfields(scene: mujoco.MjSpec, footprints: list[tuple[float, ...]],
+                             swing_axes: list[tuple[float, float]]) -> None:
     first = footprints[0]
+    extent = float(np.hypot(first[1] - first[0], first[3] - first[2])) / 2
+    centre, reach, distance = _sun_box(swing_axes)
+    scene.stat.center = centre.tolist()
+    scene.stat.extent = extent
     vis = scene.visual
     vis.global_.offwidth, vis.global_.offheight = 1280, 720
-    vis.quality.shadowsize = 4096
+    vis.quality.shadowsize = 8192 if len(swing_axes) == 1 else 4096
     vis.quality.offsamples = 4
-    vis.map.shadowclip = 1.0
+    vis.map.shadowclip = reach / extent
     vis.map.haze = 0.4
-    vis.map.fogstart, vis.map.fogend = 3.0, 12.0
-    vis.map.znear, vis.map.zfar = 0.01, 60.0
+    vis.map.fogstart, vis.map.fogend = FOG_START / extent, FOG_END / extent
+    vis.map.znear, vis.map.zfar = NEAR / extent, FAR / extent
     vis.rgba.haze = [*SKY_HORIZON, 1.0]
     vis.rgba.fog = [*SKY_HORIZON, 1.0]
     vis.headlight.ambient = [0.32, 0.32, 0.34]
@@ -90,7 +108,8 @@ def dress(scene: mujoco.MjSpec, footprints: list[tuple[float, float, float, floa
                       rgb1=list(SKY_TOP), rgb2=list(SKY_HORIZON))
     _add_dirt(scene, ((first[1] - first[0]) / DIRT_TILE, (first[3] - first[2]) / DIRT_TILE))
     scene.worldbody.add_light(name="sun", type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL,
-                              pos=(centre - SUN_DISTANCE * np.array(SUN_DIR)).tolist(),
+                              pos=(centre - distance * np.array(SUN_DIR)
+                                   / np.linalg.norm(SUN_DIR)).tolist(),
                               dir=list(SUN_DIR), castshadow=True,
                               diffuse=[0.75, 0.72, 0.66], specular=[0.3, 0.3, 0.3],
                               ambient=[0.0, 0.0, 0.0])

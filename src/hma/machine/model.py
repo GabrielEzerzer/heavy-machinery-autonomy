@@ -9,7 +9,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from hma.machine.scenery import dress
+from hma.machine.scenery import dress_after_heightfields
 
 ASSETS = Path(__file__).parent / "assets"
 MACHINE_XML = ASSETS / "excavator.xml"
@@ -157,8 +157,9 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
                            name2=prefix + ANCHOR, data=[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0],
                            active=int(weld))
     _share_look(scene)
-    dress(scene, [(*GROUND_X, i * MACHINE_SPACING + GROUND_Y[0], i * MACHINE_SPACING + GROUND_Y[1])
-                  for i in range(n_machines)])
+    offsets = [i * MACHINE_SPACING for i in range(n_machines)]
+    footprints = [(*GROUND_X, y + GROUND_Y[0], y + GROUND_Y[1]) for y in offsets]
+    dress_after_heightfields(scene, footprints, [(0.0, y) for y in offsets])
     scene.add_key(name=HOME_KEY)
     model = scene.compile()
     flat = np.zeros(ground_shape())
