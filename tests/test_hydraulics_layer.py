@@ -518,7 +518,7 @@ def test_power_limit_holds_still_at_a_stall_and_at_rest():
     cap = NOMINAL.force_limit[ARM]
     for load, command in ((lambda v: -1.2 * cap, 1.0), (lambda v: 0.0, -1.0),
                           (lambda v: 0.0, 0.0)):
-        layer, (commands, speeds) = pushed_arm(NOMINAL, load, command, 4.0)
+        layer, (commands, speeds) = pushed_arm(NOMINAL, load, command, 5.0)
         assert np.ptp(commands[-200:]) < 1e-9
         assert np.ptp(speeds[-200:]) < 1e-4
         if command:
@@ -529,12 +529,12 @@ def test_power_limit_holds_still_at_a_stall_and_at_rest():
 
 def test_free_air_motion_never_reaches_the_power_limit():
     unlimited = replace(NOMINAL, power=1e12)
-    for u in ([0, 1, -1, 1], [1, -1, 1, 1], [-1, -1, 1, -1]):
+    for u in ([0, 1, -1, 1], [1, -1, -1, 1], [-1, 1, -1, -1]):
         for machine in (NOMINAL, draw_machine(9)):
             runs = [steady_speeds(m, u, 1.5) for m in (machine, replace(machine, power=1e12))]
             assert np.array_equal(*runs)
-    assert np.array_equal(steady_speeds(NOMINAL, [0, -1, 1, 1]),
-                          steady_speeds(unlimited, [0, -1, 1, 1]))
+    assert np.array_equal(steady_speeds(NOMINAL, [0, -1, -1, 1]),
+                          steady_speeds(unlimited, [0, -1, -1, 1]))
 
 
 def test_curve_gain_applies_before_the_drawn_speed_limit_clips():
@@ -617,12 +617,12 @@ def test_a_held_full_command_stays_within_the_stated_windows_of_the_power_limit(
 def test_the_slowdown_lingers_after_an_overload_and_then_clears():
     layer = layer_for(NOMINAL)
     ratios = []
-    for k in range(round(7.0 / DT)):
+    for k in range(round(16.0 / DT)):
         if k % layer.steps_per_decision == 0:
-            layer.act(np.full((1, 4), 1.0 if k * DT < 6.0 else 0.1))
+            layer.act(np.full((1, 4), 1.0 if k * DT < 15.0 else 0.1))
         layer.step()
         ratios.append(layer._ratio[0])
-    drop = round(6.0 / DT)
+    drop = round(15.0 / DT)
     assert ratios[drop] < 0.5
     assert ratios[drop + round(0.3 / DT)] < 0.9
     assert ratios[drop + round(0.6 / DT)] == 1.0

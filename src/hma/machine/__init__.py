@@ -18,6 +18,7 @@ from hma.machine.model import (
     load_scene,
     machine_prefix,
     set_weld,
+    tendon_friction,
     write_ground,
 )
 
@@ -41,5 +42,6 @@ __all__ = [
     "load_scene",
     "machine_prefix",
     "set_weld",
+    "tendon_friction",
     "write_ground",
 ]

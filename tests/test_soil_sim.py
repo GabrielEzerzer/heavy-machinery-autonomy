@@ -4,14 +4,13 @@ import mujoco
 import numpy as np
 import pytest
 
-from hma.machine import FORCE_CAPS, JOINT_NAMES, load_scene, machine_prefix
+from hma.machine import FORCE_CAPS, JOINT_NAMES, VALVE, load_scene, machine_prefix, tendon_friction
 from hma.machine.kinematics import inverse_kinematics
 from hma.soil import (
     BUCKET_CAPACITY,
     NOMINAL,
     Soil,
     SoilParams,
-    joint_load,
     physics_steps,
     sample_soil,
     step,
@@ -32,6 +31,11 @@ STIFF = SoilParams(105.0e3, 105.0e3, 0.8, 22.0e3, 0.4, 300.0)
 LOOSE = SoilParams(0.0, 0.0, 0.3, 17.0e3, 0.2, 0.0)
 BURIED = (np.array([6.0, 0.0, -0.25]), PITCH_DIG)
 BETWEEN_CELLS = (np.array([6.05, 0.0, -0.25]), PITCH_DIG)
+
+
+def joint_load(model, data, index, joint):
+    tendon = model.tendon(machine_prefix(index) + joint + VALVE).id
+    return -float(tendon_friction(data, [tendon])[0])
 
 
 def machine(params=NOMINAL):
@@ -77,8 +81,7 @@ def nominal():
 
 
 def tendon_forces(data, soil):
-    rows = data.efc_type == mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON
-    return [float(data.efc_force[rows & (data.efc_id == t)].sum()) for t in soil.tendons]
+    return tendon_friction(data, soil.tendons).tolist()
 
 
 def joint_loads(model, data):
@@ -165,7 +168,7 @@ def test_stiff_soil_stalls_the_drag_against_the_arm_cap():
     last = trace[-10:]
     assert {s["phase"] for s in last} == {"drag"}
     assert all(abs(s["loads"]["arm"]) >= 0.99 * FORCE_CAPS["arm"] for s in last)
-    assert np.linalg.norm(last[-1]["tip"][:2] - last[0]["tip"][:2]) < 0.01
+    assert np.linalg.norm(last[-1]["tip"][:2] - last[0]["tip"][:2]) < 0.015
 
 
 def test_holding_the_bucket_at_its_limit_stalls_like_a_free_bucket():

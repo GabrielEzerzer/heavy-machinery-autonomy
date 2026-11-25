@@ -23,7 +23,7 @@ ANCHOR = "anchor"
 WELD = "base_weld"
 GROUND = "ground"
 HOME_KEY = "home"
-HOME_POSE = (0.0, 0.0, 1.6, 0.4)
+HOME_POSE = (0.0, -0.6, 1.9, 0.6)
 
 LINK_MASSES = {"base": 4500.0, "upper": 5580.0, "boom": 1220.0, "arm": 600.0, "bucket": 400.0}
 COUNTERWEIGHT_MASS = 2450.0
@@ -45,10 +45,19 @@ MAX_MACHINES = 31
 
 TIMESTEP = 0.005
 SOLVER_TOLERANCE = 1e-12
+FRICTION_TENDON = int(mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON)
 
 
 def machine_prefix(index: int) -> str:
     return f"m{index}/"
+
+
+def tendon_friction(data: mujoco.MjData, tendons: np.ndarray) -> np.ndarray:
+    tendons = np.asarray(tendons, np.intp)
+    rows = data.efc_type == FRICTION_TENDON
+    forces = np.bincount(data.efc_id[rows], weights=data.efc_force[rows],
+                         minlength=int(tendons.max(initial=-1)) + 1)
+    return forces[tendons]
 
 
 def ground_shape() -> tuple[int, int]:

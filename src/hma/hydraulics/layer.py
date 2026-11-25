@@ -18,14 +18,21 @@ from hma.hydraulics.params import (
     RANGES,
     Machine,
 )
-from hma.machine import BODY_NAMES, HOME_KEY, JOINT_NAMES, VALVE, load_scene, machine_prefix
+from hma.machine import (
+    BODY_NAMES,
+    HOME_KEY,
+    JOINT_NAMES,
+    VALVE,
+    load_scene,
+    machine_prefix,
+    tendon_friction,
+)
 from hma.machine.model import COUNTERWEIGHT_MASS
 
 CONTROL_HZ = 10.0
 JOINTS = len(JOINT_NAMES)
 COUNTERWEIGHT = "counterweight"
 UPPER = BODY_NAMES.index("upper")
-FRICTION_TENDON = int(mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON)
 JOINT_SIZES = {int(mujoco.mjtJoint.mjJNT_FREE): (7, 6), int(mujoco.mjtJoint.mjJNT_BALL): (4, 3)}
 
 
@@ -117,7 +124,6 @@ class Hydraulics:
         ]
         self._counterweight = _counterweight_solid(reference)
         self._scratch = mujoco.MjData(model)
-        self._tendon_forces = np.zeros(model.ntendon)
 
         delay_cap = max([RANGES["delay"][1], *(float(np.max(m.delay)) for m in machines)])
         latency_cap = max([RANGES["sensor_latency"][1], *(m.sensor_latency for m in machines)])
@@ -324,11 +330,7 @@ class Hydraulics:
         data = self.data
         out[0] = data.qpos[self._qpos]
         out[1] = data.qvel[self._qvel]
-        rows = np.flatnonzero(data.efc_type == FRICTION_TENDON)
-        forces = self._tendon_forces
-        forces[:] = 0.0
-        forces[data.efc_id[rows]] = data.efc_force[rows]
-        out[2] = forces[self._tendons] * self._inv_force_limit
+        out[2] = tendon_friction(data, self._tendons) * self._inv_force_limit
 
     def true_state(self) -> Observation:
         out = np.empty((3, self.n, JOINTS))
