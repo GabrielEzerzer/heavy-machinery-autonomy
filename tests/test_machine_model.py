@@ -227,7 +227,7 @@ def test_ridge_across_the_middle_of_the_tracks_lifts_the_machine():
 
 
 @pytest.mark.parametrize("lip", [1.5, 1.4, 1.2, 1.0])
-def test_loaded_machine_stays_level_with_track_ends_over_a_trench(lip):
+def test_loaded_machine_stays_level_with_track_ends_over_a_drop(lip):
     model = load_scene(1)
     xs, _ = ground_axes()
     heights = np.zeros(ground_shape())
@@ -371,7 +371,7 @@ def test_write_ground_rejects_bad_input():
         write_ground(model, 0, np.full(ground_shape(), np.nan))
 
 
-def test_ground_grid_covers_the_dig_area_and_depth():
+def test_ground_grid_covers_the_work_area_and_depth():
     xs, ys = ground_axes()
     assert ground_shape() == (len(ys), len(xs)) and len(xs) != len(ys)
     assert math.isclose(xs[1] - xs[0], 0.1) and math.isclose(ys[1] - ys[0], 0.1)
