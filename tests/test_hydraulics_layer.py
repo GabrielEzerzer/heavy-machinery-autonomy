@@ -605,6 +605,29 @@ def test_reversals_against_a_resisting_load_hold_the_power_over_two_seconds(
     assert power[200:].mean() > 0.7 * machine.power
 
 
+def test_a_held_full_command_stays_within_the_stated_windows_of_the_power_limit():
+    _, power = loaded_run(NOMINAL, lambda ctrl, speed: np.zeros(4), lambda k: np.ones(4), 10.0)
+    share = power[400:] / NOMINAL.power
+    half, two = round(0.5 / DT), round(2.0 / DT)
+    assert np.convolve(share, np.ones(half) / half, mode="valid").max() < 1.10
+    assert np.convolve(share, np.ones(two) / two, mode="valid").max() < 1.04
+    assert share[-half:].mean() == pytest.approx(1.0, abs=0.003)
+
+
+def test_the_slowdown_lingers_after_an_overload_and_then_clears():
+    layer = layer_for(NOMINAL)
+    ratios = []
+    for k in range(round(7.0 / DT)):
+        if k % layer.steps_per_decision == 0:
+            layer.act(np.full((1, 4), 1.0 if k * DT < 6.0 else 0.1))
+        layer.step()
+        ratios.append(layer._ratio[0])
+    drop = round(6.0 / DT)
+    assert ratios[drop] < 0.5
+    assert ratios[drop + round(0.3 / DT)] < 0.9
+    assert ratios[drop + round(0.6 / DT)] == 1.0
+
+
 def episode(layer, index, machine, commands, others=None):
     layer.reset(index, machine)
     seen = []
