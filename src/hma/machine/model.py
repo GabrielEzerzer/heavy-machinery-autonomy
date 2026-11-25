@@ -44,6 +44,7 @@ MACHINE_SPACING = 14.0
 MAX_MACHINES = 31
 
 TIMESTEP = 0.005
+SOLVER_TOLERANCE = 1e-10
 
 
 def machine_prefix(index: int) -> str:
@@ -124,6 +125,7 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
     scene.meshdir = str(ASSETS)
     scene.option.timestep = TIMESTEP
     scene.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+    scene.option.tolerance = SOLVER_TOLERANCE
     scene.visual.global_.offwidth = 1280
     scene.visual.global_.offheight = 720
     scene.visual.quality.shadowsize = 4096
