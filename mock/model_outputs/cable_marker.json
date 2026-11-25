@@ -1,5 +1,0 @@
-{
- "instruction": "dig 1 m down right at the buried cable",
- "source": "recorded",
- "output": "{\"status\":\"plan\",\"message\":\"Dig a trench 1 m deep at the buried cable.\",\"task_type\":\"trench\",\"marker_id\":\"H1\",\"depth_m\":1,\"length_m\":null,\"width_m\":null,\"heading\":null,\"spoil_side\":null,\"soil_class\":\"unknown\"}"
-}

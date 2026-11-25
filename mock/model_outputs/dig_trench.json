@@ -1,0 +1,5 @@
+{
+ "instruction": "dig a trench 1 m deep at the far marker",
+ "source": "recorded",
+ "output": "{\"status\":\"refuse\",\"message\":\"Digging a trench is not one of the supported tasks for this machine.\",\"task_type\":null,\"load_id\":null,\"marker_id\":null,\"stand_marker_id\":null,\"hold_s\":null}"
+}
