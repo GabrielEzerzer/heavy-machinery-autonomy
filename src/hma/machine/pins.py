@@ -67,14 +67,14 @@ def derive(source: Path) -> tuple[dict[str, tuple[str, tuple[float, ...]]], dict
         xyz, _ = origin(xacro.find(f".//joint[@name='{joint}']/origin"))
         mesh_frame[name] = (frame, xyz)
     for name, (frame, mesh, seed, radius) in MESH_BOSSES.items():
-        verts, _ = read_dae(desc / "meshes" / mesh)
+        verts = read_dae(desc / "meshes" / mesh).verts
         x, z = fit_ring(verts, np.array(seed), radius)
         mesh_frame[name] = (frame, np.array([x, 0.0, z]))
     pins = {name: (frame, tuple(float(v) for v in np.round(turn[frame] @ xyz, 4)))
             for name, (frame, xyz) in mesh_frame.items()}
     lengths = {}
     for name, (mesh, seed, radius) in LINK_MESHES.items():
-        verts, _ = read_dae(desc / "meshes" / mesh)
+        verts = read_dae(desc / "meshes" / mesh).verts
         ends = [fit_ring(verts, np.array(at), radius, 0.12) for at in ((0.0, 0.0), seed)]
         lengths[name] = float(np.linalg.norm(ends[1] - ends[0]))
     return pins, lengths
