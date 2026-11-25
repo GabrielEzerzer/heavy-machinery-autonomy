@@ -1,23 +1,30 @@
-"""The look of an excavator scene: sky, sunlight with soft shadows, and a dirt work site that runs
-from the machines' heightfields out to a hazy horizon. Nothing here collides or has mass."""
+"""The look of an excavator scene: a plain grey machine, with its tracks and upper structure drawn
+without fine detail, on a two-tone grey grid of 1 m squares under a pale sky and a sun with soft
+shadows. Nothing here collides or has mass."""
 
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache
 
 import mujoco
 import numpy as np
 
 from hma.machine import kinematics
+from hma.machine.collision import LINK_MESH, link_triangles
 
-SKY_TOP = (0.42, 0.6, 0.82)
-SKY_HORIZON = (0.86, 0.89, 0.91)
-DIRT_DARK = np.array([0.42, 0.34, 0.25])
-DIRT_LIGHT = np.array([0.66, 0.56, 0.43])
-DIRT_TILE = 14.0
-DIRT_PIXELS = 1024
-DIRT_SEED = 7
-DIRT_GRAIN = 4.0
+SKY_TOP = (0.62, 0.66, 0.72)
+SKY_HORIZON = (0.84, 0.85, 0.87)
+GRID_LIGHT = (0.40, 0.41, 0.43)
+GRID_DARK = (0.33, 0.34, 0.36)
+GRID_SQUARE = 1.0
+GRID_TILE = 2.0 * GRID_SQUARE
+GRID_PIXELS = 256
+MACHINE_GREY = (0.80, 0.81, 0.83, 1.0)
+PAINT = "paint"
+PLAIN_LINKS = ("base", "upper")
+PLAIN_CELL = 0.05
+PLAIN = "_plain"
+DRAWN_GROUP, HIDDEN_GROUP = 1, 4
 SITE_STEPS = (0.0, 2.0, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0, 640.0, 1280.0)
 SITE_DROP = 0.0
 SUN_DIR = (-0.45, 0.3, -0.85)
@@ -30,29 +37,55 @@ NEAR, FAR = 0.1, 3000.0
 FOG_START, FOG_END = 60.0, 900.0
 
 
-@lru_cache(maxsize=1)
-def dirt_pixels() -> bytes:
-    rng = np.random.default_rng(DIRT_SEED)
-    k = np.fft.fftfreq(DIRT_PIXELS)
-    radius = np.hypot(*np.meshgrid(k, k))
-    radius[0, 0] = 1.0
-    cutoff = DIRT_TILE / DIRT_GRAIN / DIRT_PIXELS
-    shape = (1.0 - np.exp(-((radius / cutoff) ** 2))) / radius**1.4
-    field = np.fft.ifft2(np.fft.fft2(rng.standard_normal((DIRT_PIXELS,) * 2)) * shape).real
-    field = (field - field.mean()) / field.std()
-    grain = rng.standard_normal(field.shape) * 0.25
-    shade = np.clip(0.5 + 0.15 * field + 0.12 * grain, 0.0, 1.0)[..., None]
-    rgb = DIRT_DARK + shade * (DIRT_LIGHT - DIRT_DARK)
-    return np.round(rgb * 255).astype(np.uint8).tobytes()
+@cache
+def plain_mesh(link: str) -> tuple[tuple[float, ...], tuple[int, ...]]:
+    points = link_triangles(link).reshape(-1, 3)
+    _, cell, count = np.unique(np.floor(points / PLAIN_CELL).astype(np.int64), axis=0,
+                               return_inverse=True, return_counts=True)
+    cell = cell.ravel()
+    verts = np.zeros((len(count), 3))
+    np.add.at(verts, cell, points)
+    faces = cell.reshape(-1, 3)
+    faces = faces[(faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2])
+                  & (faces[:, 0] != faces[:, 2])]
+    _, first = np.unique(np.sort(faces, axis=1), axis=0, return_index=True)
+    return (tuple((verts / count[:, None]).ravel().tolist()),
+            tuple(faces[np.sort(first)].ravel().tolist()))
 
 
-def _add_dirt(scene: mujoco.MjSpec, ground_repeat: tuple[float, float]) -> None:
-    tex = scene.add_texture(name="dirt", type=mujoco.mjtTexture.mjTEXTURE_2D,
-                            width=DIRT_PIXELS, height=DIRT_PIXELS, nchannel=3)
-    tex.data = dirt_pixels()
+def plain_look(scene: mujoco.MjSpec) -> None:
+    rgb = mujoco.mjtTextureRole.mjTEXROLE_RGB
+    used = set()
+    for material in scene.materials:
+        if material.name.split("/")[-1] == PAINT:
+            used.add(material.textures[rgb])
+            material.textures[rgb] = ""
+            material.rgba = list(MACHINE_GREY)
+    for texture in scene.textures:
+        if texture.name in used:
+            scene.delete(texture)
+    detailed = {mesh: link for link, mesh in LINK_MESH.items() if link in PLAIN_LINKS}
+    for geom in list(scene.geoms):
+        link = detailed.get(geom.meshname.split("/")[-1])
+        if geom.type != mujoco.mjtGeom.mjGEOM_MESH or link is None:
+            continue
+        verts, faces = plain_mesh(link)
+        scene.add_mesh(name=geom.meshname + PLAIN, uservert=list(verts), userface=list(faces),
+                       inertia=mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL)
+        geom.parent.add_geom(name=geom.name + PLAIN, type=mujoco.mjtGeom.mjGEOM_MESH,
+                             meshname=geom.meshname + PLAIN, material=geom.material,
+                             pos=geom.pos, quat=geom.quat, contype=0, conaffinity=0, mass=0.0,
+                             group=DRAWN_GROUP)
+        geom.group = HIDDEN_GROUP
+
+
+def _add_grid(scene: mujoco.MjSpec, ground_repeat: tuple[float, float]) -> None:
+    scene.add_texture(name="grid", type=mujoco.mjtTexture.mjTEXTURE_2D,
+                      builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER, width=GRID_PIXELS,
+                      height=GRID_PIXELS, rgb1=list(GRID_LIGHT), rgb2=list(GRID_DARK))
     for name, repeat in (("ground", ground_repeat), ("site_ground", (1.0, 1.0))):
         mat = scene.add_material(name=name, texrepeat=list(repeat), specular=0.05, shininess=0.1)
-        mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "dirt"
+        mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "grid"
 
 
 def _breaks(low: float, high: float, inner: list[float]) -> list[float]:
@@ -94,7 +127,7 @@ def dress_after_heightfields(scene: mujoco.MjSpec, footprints: list[tuple[float,
     vis.global_.offwidth, vis.global_.offheight = 1280, 720
     vis.quality.shadowsize = 8192 if len(swing_axes) == 1 else 4096
     vis.quality.offsamples = 4
-    vis.map.shadowclip = reach / extent
+    vis.map.shadowclip = float(np.nextafter(np.float32(reach / extent), np.float32(np.inf)))
     vis.map.haze = 0.4
     vis.map.fogstart, vis.map.fogend = FOG_START / extent, FOG_END / extent
     vis.map.znear, vis.map.zfar = NEAR / extent, FAR / extent
@@ -106,7 +139,7 @@ def dress_after_heightfields(scene: mujoco.MjSpec, footprints: list[tuple[float,
     scene.add_texture(name="sky", type=mujoco.mjtTexture.mjTEXTURE_SKYBOX,
                       builtin=mujoco.mjtBuiltin.mjBUILTIN_GRADIENT, width=128, height=768,
                       rgb1=list(SKY_TOP), rgb2=list(SKY_HORIZON))
-    _add_dirt(scene, ((first[1] - first[0]) / DIRT_TILE, (first[3] - first[2]) / DIRT_TILE))
+    _add_grid(scene, ((first[1] - first[0]) / GRID_TILE, (first[3] - first[2]) / GRID_TILE))
     scene.worldbody.add_light(name="sun", type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL,
                               pos=(centre - distance * np.array(SUN_DIR)
                                    / np.linalg.norm(SUN_DIR)).tolist(),
@@ -126,7 +159,7 @@ def _add_site_ground(scene: mujoco.MjSpec, footprints: list[tuple[float, ...]]) 
         n = len(verts)
         for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
             verts.append((x, y, -SITE_DROP))
-            uvs.append((0.5 + (x - cx) / DIRT_TILE, 0.5 - (y - cy) / DIRT_TILE))
+            uvs.append((0.5 + (x - cx) / GRID_TILE, 0.5 - (y - cy) / GRID_TILE))
         faces += [(n, n + 1, n + 2), (n, n + 2, n + 3)]
     verts.append((cx, cy, -SITE_DROP - 1.0))
     uvs.append((0.5, 0.5))

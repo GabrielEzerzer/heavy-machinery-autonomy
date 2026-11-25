@@ -4,7 +4,6 @@ import mujoco
 import numpy as np
 import pytest
 
-from hma.hydraulics import NOMINAL, Hydraulics
 from hma.machine import (
     BODY_NAMES,
     GROUND,
@@ -23,8 +22,18 @@ from hma.machine import (
     set_weld,
     write_ground,
 )
-from hma.machine.model import GROUND_DEPTH
+from hma.machine.load import apply_load, block, hang_load
+from hma.machine.model import (
+    GROUND_DEPTH,
+    LOAD_POINTS,
+    MACHINE_SPACING,
+    MAX_MACHINES,
+    ground_geoms,
+)
+from scenes import held, lock_joints
 
+LIFT_POSE = (0.0, -0.65, 1.0, 2.4)
+LOWER = 0.3
 SOURCE_LIMITS_DEG = {"boom": (-70.0, 44.0), "arm": (30.0, 152.0), "bucket": (-33.0, 143.0)}
 
 
@@ -65,33 +74,15 @@ def push_base(model, data, index, force, seconds):
     data.xfrc_applied[body] = 0.0
 
 
-LAYERS = {}
-
-
-def held(model, data):
-    layer = LAYERS.get(id(data))
-    if layer is None or layer.data is not data:
-        count = sum(model.body(i).name.endswith("/base") for i in range(model.nbody))
-        qpos, qvel = data.qpos.copy(), data.qvel.copy()
-        poses = [joint_angles(model, data, index) for index in range(count)]
-        layer = Hydraulics(model, data, [NOMINAL] * count)
-        for index, pose in enumerate(poses):
-            layer.reset(index, NOMINAL, pose)
-        data.qpos[:], data.qvel[:] = qpos, qvel
-        mujoco.mj_forward(model, data)
-        LAYERS[id(data)] = layer
-    return layer
-
-
-def settle(model, data, seconds=1.0, payload=0.0):
+def settle(model, data, seconds=1.0):
     layer = held(model, data)
-    tip, bucket = model.site(machine_prefix(0) + TIP_SITE).id, model.body("m0/bucket").id
     for _ in range(round(seconds / model.opt.timestep)):
-        if payload:
-            data.qfrc_applied[:] = 0.0
-            mujoco.mj_applyFT(model, data, np.array([0.0, 0.0, -9.81 * payload]), np.zeros(3),
-                              data.site_xpos[tip].copy(), bucket, data.qfrc_applied)
         layer.step()
+
+
+def hang(model, data, mass):
+    apply_load(model, 0, block(mass), mujoco.MjData(model))
+    hang_load(model, data, 0)
 
 
 def test_total_mass_in_operating_weight_band():
@@ -120,7 +111,8 @@ def test_every_driven_joint_has_an_unlimited_torque_motor_on_the_joint():
         assert act.trnid[0] == model.joint(prefix + name).id
         assert act.gainprm[0] == 1.0 and not act.biasprm.any()
         assert not act.ctrllimited and not act.forcelimited
-    assert model.ntendon == 0
+    joint_wraps = model.wrap_type == mujoco.mjtWrap.mjWRAP_JOINT
+    assert not joint_wraps.any()
 
 
 def test_names_are_prefixed_per_machine():
@@ -141,7 +133,7 @@ def test_home_keyframe_puts_every_machine_in_its_home_pose():
     data = home_data(model)
     for i in range(2):
         np.testing.assert_array_equal(joint_angles(model, data, i), HOME_POSE)
-        np.testing.assert_allclose(base_position(model, data, i), [0.0, 14.0 * i, 0.0])
+        np.testing.assert_allclose(base_position(model, data, i), [0.0, MACHINE_SPACING * i, 0.0])
 
 
 @pytest.mark.parametrize("weld", [False, True])
@@ -162,14 +154,14 @@ def test_each_machine_stands_on_its_own_ground_with_few_contacts():
     settle(model, data)
     pairs = {}
     for contact in data.contact[: data.ncon]:
-        g1, g2 = model.geom(contact.geom1).name, model.geom(contact.geom2).name
-        pairs[(g1, g2)] = pairs.get((g1, g2), 0) + 1
+        pairs[(contact.geom1, contact.geom2)] = pairs.get((contact.geom1, contact.geom2), 0) + 1
     for (g1, g2), count in pairs.items():
-        names = sorted((g1, g2))
-        prefix = names[0][:3]
-        assert names[0] == prefix + GROUND and names[1].startswith(prefix + "track_")
-        assert count <= 4
-    assert 0 < data.ncon <= 2 * 24 * 2
+        index, ground, other = on_ground(model, g1, g2)
+        prefix = machine_prefix(index)
+        name = model.geom(other).name
+        assert name.startswith(prefix + "track_") and count <= 4 or name.startswith(
+            prefix + LOAD_POINTS)
+    assert 0 < data.ncon <= 2 * (24 * 2 + 26)
     for i in range(2):
         assert abs(base_position(model, data, i)[2]) < 1e-3
 
@@ -178,7 +170,17 @@ def test_welded_machines_have_no_contacts():
     model = load_scene(2, weld=True)
     data = home_data(model)
     settle(model, data, 0.5)
-    assert data.ncon == 0
+    for contact in data.contact[: data.ncon]:
+        index, _, other = on_ground(model, contact.geom1, contact.geom2)
+        assert model.geom(other).name.startswith(machine_prefix(index) + LOAD_POINTS)
+
+
+def on_ground(model, g1, g2):
+    for index in range(MAX_MACHINES):
+        ground = ground_geoms(model, index)
+        if g1 in ground or g2 in ground:
+            return index, (g1 if g1 in ground else g2), (g2 if g1 in ground else g1)
+    raise AssertionError("a contact that does not involve any machine's ground")
 
 
 def test_free_base_rests_flush_and_tip_matches_kinematics():
@@ -252,33 +254,40 @@ def test_loaded_machine_stays_level_with_track_ends_over_a_drop(lip):
     heights[:, xs > lip] = -1.0
     write_ground(model, 0, heights)
     data = home_data(model)
-    set_pose(model, data, 0, dict(zip(JOINT_NAMES, (0.0, 0.0, 1.0, 0.5), strict=True)))
-    settle(model, data, 3.0, 1200.0)
+    set_pose(model, data, 0, dict(zip(JOINT_NAMES, LIFT_POSE, strict=True)))
+    hang(model, data, 1200.0)
+    settle(model, data, 3.0)
     assert tilt_deg(model, data) < 0.5
 
 
-def side_reach_tilt(swing, payload):
+def worst_tilt(swing, payload):
     model = load_scene(1)
     data = home_data(model)
-    set_pose(model, data, 0, dict(zip(JOINT_NAMES, (swing, 0.0, 1.0, 0.5), strict=True)))
-    settle(model, data, 3.0, payload)
-    return tilt_deg(model, data)
+    set_pose(model, data, 0, dict(zip(JOINT_NAMES, (swing, *LIFT_POSE[1:]), strict=True)))
+    hang(model, data, payload)
+    lock_joints(model, data)
+    worst, feet = 0.0, []
+    for _ in range(round(3.0 / model.opt.timestep)):
+        mujoco.mj_step(model, data)
+        if tilt_deg(model, data) > worst:
+            worst = tilt_deg(model, data)
+            feet = [model.geom_pos[g][0] for c in data.contact[:data.ncon]
+                    for g in (c.geom1, c.geom2) if model.geom(g).name.startswith("m0/track_")]
+    return worst, feet
 
 
 def test_loaded_bucket_tilts_alike_swung_left_and_right():
-    left, right = (side_reach_tilt(s, 1200.0) for s in (math.pi / 2, -math.pi / 2))
+    left, right = (worst_tilt(s, 2200.0)[0] for s in (math.pi / 2, -math.pi / 2))
     assert left < 0.05 and right < 0.05
-    left, right = (side_reach_tilt(s, 3000.0) for s in (math.pi / 2, -math.pi / 2))
-    assert left > 30.0 and right > 30.0
-    assert left == pytest.approx(right, abs=3.0)
+    left, right = (worst_tilt(s, 3000.0)[0] for s in (math.pi / 2, -math.pi / 2))
+    assert left > 1.0 and right > 1.0
+    assert left == pytest.approx(right, abs=1.0)
 
 
-def test_large_force_at_bucket_tip_tips_a_free_base():
-    model = load_scene(1)
-    data = home_data(model)
-    set_pose(model, data, 0, dict(zip(JOINT_NAMES, (0.0, 0.0, 1.0, 0.5), strict=True)))
-    settle(model, data, 3.0, 5000.0)
-    assert tilt_deg(model, data) > 30.0
+def test_load_beyond_capacity_tips_a_free_base_onto_its_front_track_ends():
+    worst, feet = worst_tilt(0.0, 5000.0)
+    assert worst > 1.0
+    assert feet and all(x > 1.0 for x in feet)
 
 
 @pytest.mark.parametrize("index", [0, 1])
@@ -342,22 +351,23 @@ def test_two_data_on_one_model_weld_independently():
     np.testing.assert_allclose(base_position(model, a, 0), [3.0, 0.0, 0.5], atol=0.01)
 
 
-def test_arm_and_bucket_pass_through_ground_without_contact():
+def test_bucket_lowered_onto_raised_ground_stops_on_its_surface():
     model = load_scene(1, weld=True)
     data = home_data(model)
     xs, ys = ground_axes()
     heights = np.where(xs[None, :] > 3.0, 1.5, 0.0) * np.ones((len(ys), 1))
     write_ground(model, 0, heights)
-    target = np.array([5.5, 0.0, 0.3])
-    pose = dict(zip(JOINT_NAMES, inverse_kinematics(target, 1.0), strict=True))
+    pose = dict(zip(JOINT_NAMES, inverse_kinematics(np.array([5.5, 0.0, 2.3]), 1.0), strict=True))
     set_pose(model, data, 0, pose)
-    settle(model, data, 1.0)
+    held(model, data).act(np.array([[0.0, LOWER, 0.0, 0.0]]))
+    settle(model, data, 6.0)
     mujoco.mj_rnePostConstraint(model, data)
-    np.testing.assert_allclose(data.site(machine_prefix(0) + TIP_SITE).xpos, target, atol=0.05)
-    assert data.ncon == 0
-    for body in ("boom", "arm", "bucket"):
-        assert np.allclose(data.cfrc_ext[model.body(machine_prefix(0) + body).id], 0.0)
-    np.testing.assert_allclose(joint_angles(model, data), list(pose.values()), atol=0.02)
+    assert data.site(machine_prefix(0) + TIP_SITE).xpos[2] == pytest.approx(1.5, abs=0.05)
+    bucket = model.body(machine_prefix(0) + "bucket").id
+    touching = [c for c in data.contact[:data.ncon]
+                if bucket in (model.geom_bodyid[c.geom1], model.geom_bodyid[c.geom2])]
+    assert touching and min(c.dist for c in touching) > -0.002
+    assert data.cfrc_ext[bucket][5] > 0.5 * LINK_MASSES["bucket"] * 9.81
 
 
 def test_written_ground_heights_appear_in_the_heightfield():

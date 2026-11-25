@@ -10,6 +10,7 @@ from hma.hydraulics.params import PORT_RELIEF_TOLERANCE, RELIEF_TOLERANCE
 from hma.machine import BODY_NAMES, JOINT_NAMES, LINK_MASSES, load_scene, machine_prefix
 from hma.machine.cylinders import MAIN_RELIEF
 from hma.machine.model import COUNTERWEIGHT_MASS, _machine_spec
+from scenes import dig_pit
 
 DT = 0.005
 SWING = JOINT_NAMES.index("swing")
@@ -18,7 +19,7 @@ BUCKET = JOINT_NAMES.index("bucket")
 
 
 def layer_for(machine, n=1, weld=True, control_hz=10.0):
-    model = load_scene(n, weld=weld)
+    model = dig_pit(load_scene(n, weld=weld), n)
     data = mujoco.MjData(model)
     return Hydraulics(model, data, [machine] * n, control_hz=control_hz)
 
@@ -310,7 +311,7 @@ def test_twenty_hertz_holds_each_command_for_ten_physics_steps():
 def test_mass_changes_match_the_compiler_for_the_same_masses():
     machine = replace(only("mass"), com_shift=np.zeros((len(BODY_NAMES), 3)))
     layer = layer_for(machine)
-    spec = _machine_spec(0, True)
+    spec = _machine_spec(0)
     for k, name in enumerate(BODY_NAMES):
         mesh = next(g for g in spec.body(name).geoms if g.type == mujoco.mjtGeom.mjGEOM_MESH)
         own = LINK_MASSES[name] - (COUNTERWEIGHT_MASS if name == "upper" else 0.0)

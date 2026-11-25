@@ -29,6 +29,7 @@ HYDRAULIC_SHARE, TIPPING_SHARE = 0.87, 0.75
 class Machine:
     def __init__(self) -> None:
         self.model = load_scene(1, weld=True)
+        self.model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
         self.data = mujoco.MjData(self.model)
         p = machine_prefix(0)
         self.joints = {j: self.model.joint(p + j) for j in ("swing", "boom", "arm", "bucket")}

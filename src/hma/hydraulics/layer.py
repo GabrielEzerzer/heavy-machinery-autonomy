@@ -12,7 +12,7 @@ import numpy as np
 
 from hma.hydraulics import circuit as c
 from hma.hydraulics.params import CURVE_SEGMENTS, NOMINAL, RANGES, Machine
-from hma.machine import BODY_NAMES, HOME_KEY, JOINT_NAMES, load_scene, machine_prefix
+from hma.machine import BODY_NAMES, HOME_KEY, JOINT_NAMES, WELD, load_scene, machine_prefix
 from hma.machine.cylinders import MAIN_RELIEF
 from hma.machine.model import COUNTERWEIGHT_MASS
 
@@ -153,6 +153,13 @@ class Hydraulics:
         self._own_joints = [[j for j in range(model.njnt)
                              if model.joint(j).name.startswith(machine_prefix(i))]
                             for i in range(self.n)]
+        self._own_bodies = [[b for b in range(model.nbody)
+                             if model.body(b).name.startswith(machine_prefix(i))]
+                            for i in range(self.n)]
+        self._own_equalities = [[e for e in range(model.neq)
+                                 if model.equality(e).name.startswith(machine_prefix(i))
+                                 and model.equality(e).name != machine_prefix(i) + WELD]
+                                for i in range(self.n)]
         reference = load_scene(1, weld=True)
         nominal_ids = [reference.body(machine_prefix(0) + b).id for b in BODY_NAMES]
         self._nominal_bodies = [_body_solid(reference, b) for b in nominal_ids]
@@ -367,7 +374,9 @@ class Hydraulics:
             data.qvel[v0:v0 + nv] = 0.0
             data.qacc_warmstart[v0:v0 + nv] = 0.0
             data.qfrc_applied[v0:v0 + nv] = 0.0
-        data.xfrc_applied[self._bodies[index]] = 0.0
+        data.xfrc_applied[self._own_bodies[index]] = 0.0
+        own = self._own_equalities[index]
+        data.eq_active[own] = model.eq_active0[own]
         if pose is not None:
             data.qpos[self._qpos[index]] = pose
         data.ctrl[self._actuators[index]] = 0.0
@@ -489,7 +498,8 @@ class Hydraulics:
         redo = np.zeros(n, bool)
         redo_held = np.zeros((n, NODES), bool)
         redo_speed = np.zeros((n, JOINTS))
-        best = (np.full(n, np.inf), redo.copy(), redo_held.copy(), redo_speed.copy(), np.zeros(n, int))
+        best = (np.full(n, np.inf), redo.copy(), redo_held.copy(), redo_speed.copy(),
+                np.zeros(n, int))
         cavity = self._cavity
         for attempt in range(REDO_PASSES + 2):
             ahead = np.where(redo[:, None], redo_speed, lever * (qd + dt * self._accel))
@@ -518,7 +528,8 @@ class Hydraulics:
 
             stiff = self._stiff
             stiff[:] = np.where(contact, diag * lever * lever, 0.0)
-            data.ctrl[self._actuators] = np.where(contact, lever * (held - others), 0.0) - stiff * qd
+            push = np.where(contact, lever * (held - others), 0.0)
+            data.ctrl[self._actuators] = push - stiff * qd
             model.dof_armature[qvel] = self._base_armature + stiff * dt
             model.dof_frictionloss[self._swing_dofs] = brake
             mujoco.mj_step(model, data)
@@ -553,7 +564,7 @@ class Hydraulics:
                 break
             score = (miss / REDO_FORCE).max(1)
             better = score < best[0]
-            for kept, now in zip(best, (score, redo, redo_held, redo_speed, attempt)):
+            for kept, now in zip(best, (score, redo, redo_held, redo_speed, attempt), strict=True):
                 kept[better] = now[better] if np.ndim(now) else now
             if attempt == REDO_PASSES:
                 self.capped += 1

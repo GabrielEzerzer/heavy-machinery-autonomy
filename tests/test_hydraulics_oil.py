@@ -18,6 +18,7 @@ from hma.machine import (
     statics,
 )
 from hma.machine.cylinders import MAIN_RELIEF, areas, cylinder_length
+from scenes import dig_pit
 
 DT = 0.005
 G = 9.81
@@ -25,7 +26,7 @@ SWING, BOOM, ARM, BUCKET = range(4)
 
 
 def layer_for(machine, pose=None, n=1):
-    model = load_scene(n, weld=True)
+    model = dig_pit(load_scene(n, weld=True), n)
     layer = Hydraulics(model, mujoco.MjData(model), [machine] * n)
     for i in range(n):
         layer.reset(i, machine, pose)
@@ -80,7 +81,7 @@ def chatter(pressures):
 @pytest.mark.parametrize("value", [1.0, -1.0])
 def test_stiffest_oil_and_full_play_stay_above_the_cavitation_floor_without_chatter(joint, value):
     machines = [extreme_machine(m) for m in RANGES["link_mass"]]
-    model = load_scene(2, weld=True)
+    model = dig_pit(load_scene(2, weld=True), 2)
     layer = Hydraulics(model, mujoco.MjData(model), machines)
     layer.act(command(joint, value, 2))
     pressures, speeds = [], []
@@ -118,7 +119,7 @@ def prony_frequency(x):
 
 
 def test_boom_bounce_matches_the_oil_springs_on_the_linkage_inertia():
-    model = load_scene(1, weld=True)
+    model = dig_pit(load_scene(1, weld=True))
     model.eq_solref[:, 0] = 2 * DT
     data = mujoco.MjData(model)
     layer = Hydraulics(model, data, [NOMINAL])
@@ -334,7 +335,7 @@ RELIEF_SPREAD = (-0.5e6, 2.0e6)
     ids=["arm roll-in on both pumps", "bucket roll-in on one", "boom lower on one"])
 def test_each_machine_stalls_at_its_own_main_relief(joint, value, pumps):
     machines = [replace(NOMINAL, main_relief=MAIN_RELIEF + d) for d in RELIEF_SPREAD]
-    model = load_scene(2, weld=True)
+    model = dig_pit(load_scene(2, weld=True), 2)
     layer = Hydraulics(model, mujoco.MjData(model), machines)
     layer.act(command(joint, value, 2))
     trace, inlets = [], []
@@ -425,7 +426,7 @@ RELIEF_OVERSHOOT = 3.0e6
 
 def test_random_combined_commands_at_the_corners_keep_floor_relief_and_torque_consistent():
     machines = [extreme_machine(m) for m in RANGES["link_mass"]] + [NOMINAL]
-    model = load_scene(len(machines), weld=True)
+    model = dig_pit(load_scene(len(machines), weld=True), len(machines))
     data = mujoco.MjData(model)
     layer = Hydraulics(model, data, machines)
     setting = np.zeros((len(machines), c.NODES))
@@ -466,7 +467,7 @@ def stepped_force_mismatch(layer):
     return np.where(loaded & (ctrl != 0.0), np.abs(torque / lever - force), 0.0)
 
 
-def test_a_boom_driven_into_its_top_stop_jolts_the_held_arm_only_with_forces_the_oil_has():
+def test_a_boom_lowered_into_its_stop_jolts_the_held_arm_only_with_forces_the_oil_has():
     layer = layer_for(NOMINAL, (0.0, 0.5, 0.8, -0.3))
     layer.act(command(BOOM, 1.0))
     mismatch = np.array([stepped_force_mismatch(layer) for _ in range(round(1.5 / DT))])
@@ -523,7 +524,7 @@ def wobble_and_kick(layer, k):
 
 def test_energy_closes_with_cavitation_and_outside_forces_once_the_integration_terms_count():
     machines = [draw_machine(s) for s in (100, 101)]
-    model = load_scene(len(machines), weld=True)
+    model = dig_pit(load_scene(len(machines), weld=True), len(machines))
     data = mujoco.MjData(model)
     layer = Hydraulics(model, data, machines)
     rng = np.random.default_rng(5)

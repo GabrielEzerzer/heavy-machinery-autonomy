@@ -33,6 +33,11 @@ Changes made to the source:
   counterweight mass in the lower 1 m of the rear of the upper structure, a site at the
   bucket tip, and two sites at the ends of the cutting edge, placed at the bucket mesh's
   widest points within 5 cm of the tip's distance from the bucket joint.
+- Added at scene load, in hma/machine/model.py: convex collision shapes cut with planes from the
+  track, body, boom, arm and bucket meshes (hma/machine/collision.py), with no mass and in a
+  geom group that is not rendered by default, and a lifting point on the back of the bucket
+  from which a block hangs by a four-leg sling joined at a master link. The cylinder and
+  linkage meshes have no collision shape.
 - Masses: the source gives a placeholder mass of 0.03 kg per link. The link masses used here are
   set in hma/machine/model.py. Boom (1,220 kg, with arm cylinder), arm (600 kg, with bucket
   cylinder), bucket (400 kg) and counterweight (2,450 kg) follow the manufacturer's published
