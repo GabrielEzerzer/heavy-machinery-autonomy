@@ -1,6 +1,7 @@
 """Tracks as rows of road wheels that MuJoCo's own collision and solver put on the ground, with a
-travel drive per track. step() caps the two drives' power, then runs mujoco.mj_step; it holds no
-state of its own."""
+travel drive per track. step() keeps the positive drive power of both tracks within the engine's
+share: a force on each drive wheel in data.qfrc_applied, split by shares kept in data.userdata
+with the power each track used in the last step, so a saved integration state replays exactly."""
 
 from __future__ import annotations
 
@@ -37,13 +38,16 @@ ENGINE_POWER = 65.0e3
 DRIVE_EFFICIENCY = 0.7
 TRAVEL_POWER = ENGINE_POWER * DRIVE_EFFICIENCY
 BELT_ARMATURE = TRACK_CHAINS / 2 * WHEEL_RADIUS**2
+WHEEL_INERTIA = 1e-3
 BRAKE_SOLIMP = (0.9999, 0.9999, 0.001)
+SHARE_TIME = 0.1
+FULL_SHARE = 0.99
 
 FRICTION = 0.565
 FRICTION_RANGE = (0.55, 0.58)
-FRICTION_REFERENCE = 35.0
+FRICTION_REFERENCE = 40.0
 CONTACT_SOLIMP = (0.999, 0.999, 0.001, 0.5, 2.0)
-IMPRATIO = 1000.0
+IMPRATIO = 10.0
 COUPLING_SOLREF = (0.01, 1.0)
 COUPLING_SOLIMP = (0.9999, 0.9999, 0.001, 0.5, 2.0)
 
@@ -52,6 +56,9 @@ OUTLINE = (-TUMBLER - WHEEL_RADIUS, TUMBLER + WHEEL_RADIUS,
            -(GAUGE + SHOE_WIDTH) / 2, (GAUGE + SHOE_WIDTH) / 2)
 SHELL_LIFT = LINK_BAND
 SHELL_TOP = TRACK_HEIGHT
+SUPPORT_GAP = 2e-4
+SUPPORT_HALF_HEIGHT = 0.01
+FRICTION_TENDON = int(mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON)
 WHEEL_X = tuple(float(x) for x in np.linspace(REAR_LINE, FRONT_LINE, WHEELS))
 
 
@@ -64,7 +71,8 @@ def wheel_name(side: str, k: int) -> str:
 
 
 def shell_names(side: str) -> tuple[str, ...]:
-    return (f"{TRACK}{side}_frame", f"{TRACK}{side}_rear", f"{TRACK}{side}_front")
+    return (f"{TRACK}{side}_frame", f"{TRACK}{side}_rear", f"{TRACK}{side}_front",
+            f"{TRACK}{side}_support")
 
 
 def contact_names(side: str) -> tuple[str, ...]:
@@ -96,18 +104,61 @@ def drives(model: mujoco.MjModel) -> Drives:
     return found
 
 
-def travel_caps(belt_speeds: np.ndarray) -> np.ndarray:
-    total = np.abs(belt_speeds).sum(axis=-1, keepdims=True)
-    cap = np.minimum(TRACTION, TRAVEL_POWER / np.maximum(total, 1e-12))
-    return np.broadcast_to(cap, np.shape(belt_speeds))
+def tendon_friction(data: mujoco.MjData, tendons: np.ndarray) -> np.ndarray:
+    tendons = np.asarray(tendons, np.intp)
+    rows = data.efc_type == FRICTION_TENDON
+    forces = np.bincount(data.efc_id[rows], weights=data.efc_force[rows],
+                         minlength=int(tendons.max(initial=-1)) + 1)
+    return forces[tendons]
 
 
-def write_caps(model: mujoco.MjModel, data: mujoco.MjData) -> None:
+def drive_forces(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
     lay = drives(model)
-    model.tendon_frictionloss[lay.tendons] = travel_caps(data.qvel[lay.dofs] * WHEEL_RADIUS)
+    return (tendon_friction(data, lay.tendons)
+            + data.qfrc_applied[lay.dofs] / WHEEL_RADIUS)
+
+
+def shares(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
+    lead = 0.5 + data.userdata[:len(drives(model).dofs), None]
+    return np.concatenate([lead, 1.0 - lead], axis=1)
+
+
+def split_power(belt_speeds: np.ndarray, used: np.ndarray, share: np.ndarray,
+                rate: float) -> np.ndarray:
+    full = used >= FULL_SHARE * share * TRAVEL_POWER
+    weight = np.abs(belt_speeds) * np.where(full.any(axis=-1, keepdims=True), full, True)
+    open_use = np.where(full, 0.0, used)
+    rest = TRAVEL_POWER - open_use.sum(axis=-1, keepdims=True)
+    total = weight.sum(axis=-1, keepdims=True)
+    even = np.full_like(weight, 1.0 / weight.shape[-1])
+    part = np.divide(weight, total, out=even, where=total > 0.0)
+    target = (open_use + rest * part) / TRAVEL_POWER
+    return share + rate * (target - share)
+
+
+def drive_caps(belt_speeds: np.ndarray, share: np.ndarray) -> np.ndarray:
+    return np.minimum(TRACTION, share * TRAVEL_POWER / np.maximum(np.abs(belt_speeds), 1e-12))
+
+
+def used_power(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
+    n = len(drives(model).dofs)
+    return data.userdata[n:3 * n].reshape(n, 2)
+
+
+def limit_power(model: mujoco.MjModel, data: mujoco.MjData) -> None:
+    lay = drives(model)
+    belt = data.qvel[lay.dofs] * WHEEL_RADIUS
+    used = used_power(model, data)
+    share = split_power(belt, used, shares(model, data), model.opt.timestep / SHARE_TIME)
+    data.userdata[:len(lay.dofs)] = share[:, 0] - 0.5
+    excess = drive_caps(belt, share) - TRACTION
+    data.qfrc_applied[lay.dofs] = excess * np.sign(belt) * WHEEL_RADIUS
 
 
 def step(model: mujoco.MjModel, data: mujoco.MjData, nstep: int = 1) -> None:
     for _ in range(nstep):
-        write_caps(model, data)
+        limit_power(model, data)
+        lay = drives(model)
+        belt = data.qvel[lay.dofs] * WHEEL_RADIUS
         mujoco.mj_step(model, data)
+        used_power(model, data)[:] = np.maximum(drive_forces(model, data) * belt, 0.0)

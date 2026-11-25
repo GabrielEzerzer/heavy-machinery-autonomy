@@ -1,6 +1,6 @@
 """Scenes of 12 t class excavators, each on its own ground of primitive geoms; names start with
 machine_prefix(i). ctrl is a joint speed in rad/s or a track speed in m/s, sent through a "_valve"
-joint: read joints by name. Step with hma.machine.tracks.step, which caps travel power."""
+joint: read joints by name. Step with hma.machine.tracks.step, which limits travel power."""
 
 from __future__ import annotations
 
@@ -47,19 +47,10 @@ MAX_MACHINES = 31
 
 TIMESTEP = 0.005
 SOLVER_TOLERANCE = 1e-14
-FRICTION_TENDON = int(mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON)
 
 
 def machine_prefix(index: int) -> str:
     return f"m{index}/"
-
-
-def tendon_friction(data: mujoco.MjData, tendons: np.ndarray) -> np.ndarray:
-    tendons = np.asarray(tendons, np.intp)
-    rows = data.efc_type == FRICTION_TENDON
-    forces = np.bincount(data.efc_id[rows], weights=data.efc_force[rows],
-                         minlength=int(tendons.max(initial=-1)) + 1)
-    return forces[tendons]
 
 
 def ground_geoms(model: mujoco.MjModel, index: int) -> tuple[int, np.ndarray, np.ndarray]:
@@ -95,7 +86,7 @@ def _turn_reference_to_home(joint: mujoco.MjsJoint, angle: float) -> None:
     joint.ref = angle
 
 
-def _valve(spec: mujoco.MjSpec, name: str, joint: str, cap: float, limit: float,
+def _valve(spec: mujoco.MjSpec, name: str, joints: tuple[str, ...], cap: float, limit: float,
            solimp: tuple[float, float, float] = VALVE_SOLIMP, coef: float = 1.0) -> None:
     valve = spec.worldbody.add_body(name=name + VALVE, mass=1.0, inertia=[1.0, 1.0, 1.0],
                                     explicitinertial=True)
@@ -103,7 +94,8 @@ def _valve(spec: mujoco.MjSpec, name: str, joint: str, cap: float, limit: float,
     tendon = spec.add_tendon(name=name + VALVE, frictionloss=cap,
                              solref_friction=[2 * TIMESTEP, 1.0],
                              solimp_friction=[*solimp, 0.5, 2.0])
-    tendon.wrap_joint(joint, coef)
+    for joint in joints:
+        tendon.wrap_joint(joint, coef)
     tendon.wrap_joint(name + VALVE, -1.0)
     act = spec.add_actuator(name=name, target=name + VALVE, trntype=mujoco.mjtTrn.mjTRN_JOINT)
     act.set_to_velocity(kv=VALVE_GAIN)
@@ -117,14 +109,12 @@ def _add_track(spec: mujoco.MjSpec, side: str) -> None:
     drive = tracks.wheel_name(side, 0)
     for k, x in enumerate(tracks.WHEEL_X):
         name = tracks.wheel_name(side, k)
-        m = tracks.WHEEL_MASSES[k]
-        disc = m * tracks.WHEEL_RADIUS**2
-        wheel = spec.body("base").add_body(name=name, pos=[x, y, tracks.WHEEL_RADIUS], mass=m,
-                                           ipos=[0.0, 0.0, 0.0],
-                                           inertia=[disc / 4, disc / 2, disc / 4],
+        wheel = spec.body("base").add_body(name=name, pos=[x, y, tracks.WHEEL_RADIUS],
+                                           mass=tracks.WHEEL_MASSES[k], ipos=[0.0, 0.0, 0.0],
+                                           inertia=[tracks.WHEEL_INERTIA] * 3,
                                            explicitinertial=True)
         wheel.add_joint(name=name, axis=[0.0, 1.0, 0.0],
-                        armature=tracks.BELT_ARMATURE if k == 0 else 0.0)
+                        armature=tracks.BELT_ARMATURE / tracks.WHEELS)
         wheel.add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_CYLINDER, quat=across,
                        size=[tracks.WHEEL_RADIUS, tracks.RAIL], contype=0, conaffinity=0,
                        group=3, rgba=[0.2, 0.6, 0.9, 0.4])
@@ -134,7 +124,7 @@ def _add_track(spec: mujoco.MjSpec, side: str) -> None:
                               solref=list(tracks.COUPLING_SOLREF),
                               solimp=list(tracks.COUPLING_SOLIMP))
     base = spec.body("base")
-    frame, rear, front = tracks.shell_names(side)
+    frame, rear, front, support = tracks.shell_names(side)
     lift, top, half_shoe = tracks.SHELL_LIFT, tracks.SHELL_TOP, mass.SHOE_WIDTH / 2
     shell = dict(contype=0, conaffinity=0, group=3, mass=0.0, rgba=[0.9, 0.6, 0.2, 0.3])
     base.add_geom(name=frame, type=mujoco.mjtGeom.mjGEOM_BOX, pos=[0.0, y, (lift + top) / 2],
@@ -143,8 +133,12 @@ def _add_track(spec: mujoco.MjSpec, side: str) -> None:
         base.add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_CYLINDER, quat=across,
                       pos=[x, y, tracks.WHEEL_RADIUS + lift],
                       size=[tracks.WHEEL_RADIUS, half_shoe], **shell)
-    _valve(spec, tracks.TRAVEL + side, drive, tracks.TRACTION, tracks.TRAVEL_SPEED,
-           tracks.BRAKE_SOLIMP, coef=tracks.WHEEL_RADIUS)
+    base.add_geom(name=support, type=mujoco.mjtGeom.mjGEOM_BOX,
+                  pos=[0.0, y, tracks.SUPPORT_GAP + tracks.SUPPORT_HALF_HEIGHT],
+                  size=[mass.TUMBLER, tracks.RAIL, tracks.SUPPORT_HALF_HEIGHT], **shell)
+    wheels = tuple(tracks.wheel_name(side, k) for k in range(tracks.WHEELS))
+    _valve(spec, tracks.TRAVEL + side, wheels, tracks.TRACTION, tracks.TRAVEL_SPEED,
+           tracks.BRAKE_SOLIMP, coef=tracks.WHEEL_RADIUS / tracks.WHEELS)
 
 
 def _machine_spec(index: int, weld: bool) -> mujoco.MjSpec:
@@ -160,7 +154,7 @@ def _machine_spec(index: int, weld: bool) -> mujoco.MjSpec:
         _turn_reference_to_home(joint, home)
         joint.solref_limit = [2 * TIMESTEP, 1.0]
         joint.solimp_limit = [*VALVE_SOLIMP, 0.5, 2.0]
-        _valve(spec, name, name, FORCE_CAPS[name], SPEED_LIMITS[name])
+        _valve(spec, name, (name,), FORCE_CAPS[name], SPEED_LIMITS[name])
     for side in tracks.SIDES:
         _add_track(spec, side)
     return spec
@@ -188,10 +182,11 @@ def _add_track_pairs(scene: mujoco.MjSpec, prefix: str) -> None:
     grounds += [f"{GROUND_BUMP}{k}" for k in range(GROUND_BUMPS)]
     mu = tracks.FRICTION
     for side in tracks.SIDES:
+        shells = tracks.shell_names(side)
         for part in tracks.contact_names(side):
             for ground in grounds:
                 scene.add_pair(geomname1=prefix + part,
-                               geomname2=prefix + ground, condim=3,
+                               geomname2=prefix + ground, condim=1 if part in shells else 3,
                                friction=[mu, mu, 0.005, 1e-4, 1e-4],
                                solreffriction=[-0.0, -tracks.FRICTION_REFERENCE],
                                solimp=list(tracks.CONTACT_SOLIMP))
@@ -225,13 +220,15 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
     scene.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
     scene.option.impratio = tracks.IMPRATIO
     scene.option.jacobian = mujoco.mjtJacobian.mjJAC_SPARSE
+    scene.nuserdata = 3 * n_machines
     for i in range(n_machines):
         prefix = machine_prefix(i)
         offset = np.array([0.0, i * MACHINE_SPACING, 0.0])
         frame = scene.worldbody.add_frame(pos=offset)
         scene.attach(_machine_spec(i, weld), prefix=prefix, frame=frame)
         _add_ground(scene, i, prefix, offset)
-        _add_track_pairs(scene, prefix)
+        if not weld:
+            _add_track_pairs(scene, prefix)
         scene.worldbody.add_body(name=prefix + ANCHOR, pos=offset, mocap=True)
         scene.add_equality(name=prefix + WELD, type=mujoco.mjtEq.mjEQ_WELD,
                            objtype=mujoco.mjtObj.mjOBJ_BODY, name1=prefix + "base",
@@ -255,13 +252,18 @@ def write_friction(model: mujoco.MjModel, index: int, mu: float) -> None:
     prefix = machine_prefix(index)
     plane, boxes, bumps = ground_geoms(model, index)
     model.geom_friction[[plane, *boxes, *bumps], 0] = mu
-    parts = [model.geom(prefix + name).id for s in tracks.SIDES for name in tracks.contact_names(s)]
+    names = [tracks.wheel_name(s, k) for s in tracks.SIDES for k in range(tracks.WHEELS)]
+    names += [n for s in tracks.SIDES for n in tracks.shell_names(s)]
+    parts = [model.geom(prefix + n).id for n in names]
     pairs = np.isin(model.pair_geom1, parts) | np.isin(model.pair_geom2, parts)
     model.pair_friction[pairs, :2] = mu
 
 
 def set_weld(model: mujoco.MjModel, data: mujoco.MjData, index: int, on: bool) -> None:
     prefix = machine_prefix(index)
+    wheel = model.geom(prefix + tracks.wheel_name(tracks.SIDES[0], 0)).id
+    if not on and not np.isin(wheel, [model.pair_geom1, model.pair_geom2]).any():
+        raise ValueError("a scene loaded welded has no ground contact; load it released")
     base = model.body(prefix + "base").id
     if on:
         mocap = model.body_mocapid[model.body(prefix + ANCHOR).id]

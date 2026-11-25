@@ -1,6 +1,7 @@
 """Rigid ground for one machine from MuJoCo primitives: a plane, tilted for a slope, with a fixed
 pool of boxes (steps, kerbs, rut banks) and buried spheres (bumps) placed at reset. settle() sets a
-machine down and steps it to rest; stand() redraws a seed's ground until the machine can stand."""
+machine down clear of the ground and steps it to rest, refusing a rest that is tipped, moved or off
+the field; stand() redraws a seed's ground until the machine can stand."""
 
 from __future__ import annotations
 
@@ -40,7 +41,6 @@ RANGES = {
     "bumps": (0, 6),
     "bump_height": (0.03, 0.15),
     "bump_radius": (0.3, 1.5),
-    "feature_reach": (-4.0, 4.0),
     "friction": tracks.FRICTION_RANGE,
 }
 REACH = 6.0
@@ -48,6 +48,7 @@ BANK = 2.0
 FIT_TRIES = 40
 FIT_SHRINK = 0.9
 MIN_WIDTH = 1.5
+RIM_POINTS = 32
 SHADOW_REACH = SCENERY_REACH
 BURY = 0.5
 DROP = 0.01
@@ -56,6 +57,9 @@ SETTLE_MAX = 6.0
 REST_SPEED = 1e-3
 REST_TIME = 0.25
 DRAWS = 20
+CLEAR_TRIES = 8
+MAX_TILT = 15.0
+MAX_SHIFT = 0.3
 
 
 @dataclass(frozen=True)
@@ -95,32 +99,69 @@ def inside(points: np.ndarray) -> bool:
     return bool(np.all(in_field & (across <= SHADOW_REACH)))
 
 
-def box_corners(box: Box) -> np.ndarray:
-    n = np.array([math.cos(box.heading), math.sin(box.heading)])
-    t = np.array([-n[1], n[0]])
-    return np.array([[*(np.array([box.x, box.y]) + a * box.half_length * n
-                       + b * box.half_width * t), box.height]
-                     for a in (-1, 1) for b in (-1, 1)])
+def _normal(grade: tuple[float, float]) -> np.ndarray:
+    return np.array([-grade[0], -grade[1], 1.0]) / math.hypot(1.0, *grade)
 
 
-def _fit(rng: np.random.Generator, length: float, width: float, height: float,
-         offsets: tuple[float, ...], grows: bool) -> list[Box]:
-    heading = float(rng.uniform(0.0, 2 * math.pi))
-    n = np.array([math.cos(heading), math.sin(heading)])
-    at = float(rng.uniform(*RANGES["feature_reach"]))
+def _on_plane(grade: tuple[float, float], x: float, y: float, lift: float) -> np.ndarray:
+    return np.array([x, y, grade[0] * x + grade[1] * y]) + lift * _normal(grade)
+
+
+def place_box(grade: tuple[float, float], box: Box) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    half_height = (box.height + BURY) / 2
+    return (_on_plane(grade, box.x, box.y, box.height - half_height),
+            _turned(_tilt(grade), box.heading),
+            np.array([box.half_length, box.half_width, half_height]))
+
+
+def box_points(grade: tuple[float, float], box: Box) -> np.ndarray:
+    pos, quat, size = place_box(grade, box)
+    mat = np.zeros(9)
+    mujoco.mju_quat2Mat(mat, quat)
+    top = np.array([[a * size[0], b * size[1], size[2]] for a in (-1, 1) for b in (-1, 1)])
+    feet = top - [0.0, 0.0, box.height]
+    return pos + np.concatenate([top, feet]) @ mat.reshape(3, 3).T
+
+
+def place_bump(grade: tuple[float, float], bump: Bump) -> tuple[np.ndarray, float]:
+    radius = (bump.radius**2 + bump.height**2) / (2 * bump.height)
+    return _on_plane(grade, bump.x, bump.y, bump.height - radius), radius
+
+
+def bump_points(grade: tuple[float, float], bump: Bump) -> np.ndarray:
+    normal = _normal(grade)
+    across = np.cross(normal, [1.0, 0.0, 0.0])
+    across /= np.linalg.norm(across)
+    along = np.cross(across, normal)
+    angles = np.linspace(0.0, 2 * math.pi, RIM_POINTS, endpoint=False)
+    rim = bump.radius * (np.outer(np.cos(angles), along) + np.outer(np.sin(angles), across))
+    return np.vstack([_on_plane(grade, bump.x, bump.y, 0.0) + rim,
+                      _on_plane(grade, bump.x, bump.y, bump.height)])
+
+
+def _fit(rng: np.random.Generator, grade: tuple[float, float], length: float, width: float,
+         height: float, offsets: tuple[float, ...], grows: bool) -> list[Box]:
     for _ in range(FIT_TRIES):
-        boxes = []
-        for offset in offsets:
-            middle = at + offset + (length if grows else 0.0)
-            x, y = middle * n
-            boxes.append(Box(float(x), float(y), heading, length, width, height))
-        if all(inside(box_corners(b)) for b in boxes):
+        heading = float(rng.uniform(0.0, 2 * math.pi))
+        n = np.array([math.cos(heading), math.sin(heading)])
+        at = np.array([rng.uniform(*GROUND_X), rng.uniform(*GROUND_Y)])
+        boxes = [Box(*(float(v) for v in at + (offset + (length if grows else 0.0)) * n),
+                     heading, length, width, height) for offset in offsets]
+        if all(inside(box_points(grade, b)) for b in boxes):
             return boxes
-        width *= FIT_SHRINK
-        length *= FIT_SHRINK if grows else 1.0
-        if width < MIN_WIDTH:
-            break
-    return []
+        width = max(MIN_WIDTH, width * FIT_SHRINK)
+        length = max(MIN_WIDTH, length * FIT_SHRINK) if grows else length
+    raise RuntimeError("a drawn feature does not fit in the field")
+
+
+def _bump(rng: np.random.Generator, grade: tuple[float, float]) -> Bump:
+    radius = float(rng.uniform(*RANGES["bump_radius"]))
+    height = float(rng.uniform(*RANGES["bump_height"]))
+    for _ in range(FIT_TRIES):
+        bump = Bump(float(rng.uniform(*GROUND_X)), float(rng.uniform(*GROUND_Y)), radius, height)
+        if inside(bump_points(grade, bump)):
+            return bump
+    raise RuntimeError("a drawn bump does not fit in the field")
 
 
 def draw_ground(seed: int, attempt: int = 0) -> Ground:
@@ -129,28 +170,21 @@ def draw_ground(seed: int, attempt: int = 0) -> Ground:
     rng = np.random.default_rng((seed, 3, attempt))
     slope = rng.uniform(*RANGES["slope"])
     direction = rng.uniform(0.0, 2 * math.pi)
+    grade = (math.tan(slope) * math.cos(direction), math.tan(slope) * math.sin(direction))
     boxes: list[Box] = []
     for _ in range(rng.integers(RANGES["steps"][0], RANGES["steps"][1] + 1)):
-        boxes += _fit(rng, REACH, REACH, rng.uniform(*RANGES["step_height"]), (0.0,), True)
+        boxes += _fit(rng, grade, REACH, REACH, rng.uniform(*RANGES["step_height"]), (0.0,), True)
     for _ in range(rng.integers(RANGES["kerbs"][0], RANGES["kerbs"][1] + 1)):
-        boxes += _fit(rng, rng.uniform(*RANGES["kerb_width"]) / 2, REACH,
+        boxes += _fit(rng, grade, rng.uniform(*RANGES["kerb_width"]) / 2, REACH,
                       rng.uniform(*RANGES["kerb_height"]), (0.0,), False)
     for _ in range(rng.integers(RANGES["ruts"][0], RANGES["ruts"][1] + 1)):
         half = rng.uniform(*RANGES["rut_width"]) / 2 + BANK / 2
-        boxes += _fit(rng, BANK / 2, REACH, rng.uniform(*RANGES["rut_depth"]), (-half, half),
-                      False)
-    bumps = []
-    for _ in range(rng.integers(RANGES["bumps"][0], RANGES["bumps"][1] + 1)):
-        radius = float(rng.uniform(*RANGES["bump_radius"]))
-        x, y = (float(v) for v in rng.uniform(*RANGES["feature_reach"], size=2))
-        height = float(rng.uniform(*RANGES["bump_height"]))
-        rim = [[x + radius * c, y + radius * s, height] for c, s in ((1, 0), (-1, 0), (0, 1),
-                                                                      (0, -1))]
-        if inside(np.array(rim)):
-            bumps.append(Bump(x, y, radius, height))
-    grade = (math.tan(slope) * math.cos(direction), math.tan(slope) * math.sin(direction))
-    return Ground(grade, float(rng.uniform(*RANGES["friction"])), tuple(boxes[:GROUND_BOXES]),
-                  tuple(bumps[:GROUND_BUMPS]), seed)
+        boxes += _fit(rng, grade, BANK / 2, REACH, rng.uniform(*RANGES["rut_depth"]),
+                      (-half, half), False)
+    bumps = [_bump(rng, grade)
+             for _ in range(rng.integers(RANGES["bumps"][0], RANGES["bumps"][1] + 1))]
+    return Ground(grade, float(rng.uniform(*RANGES["friction"])), tuple(boxes), tuple(bumps),
+                  seed)
 
 
 def _offset(model: mujoco.MjModel, index: int) -> np.ndarray:
@@ -180,29 +214,23 @@ def apply_ground(model: mujoco.MjModel, index: int, ground: Ground) -> None:
     if not all(math.isfinite(g) for g in ground.grade):
         raise ValueError("the grade must be finite")
     offset = _offset(model, index)
-    gx, gy = ground.grade
-    normal = np.array([-gx, -gy, 1.0]) / math.sqrt(1.0 + gx * gx + gy * gy)
-    tilt = _tilt(ground.grade)
     plane, boxes, bumps = ground_geoms(model, index)
-
-    def on_plane(x: float, y: float, lift: float) -> np.ndarray:
-        return offset + [x, y, gx * x + gy * y] + lift * normal
-
-    centre = [(GROUND_X[0] + GROUND_X[1]) / 2, (GROUND_Y[0] + GROUND_Y[1]) / 2]
-    model.geom_pos[plane] = on_plane(*centre, 0.0)
-    model.geom_quat[plane] = tilt
+    centre = ((GROUND_X[0] + GROUND_X[1]) / 2, (GROUND_Y[0] + GROUND_Y[1]) / 2)
+    model.geom_pos[plane] = offset + _on_plane(ground.grade, *centre, 0.0)
+    model.geom_quat[plane] = _tilt(ground.grade)
     model.geom_size[plane, :2] = np.array([GROUND_X[1] - GROUND_X[0],
-                                           GROUND_Y[1] - GROUND_Y[0]]) / 2 / normal[2]
+                                           GROUND_Y[1] - GROUND_Y[0]]) / 2 / _normal(
+                                               ground.grade)[2]
     model.geom_pos[[*boxes, *bumps]] = offset + [0.0, 0.0, PARKED]
     model.geom_size[[*boxes, *bumps]] = [0.1, 0.1, 0.1]
     for geom, box in zip(boxes, ground.boxes, strict=False):
-        half_height = (box.height + BURY) / 2
-        model.geom_pos[geom] = on_plane(box.x, box.y, box.height - half_height)
-        model.geom_quat[geom] = _turned(tilt, box.heading)
-        model.geom_size[geom] = [box.half_length, box.half_width, half_height]
+        pos, quat, size = place_box(ground.grade, box)
+        model.geom_pos[geom] = offset + pos
+        model.geom_quat[geom] = quat
+        model.geom_size[geom] = size
     for geom, bump in zip(bumps, ground.bumps, strict=False):
-        radius = (bump.radius**2 + bump.height**2) / (2 * bump.height)
-        model.geom_pos[geom] = on_plane(bump.x, bump.y, bump.height - radius)
+        pos, radius = place_bump(ground.grade, bump)
+        model.geom_pos[geom] = offset + pos
         model.geom_size[geom] = [radius, 0.0, 0.0]
     for geom in boxes:
         model.geom_rbound[geom] = np.linalg.norm(model.geom_size[geom])
@@ -274,7 +302,30 @@ def _put(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float, y: fl
     mujoco.mj_kinematics(model, data)
     points = _wheel_points(model, data, index)
     data.qpos[q0 + 2] += float(np.max(ground_height(model, index, points) - points[:, 2]))
+    base = model.body(prefix + "base").id
+    for _ in range(CLEAR_TRIES):
+        mujoco.mj_kinematics(model, data)
+        mujoco.mj_collision(model, data)
+        depth = _deepest(model, data, base)
+        if depth <= 0.0:
+            break
+        data.qpos[q0 + 2] += depth
     mujoco.mj_kinematics(model, data)
+
+
+def _deepest(model: mujoco.MjModel, data: mujoco.MjData, base: int) -> float:
+    contacts = data.contact[:data.ncon]
+    own = ((model.body_rootid[model.geom_bodyid[contacts.geom[:, 0]]] == base)
+           | (model.body_rootid[model.geom_bodyid[contacts.geom[:, 1]]] == base))
+    return float(np.max(-contacts.dist[own], initial=0.0))
+
+
+def upright(model: mujoco.MjModel, data: mujoco.MjData, index: int) -> float:
+    plane, _, _ = ground_geoms(model, index)
+    normal = np.zeros(3)
+    mujoco.mju_rotVecQuat(normal, [0.0, 0.0, 1.0], model.geom_quat[plane])
+    up = data.xmat[model.body(machine_prefix(index) + "base").id].reshape(3, 3)[:, 2]
+    return math.degrees(math.acos(float(np.clip(up @ normal, -1.0, 1.0))))
 
 
 def _travel(model: mujoco.MjModel, index: int) -> list[int]:
@@ -288,6 +339,8 @@ def settle(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float = 0.
     prefix = machine_prefix(index)
     joints = _own_joints(model, index)
     data.ctrl[_travel(model, index)] = 0.0
+    data.userdata[index] = 0.0
+    tracks.used_power(model, data)[index] = 0.0
     _put(model, data, index, x, y, heading, joints)
     base = model.joint(prefix + BASE_JOINT)
     q0 = int(base.qposadr[0])
@@ -316,14 +369,21 @@ def settle(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float = 0.
         data.qpos[q:q + nq] = scratch.qpos[q:q + nq]
         data.qvel[v:v + nv] = scratch.qvel[v:v + nv]
         data.qacc_warmstart[v:v + nv] = scratch.qacc_warmstart[v:v + nv]
-    tracks.write_caps(model, data)
+        data.qfrc_applied[v:v + nv] = scratch.qfrc_applied[v:v + nv]
     mujoco.mj_kinematics(model, data)
-    return rested
+    shift = math.hypot(*(data.qpos[q0:q0 + 2] - _offset(model, index)[:2] - [x, y]))
+    return (rested and upright(model, data, index) <= MAX_TILT and shift <= MAX_SHIFT
+            and not off_features(model, data, index))
 
 
 def stand(model: mujoco.MjModel, data: mujoco.MjData, index: int, seed: int, x: float = 0.0,
           y: float = 0.0, heading: float = 0.0) -> Ground:
+    own = np.concatenate([np.arange(model.jnt_qposadr[j], model.jnt_qposadr[j]
+                                    + (7 if model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE else 1))
+                          for j in _own_joints(model, index)])
+    start = data.qpos[own].copy()
     for attempt in range(DRAWS):
+        data.qpos[own] = start
         ground = draw_ground(seed, attempt)
         apply_ground(model, index, ground)
         if settle(model, data, index, x, y, heading):

@@ -18,9 +18,9 @@ from hma.machine.ground import (
     Box,
     Ground,
     apply_ground,
-    box_corners,
     draw_ground,
     inside,
+    stand,
 )
 from hma.machine.measure import (
     CASES,
@@ -35,20 +35,22 @@ from hma.machine.measure import (
     tipping_case,
     tips_under,
 )
-from hma.machine.model import GROUND, JOINT_NAMES, TRAVEL_NAMES, VALVE, ground_geoms
+from hma.machine.model import GROUND, HOME_POSE, JOINT_NAMES, TRAVEL_NAMES, VALVE, ground_geoms
 from hma.machine.tracks import (
-    CONTACT_SOLIMP,
     FRICTION,
     FRICTION_RANGE,
     GAUGE,
     OUTLINE,
     SIDES,
+    TRACTION,
     TRAVEL,
     TRAVEL_POWER,
     TRAVEL_SPEED,
+    WHEEL_RADIUS,
     WHEEL_X,
     WHEELS,
     contact_names,
+    drive_forces,
     drives,
     step,
     wheel_name,
@@ -56,7 +58,7 @@ from hma.machine.tracks import (
 
 P = machine_prefix(0)
 G = 9.81
-SOFTNESS = CONTACT_SOLIMP[2]
+SINK = 1e-5
 
 
 def machine(ground=None, pose=None, hold=False, heading=0.0):
@@ -79,10 +81,7 @@ def energy(model, data):
     mujoco.mj_forward(model, data)
     mujoco.mj_energyPos(model, data)
     mujoco.mj_energyVel(model, data)
-    mujoco.mj_subtreeVel(model, data)
-    base = model.body(P + "base").id
-    gravity_power = model.body_subtreemass[base] * model.opt.gravity @ data.subtree_linvel[base]
-    return float(data.energy.sum()) + 0.5 * model.opt.timestep * gravity_power
+    return float(data.energy.sum())
 
 
 def travel(model):
@@ -188,6 +187,19 @@ def test_a_ground_edge_under_a_track_becomes_the_tipping_line(name, factor):
     assert (angle > TIPPED) if factor > 1 else (angle < TIPPED), angle
 
 
+BETWEEN = (WHEEL_X[-2] + WHEEL_X[-1]) / 2
+
+
+def between_wheels(factor, edit=None):
+    return tipping_about(Ground(boxes=(Box(BETWEEN - 6.0, 0.0, 0.0, 6.0, 6.0, 1.0),)),
+                         (0.0, 0.0, 1.0, 0.5), [BETWEEN, 0.0, 0.0], [0.0, 1.0, 0.0], factor, edit)
+
+
+def test_an_edge_between_two_wheels_holds_the_machine_to_0_93_of_the_hand_tipping_load():
+    assert between_wheels(0.93) < TIPPED
+    assert between_wheels(1.0) > TIPPED
+
+
 def propped():
     model, data = machine(pose=chart_pose(1.5, 5.0))
     bucket = model.geom(P + "bucket").id
@@ -218,15 +230,29 @@ def test_a_machine_propped_on_its_bucket_loads_no_brake_and_stays_put():
     assert np.linalg.norm(data.qpos[:3] - start) < 1e-3
 
 
-def test_full_speed_into_a_wall_stalls_at_the_wall():
+def wall_push(edit=None):
     wall = Box(4.0, 0.0, 0.0, 0.5, 3.0, 1.2)
     model, data = machine(Ground(boxes=(wall,)))
+    if edit is not None:
+        edit(model, data)
     data.ctrl[travel(model)] = TRAVEL_SPEED
     run(model, data, 3.0)
     start = data.qpos[0]
     run(model, data, 3.0)
-    assert abs(data.qpos[0] - start) < 1e-2
-    assert data.qpos[0] + OUTLINE[1] < wall.x - wall.half_length + SOFTNESS
+    weight = model.body_subtreemass[model.body(P + "base").id] * G
+    pushes = []
+    for _ in range(200):
+        step(model, data)
+        pushes.append(drive_forces(model, data)[0].sum())
+    return data.qpos[0] - start, data.qpos[0] + OUTLINE[1] - wall.x + wall.half_length, (
+        np.mean(pushes) / (FRICTION * weight))
+
+
+def test_full_speed_into_a_wall_stalls_at_the_wall():
+    moved, gap, push = wall_push()
+    assert abs(moved) < 1e-2
+    assert gap < SINK
+    assert push == pytest.approx(1.0, rel=0.03)
 
 
 def test_a_parked_machine_pushed_with_120_kn_does_not_pass_through_a_wall():
@@ -239,25 +265,43 @@ def test_a_parked_machine_pushed_with_120_kn_does_not_pass_through_a_wall():
         step(model, data)
         if k * model.opt.timestep > 1.0:
             sink = max(sink, deepest(data, ground_geoms(model, 0)[1][0]))
-    assert data.qpos[1] + OUTLINE[3] < BESIDE + SOFTNESS
-    assert sink < SOFTNESS
+    assert data.qpos[1] + OUTLINE[3] < BESIDE + SINK
+    assert sink < SINK
 
 
-def test_driving_onto_a_0_2_m_step_climbs_it_and_pitches_with_the_ground():
-    height = 0.2
-    model, data = machine(Ground(boxes=(Box(2.5 + 5.0, 0.0, 0.0, 5.0, 6.0, height),)))
-    data.ctrl[travel(model)] = 0.5
+def drive_onto_step(height, speed, depth):
+    model, data = machine(Ground(boxes=(Box(2.5 + depth, 0.0, 0.0, depth, 6.0, height),)))
+    data.ctrl[travel(model)] = speed
     steepest = 0.0
-    for _ in range(round(14.0 / model.opt.timestep)):
+    for _ in range(round((5.0 / speed + 4.0) / model.opt.timestep)):
         step(model, data)
         steepest = max(steepest, -pitch(model, data))
+        if data.qpos[0] > 2.5 + 2 * OUTLINE[1]:
+            break
+    data.ctrl[travel(model)] = 0.0
+    run(model, data, 1.0)
+    return model, data, steepest
+
+
+@pytest.mark.parametrize("speed, depth", [(0.25, 5.0), (0.5, 5.0), (0.5, 3.0), (1.0, 5.0),
+                                          (TRAVEL_SPEED, 5.0)])
+def test_driving_onto_a_0_1_m_step_climbs_it_at_any_speed_and_pitches_with_the_ground(speed, depth):
+    height = 0.1
+    model, data, steepest = drive_onto_step(height, speed, depth)
     assert data.qpos[0] > 2.5 + OUTLINE[1]
     assert data.qpos[2] == pytest.approx(height, abs=1e-3)
     assert abs(pitch(model, data)) < 0.05
-    _, com = machine_com(model, data)
-    origin, rot = base_frame(model, data)
-    lever = (rot.T @ (com - origin))[0] - WHEEL_X[0]
-    assert steepest == pytest.approx(math.degrees(math.asin(height / lever)), rel=0.05)
+    if speed <= 0.5:
+        _, com = machine_com(model, data)
+        origin, rot = base_frame(model, data)
+        lever = (rot.T @ (com - origin))[0] - WHEEL_X[0]
+        assert steepest == pytest.approx(math.degrees(math.asin(height / lever)), rel=0.05)
+
+
+def test_a_0_2_m_step_stops_a_crawling_machine_on_its_edge():
+    model, data, _ = drive_onto_step(0.2, 0.25, 5.0)
+    assert data.qpos[0] < 2.5 + OUTLINE[1]
+    assert -pitch(model, data) > 3.0
 
 
 SLOPE = math.radians(20.0)
@@ -278,8 +322,132 @@ def power_speed():
     return TRAVEL_POWER / (weight * math.sin(SLOPE))
 
 
+def turning(commands, seconds=3.0):
+    model, data = machine()
+    parts = {model.geom(P + name).id for side in SIDES for name in contact_names(side)}
+    data.ctrl[travel(model)] = commands
+    run(model, data, 1.5)
+    yaw, belts, power, heights, rises, free = [], [], [], [], [], 0
+    for _ in range(round(seconds / model.opt.timestep)):
+        before = data.qvel[drives(model).dofs[0]] * WHEEL_RADIUS
+        rise = data.qvel[2]
+        step(model, data)
+        yaw.append(math.degrees(data.qvel[5]))
+        belts.append(data.qvel[drives(model).dofs[0]] * WHEEL_RADIUS)
+        power.append(np.maximum(drive_forces(model, data)[0] * before, 0.0).sum())
+        heights.append(data.qpos[2])
+        rises.append((data.qvel[2] - rise) / model.opt.timestep)
+        free += not any(c.dist < 0 and {c.geom1, c.geom2} & parts
+                        for c in data.contact[:data.ncon])
+    lift = (np.ptp(heights), free / len(heights), float(np.sqrt(np.mean(np.square(rises)))))
+    return float(np.mean(yaw)), np.mean(belts, axis=0), np.array(power), lift
+
+
+def test_a_pivot_turn_holds_the_inner_track_still_and_turns():
+    yaw, belts, *_ = turning([TRAVEL_SPEED, 0.0])
+    assert abs(belts[1]) < 0.01
+    assert yaw < -2.0
+
+
+@pytest.mark.parametrize("commands", [[TRAVEL_SPEED, 0.0], [TRAVEL_SPEED, -TRAVEL_SPEED]])
+def test_sliding_tracks_lift_the_machine_within_known_bounds(commands):
+    height, free, rise = turning(commands)[3]
+    assert height < 2e-3
+    assert free < 0.4
+    assert rise < 10.0
+
+
+def test_a_gentle_curve_steers():
+    yaw, *_ = turning([TRAVEL_SPEED, 0.75 * TRAVEL_SPEED])
+    assert yaw < -0.6
+
+
+@pytest.mark.parametrize("share", [1 / 3, 1.0])
+def test_counter_rotation_never_takes_more_than_the_engine_share(share):
+    _, _, power, _ = turning([share * TRAVEL_SPEED, -share * TRAVEL_SPEED])
+    assert power.max() <= TRAVEL_POWER * (1 + 1e-9)
+    if share == 1.0:
+        assert power.mean() > 0.9 * TRAVEL_POWER
+
+
 def test_on_a_slope_the_speed_is_set_by_the_engine_power():
     assert slope_speed() == pytest.approx(power_speed(), rel=0.03)
+
+
+def downhill_run(angle):
+    model, data = machine(slope(along=angle))
+    data.ctrl[travel(model)] = -TRAVEL_SPEED
+    run(model, data, 5.0)
+    speed = float(np.linalg.norm(data.qvel[:3]))
+    start = data.qpos[:3].copy()
+    data.ctrl[travel(model)] = 0.0
+    run(model, data, 4.0)
+    return speed, float(np.linalg.norm(data.qpos[:3] - start)), float(np.abs(data.qvel[:6]).max())
+
+
+@pytest.mark.parametrize("degrees", [15.0, 20.0])
+def test_full_speed_downhill_holds_the_commanded_speed_and_stops(degrees):
+    speed, distance, left = downhill_run(math.radians(degrees))
+    assert speed == pytest.approx(TRAVEL_SPEED, rel=0.005)
+    assert distance < 1.0
+    assert left < 1e-3
+
+
+def test_braking_from_full_speed_on_flat_takes_the_friction_limited_distance():
+    model, data = machine()
+    data.ctrl[travel(model)] = TRAVEL_SPEED
+    run(model, data, 3.0)
+    start, speed = data.qpos[0], data.qvel[0]
+    data.ctrl[travel(model)] = 0.0
+    run(model, data, 2.0)
+    assert (data.qpos[0] - start) / (speed**2 / (2 * FRICTION * G)) == pytest.approx(1.0, abs=0.05)
+
+
+def test_a_track_in_the_air_leaves_the_other_its_full_traction():
+    model = load_scene(1, weld=True)
+    data = mujoco.MjData(model)
+    mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
+    data.mocap_pos[0, 2] += 1.0
+    data.qpos[2] += 1.0
+    data.ctrl[travel(model)] = [TRAVEL_SPEED, 0.3]
+    load = 0.98 * TRACTION
+    data.qfrc_applied[model.joint(P + wheel_name("right", 1)).dofadr[0]] = -load * WHEEL_RADIUS
+    step(model, data, round(4.0 / model.opt.timestep))
+    belts = data.qvel[drives(model).dofs[0]] * WHEEL_RADIUS
+    assert belts == pytest.approx([TRAVEL_SPEED, 0.3], rel=1e-3)
+    assert drive_forces(model, data)[0, 1] == pytest.approx(load, rel=1e-3)
+
+
+def test_positive_drive_power_never_exceeds_the_engine_share():
+    rng = np.random.default_rng(2)
+    model, data = machine(draw_ground(7))
+    peak = 0.0
+    for k in range(4000):
+        if k % 100 == 0:
+            data.ctrl[travel(model)] = rng.uniform(-1.0, 1.0, 2) * TRAVEL_SPEED
+        belts = data.qvel[drives(model).dofs[0]] * WHEEL_RADIUS
+        step(model, data)
+        peak = max(peak, np.maximum(drive_forces(model, data)[0] * belts, 0.0).sum())
+    assert TRAVEL_POWER * 0.99 < peak <= TRAVEL_POWER * (1 + 1e-9)
+
+
+def test_rollouts_sharing_one_model_match_rollouts_on_their_own():
+    ground = slope(along=math.radians(15.0))
+    shared, _ = machine(ground)
+    datas = [mujoco.MjData(shared) for _ in range(2)]
+    own = [machine(ground) for _ in range(2)]
+    for k, (d, (m, o)) in enumerate(zip(datas, own, strict=True)):
+        mujoco.mj_copyData(d, shared, o)
+        d.ctrl[travel(shared)] = o.ctrl[travel(m)] = [TRAVEL_SPEED, -TRAVEL_SPEED * k]
+    fields = {name: getattr(shared, name).copy() for name in ("tendon_frictionloss", "dof_damping")}
+    for _ in range(300):
+        for d, (m, o) in zip(datas, own, strict=True):
+            step(shared, d)
+            step(m, o)
+    for d, (_, o) in zip(datas, own, strict=True):
+        assert np.array_equal(d.qpos, o.qpos)
+    for name, value in fields.items():
+        assert np.array_equal(getattr(shared, name), value)
 
 
 def test_brakes_hold_on_a_slope_below_the_friction_angle():
@@ -362,6 +530,19 @@ def test_resets_on_drawn_grounds_start_at_rest_with_steady_load_readings():
         np.testing.assert_allclose(layer.true_state().loads[0], first, atol=0.01)
 
 
+def test_a_refused_draw_leaves_no_drift_for_the_next_draw_to_start_from():
+    model = load_scene(1)
+    data = mujoco.MjData(model)
+    joints = [model.joint(P + name).qposadr[0] for name in JOINT_NAMES]
+    mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
+    apply_ground(model, 0, draw_ground(91, 0))
+    assert not settle(model, data, 0)
+    assert np.abs(data.qpos[joints] - HOME_POSE).max() > 0.1
+    mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
+    stand(model, data, 0, 91)
+    assert np.abs(data.qpos[joints] - HOME_POSE).max() < 1e-2
+
+
 def test_restoring_the_integration_state_repeats_bit_for_bit():
     model, data = machine(draw_ground(4))
     data.ctrl[travel(model)] = [TRAVEL_SPEED, 0.3]
@@ -403,26 +584,77 @@ def test_one_machine_barely_moves_another_in_the_same_scene():
     assert np.abs(two_machines(True) - two_machines(False)).max() < 1e-6
 
 
-def test_drawn_features_stay_in_the_field_and_the_sun_shadow():
-    for seed in range(200):
+def placed_points(model):
+    plane, boxes, bumps = ground_geoms(model, 0)
+    normal = np.zeros(3)
+    mujoco.mju_rotVecQuat(normal, [0.0, 0.0, 1.0], model.geom_quat[plane])
+    points = []
+    for geom in boxes:
+        if model.geom_pos[geom, 2] < -1.0:
+            continue
+        rot = np.zeros(9)
+        mujoco.mju_quat2Mat(rot, model.geom_quat[geom])
+        size = model.geom_size[geom]
+        top = np.array([[a * size[0], b * size[1], size[2]] for a in (-1, 1) for b in (-1, 1)])
+        height = (model.geom_pos[geom] - model.geom_pos[plane]) @ normal + size[2]
+        corners = np.concatenate([top, top - [0.0, 0.0, height]])
+        points.append(model.geom_pos[geom] + corners @ rot.reshape(3, 3).T)
+    for geom in bumps:
+        if model.geom_pos[geom, 2] < -1.0:
+            continue
+        below = (model.geom_pos[geom] - model.geom_pos[plane]) @ normal
+        rim = math.sqrt(model.geom_size[geom, 0] ** 2 - below**2)
+        across = np.cross(normal, [1.0, 0.0, 0.0])
+        across /= np.linalg.norm(across)
+        along = np.cross(across, normal)
+        foot = model.geom_pos[geom] - below * normal
+        angles = np.linspace(0.0, 2 * math.pi, 64, endpoint=False)
+        points.append(foot + rim * (np.outer(np.cos(angles), along)
+                                    + np.outer(np.sin(angles), across)))
+    return np.concatenate(points) if points else np.zeros((0, 3))
+
+
+def test_drawn_features_stay_in_the_field_and_the_sun_shadow_as_placed():
+    model = load_scene(1)
+    xs = []
+    counts = []
+    for seed in range(300):
         ground = draw_ground(seed)
         assert FRICTION_RANGE[0] <= ground.friction <= FRICTION_RANGE[1]
         assert abs(math.atan(math.hypot(*ground.grade))) <= RANGES["slope"][1] + 1e-12
-        for box in ground.boxes:
-            assert inside(box_corners(box)), seed
-        for bump in ground.bumps:
-            rim = [[bump.x + bump.radius * c, bump.y + bump.radius * s, bump.height]
-                   for c, s in ((1, 0), (-1, 0), (0, 1), (0, -1))]
-            assert inside(np.array(rim)), seed
+        apply_ground(model, 0, ground)
+        points = placed_points(model)
+        assert len(points) == 0 or inside(points), seed
+        xs += [b.x for b in ground.boxes] + [b.x for b in ground.bumps]
+        counts.append((len(ground.boxes), len(ground.bumps)))
+    boxes, bumps = np.mean(counts, axis=0)
+    assert abs(boxes - 4.0) < 0.3 and abs(bumps - 3.0) < 0.3
+    assert min(xs) < -1.5 and max(xs) > 8.0
     assert draw_ground(5) == draw_ground(5) and draw_ground(5) != draw_ground(6)
 
 
-def test_off_features_flags_a_machine_that_drove_off_the_drawn_field():
-    model, data = machine()
-    assert not off_features(model, data, 0)
-    data.qpos[0] += 12.0
-    mujoco.mj_kinematics(model, data)
-    assert off_features(model, data, 0)
+def test_off_features_flags_the_machine_that_drove_off_its_own_field():
+    model = load_scene(2)
+    data = mujoco.MjData(model)
+    mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
+    for i in range(2):
+        apply_ground(model, i, Ground())
+        assert settle(model, data, i)
+    data.ctrl[[model.actuator(machine_prefix(1) + name).id for name in TRAVEL_NAMES]] = (
+        TRAVEL_SPEED)
+    flagged = []
+    for _ in range(round(12.0 / model.opt.timestep)):
+        step(model, data)
+        flagged.append((off_features(model, data, 0), off_features(model, data, 1)))
+    assert not any(first for first, _ in flagged)
+    assert not flagged[0][1] and flagged[-1][1]
+
+
+@pytest.mark.parametrize("heading", [0.0, 1.0, -2.5])
+def test_settle_turns_the_machine_to_the_asked_heading(heading):
+    _, data = machine(heading=heading)
+    w, _, _, z = data.qpos[3:7]
+    assert math.atan2(2 * w * z, 1 - 2 * z * z) == pytest.approx(heading, abs=1e-3)
 
 
 def stop_distance(edit):
@@ -475,13 +707,35 @@ def test_each_broken_piece_of_physics_fails_its_check(monkeypatch):
     assert front_tipping(end_wheels_out, 1.005) < TIPPED
     assert brake_drift(no_coupling) > 1e-2
 
-    def released_brakes(model, data):
+    def no_brake(model, data):
         model.tendon_frictionloss[drives(model).tendons] = 0.0
 
-    def no_brake(model, data):
-        monkeypatch.setattr(tracks, "write_caps", released_brakes)
-
     assert brake_drift(no_brake) > 1e-2
+
+    def no_support(model, data):
+        boxes = [model.geom(P + tracks.shell_names(side)[3]).id for side in SIDES]
+        model.pair_margin[np.isin(model.pair_geom1, boxes) | np.isin(model.pair_geom2, boxes)] = -1
+
+    assert between_wheels(0.93, no_support) > TIPPED
+
+    def friction_damping(b):
+        def edit(model, data):
+            model.pair_solreffriction[:, 1] = -b
+        return edit
+
+    assert wall_push(friction_damping(20.0))[2] < 0.97
+    assert wall_push(friction_damping(100.0))[2] > 1.03
+
+    def capped_brakes(model, data):
+        belts = data.qvel[drives(model).dofs] * WHEEL_RADIUS
+        model.tendon_frictionloss[drives(model).tendons] = np.minimum(
+            TRACTION, TRAVEL_POWER / np.abs(belts).sum(axis=-1, keepdims=True).clip(1e-12))
+        data.qfrc_applied[drives(model).dofs] = 0.0
+
+    monkeypatch.setattr(tracks, "limit_power", capped_brakes)
+    assert downhill_run(math.radians(20.0))[0] > 1.5 * TRAVEL_SPEED
+    assert abs(turning([TRAVEL_SPEED, 0.0])[1][1]) > 0.05
+    assert turning([TRAVEL_SPEED, 0.75 * TRAVEL_SPEED])[0] > -0.3
     monkeypatch.undo()
     monkeypatch.setattr(tracks, "TRAVEL_POWER", 1e12)
     assert slope_speed() > 1.1 * power_speed()

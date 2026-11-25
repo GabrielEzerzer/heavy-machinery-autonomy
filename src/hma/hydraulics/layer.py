@@ -30,11 +30,12 @@ from hma.machine import (
 )
 from hma.machine.ground import settle, stand
 from hma.machine.model import COUNTERWEIGHT_MASS
-from hma.machine.tracks import step
+from hma.machine.tracks import SIDES, WHEELS, step, wheel_name
 
 CONTROL_HZ = 10.0
 JOINTS = len(JOINT_NAMES)
 COUNTERWEIGHT = "counterweight"
+BASE = BODY_NAMES.index("base")
 UPPER = BODY_NAMES.index("upper")
 JOINT_SIZES = {int(mujoco.mjtJoint.mjJNT_FREE): (7, 6), int(mujoco.mjtJoint.mjJNT_BALL): (4, 3)}
 
@@ -128,6 +129,19 @@ class Hydraulics:
             for b in nominal_ids
         ]
         self._counterweight = _counterweight_solid(reference)
+
+        def wheels(m, i):
+            return np.array([m.body(machine_prefix(i) + wheel_name(s, k)).id
+                             for s in SIDES for k in range(WHEELS)])
+
+        self._wheels = np.array([wheels(model, i) for i in range(self.n)])
+        self._wheel_dofs = model.body_dofadr[self._wheels]
+        nominal_wheels = wheels(reference, 0)
+        self._wheel_mass = reference.body_mass[nominal_wheels].copy()
+        self._wheel_inertia = reference.body_inertia[nominal_wheels].copy()
+        self._belt_armature = reference.dof_armature[reference.body_dofadr[nominal_wheels]].copy()
+        self._lower_ratio = (self._nominal_bodies[BASE].mass
+                             + self._wheel_mass.sum()) / self._nominal_bodies[BASE].mass
         self._scratch = mujoco.MjData(model)
 
         delay_cap = max([RANGES["delay"][1], *(float(np.max(m.delay)) for m in machines)])
@@ -248,6 +262,10 @@ class Hydraulics:
         self._noise_draws[index] = self._rngs[index].uniform(-1.0, 1.0, shape)
 
     def _apply_mass(self, index: int, machine: Machine) -> None:
+        lower = machine.link_mass[BASE]
+        self.model.body_mass[self._wheels[index]] = self._wheel_mass * lower
+        self.model.body_inertia[self._wheels[index]] = self._wheel_inertia * lower
+        self.model.dof_armature[self._wheel_dofs[index]] = self._belt_armature * lower
         for k, body in enumerate(self._bodies[index]):
             body = int(body)
             nominal = self._nominal_bodies[k]
@@ -264,7 +282,7 @@ class Hydraulics:
                 cw = self._counterweight
                 rest = _combine(nominal, _scaled(cw, -1.0))
                 solid = _combine(_scaled(rest, machine.link_mass[k]), _scaled(cw, cw_factor))
-            com = solid.com + machine.com_shift[k]
+            com = solid.com + machine.com_shift[k] * (self._lower_ratio if k == BASE else 1.0)
             values, axes = np.linalg.eigh(solid.inertia)
             if np.linalg.det(axes) < 0:
                 axes[:, 0] = -axes[:, 0]

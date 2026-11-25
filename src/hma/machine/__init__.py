@@ -18,10 +18,9 @@ from hma.machine.model import (
     load_scene,
     machine_prefix,
     set_weld,
-    tendon_friction,
     write_friction,
 )
-from hma.machine.tracks import step
+from hma.machine.tracks import step, tendon_friction
 
 __all__ = [
     "BODY_NAMES",

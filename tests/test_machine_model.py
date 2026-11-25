@@ -158,11 +158,13 @@ def test_each_machine_stands_on_its_own_ground_with_few_contacts():
         assert abs(base_position(model, data, i)[2]) < 1e-3
 
 
-def test_welded_machines_keep_their_ground_contacts():
+def test_welded_scenes_have_no_ground_contact_and_refuse_a_release():
     model = load_scene(2, weld=True)
     data = home_data(model)
     settle(model, data, 0.5)
-    assert data.ncon > 0
+    assert model.npair == 0 and data.ncon == 0
+    with pytest.raises(ValueError):
+        set_weld(model, data, 0, False)
 
 
 def test_free_base_rests_flush_and_tip_matches_kinematics():
@@ -226,7 +228,7 @@ def test_ridge_across_the_middle_of_the_tracks_lifts_the_machine():
     assert base_position(model, data, 0)[2] > 0.15
 
 
-@pytest.mark.parametrize("lip", [1.5, 1.4, 1.2])
+@pytest.mark.parametrize("lip", [1.5, 1.4, 1.2, 1.0])
 def test_loaded_machine_stays_level_with_track_ends_over_a_drop(lip):
     model, data = on_ground(Box(lip - 6.0, 0.0, 0.0, 6.0, 6.0, 1.0), pose=(0.0, 0.0, 1.0, 0.5))
     settle(model, data, 3.0, 1200.0)
@@ -276,8 +278,9 @@ def test_base_moves_under_large_force_without_weld():
 
 
 def test_weld_switches_at_run_time_and_holds_where_it_was_switched_on():
-    model = load_scene(1, weld=True)
+    model = load_scene(1)
     data = home_data(model)
+    set_weld(model, data, 0, True)
     set_weld(model, data, 0, False)
     settle(model, data, 0.5)
     assert abs(base_position(model, data, 0)[2]) < 1e-3
@@ -292,23 +295,22 @@ def test_weld_switches_at_run_time_and_holds_where_it_was_switched_on():
 
 
 def test_switching_the_weld_at_run_time_writes_nothing_into_the_model():
-    model = load_scene(1, weld=True)
+    model = load_scene(1)
     data = home_data(model)
     fields = ("body_contype", "body_conaffinity", "geom_contype", "geom_conaffinity",
               "pair_geom1", "pair_geom2", "pair_friction", "eq_active0")
     before = {name: getattr(model, name).copy() for name in fields}
-    set_weld(model, data, 0, False)
-    settle(model, data, 0.5)
     set_weld(model, data, 0, True)
+    settle(model, data, 0.5)
+    set_weld(model, data, 0, False)
     settle(model, data, 0.5)
     for name in fields:
         assert np.array_equal(getattr(model, name), before[name]), name
 
 
 def test_reset_after_rewelding_elsewhere_returns_to_home():
-    model = load_scene(1, weld=True)
+    model = load_scene(1)
     data = home_data(model)
-    set_weld(model, data, 0, False)
     adr = model.joint(machine_prefix(0) + "base_free").qposadr[0]
     data.qpos[adr:adr + 3] = [23.0, 0.2, -3.5]
     set_weld(model, data, 0, True)
@@ -320,9 +322,8 @@ def test_reset_after_rewelding_elsewhere_returns_to_home():
 
 
 def test_two_data_on_one_model_weld_independently():
-    model = load_scene(1, weld=True)
+    model = load_scene(1)
     a, b = home_data(model), home_data(model)
-    set_weld(model, a, 0, False)
     adr = model.joint(machine_prefix(0) + "base_free").qposadr[0]
     a.qpos[adr:adr + 3] = [3.0, 0.0, 0.5]
     set_weld(model, a, 0, True)

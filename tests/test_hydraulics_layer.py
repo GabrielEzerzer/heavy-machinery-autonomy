@@ -4,6 +4,7 @@ import mujoco
 import numpy as np
 import pytest
 
+import hma.hydraulics.layer as layer_module
 from hma.hydraulics import EFFECTS, NOMINAL, NOMINAL_SUPPLY, RANGES, Hydraulics, draw_machine
 from hma.machine import (
     BODY_NAMES,
@@ -13,13 +14,24 @@ from hma.machine import (
     load_scene,
     machine_prefix,
 )
+from hma.machine.ground import apply_ground
 from hma.machine.mass import Solid, body_parts, combine, full_inertia, point
+from hma.machine.measure import slope
 from hma.machine.model import (
     COUNTERWEIGHT_MASS,
+    TRAVEL_NAMES,
     VALVE_GAIN,
     VALVE_INERTIA,
     _machine_spec,
     wheel_points,
+)
+from hma.machine.tracks import (
+    BELT_ARMATURE,
+    SIDES,
+    TRAVEL_POWER,
+    TRAVEL_SPEED,
+    WHEELS,
+    wheel_name,
 )
 
 DT = 0.005
@@ -226,6 +238,13 @@ def test_sensors_report_the_state_from_the_drawn_latency_ago_with_bounded_noise(
             assert np.all(np.abs(errors).max(axis=(0, 2, 3)) > 0.9 * amplitude[:, 0, 0])
 
 
+def undercarriage(model, bodies):
+    masses = model.body_mass[bodies]
+    places = np.array([model.body_ipos[b] + (model.body_pos[b] if b != bodies[0] else 0.0)
+                       for b in bodies])
+    return masses.sum(), masses @ places / masses.sum()
+
+
 def test_changed_masses_shift_the_links_and_the_home_pose_still_rests():
     machine = only("mass")
     for weld in (True, False):
@@ -240,13 +259,23 @@ def test_changed_masses_shift_the_links_and_the_home_pose_still_rests():
                 cw = COUNTERWEIGHT_MASS
                 expected = (nominal.body_mass[body] - cw) * machine.link_mass[k]
                 expected += cw * machine.counterweight
-            else:
+            elif k > 0:
                 np.testing.assert_allclose(model.body_ipos[body],
                                            nominal.body_ipos[body] + machine.com_shift[k],
                                            atol=1e-12)
             assert model.body_mass[body] == pytest.approx(expected, rel=1e-12)
+        lower = [bodies[0], *(model.body(machine_prefix(0) + wheel_name(s, k)).id
+                              for s in SIDES for k in range(WHEELS))]
+        mass, com = undercarriage(model, lower)
+        nominal_mass, nominal_com = undercarriage(nominal, lower)
+        assert mass == pytest.approx(nominal_mass * machine.link_mass[0], rel=1e-12)
+        np.testing.assert_allclose(com, nominal_com + machine.com_shift[0], atol=1e-12)
+        dofs = model.body_dofadr[lower[1:]]
+        assert model.dof_armature[dofs].sum() == pytest.approx(
+            2 * BELT_ARMATURE * machine.link_mass[0], rel=1e-12)
         assert model.body_subtreemass[bodies[0]] == pytest.approx(
-            sum(model.body_mass[b] for b in bodies) + sum(m for m, _ in wheel_points()))
+            sum(model.body_mass[b] for b in bodies)
+            + machine.link_mass[0] * sum(m for m, _ in wheel_points()))
         start = layer.true_state().positions[0].copy()
         for _ in range(400):
             layer.step()
@@ -708,3 +737,26 @@ def test_resetting_one_machine_leaves_the_other_machines_noise_alone():
     _, _, undisturbed = scene(False)
     np.testing.assert_allclose(second, first, rtol=0, atol=1e-12)
     np.testing.assert_allclose(other, undisturbed, rtol=0, atol=1e-9)
+
+
+def uphill_speed():
+    model = load_scene(1)
+    data = mujoco.MjData(model)
+    apply_ground(model, 0, slope(along=np.radians(20.0)))
+    layer = Hydraulics(model, data, [NOMINAL])
+    data.ctrl[[model.actuator(machine_prefix(0) + t).id for t in TRAVEL_NAMES]] = TRAVEL_SPEED
+    for _ in range(round(3.0 / DT)):
+        layer.step()
+    start = data.qpos[:3].copy()
+    for _ in range(round(1.0 / DT)):
+        layer.step()
+    weight = model.body_subtreemass[model.body(machine_prefix(0) + "base").id] * 9.81
+    return float(np.linalg.norm(data.qpos[:3] - start)), TRAVEL_POWER / (weight * np.sin(
+        np.radians(20.0)))
+
+
+def test_the_layer_steps_through_the_track_drive(monkeypatch):
+    speed, powered = uphill_speed()
+    assert speed == pytest.approx(powered, rel=0.03)
+    monkeypatch.setattr(layer_module, "step", lambda model, data: mujoco.mj_step(model, data))
+    assert uphill_speed()[0] > 1.1 * powered
