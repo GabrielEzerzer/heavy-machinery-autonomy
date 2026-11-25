@@ -7,6 +7,7 @@ import pytest
 
 from hma.hydraulics import NOMINAL, RANGES, Hydraulics, draw_machine
 from hma.hydraulics import circuit as c
+from hma.hydraulics import layer as oil_layer
 from hma.hydraulics.layer import DISPLACEMENT, INFLOW, NODE_DROPS, VOLUME_SLOPE
 from hma.machine import (
     BODY_NAMES,
@@ -424,11 +425,14 @@ def test_a_parked_machine_holds_2500_kg_on_a_ten_degree_side_slope():
 RELIEF_OVERSHOOT = 3.0e6
 
 
-def test_random_combined_commands_at_the_corners_keep_floor_relief_and_torque_consistent():
+def corner_scene():
     machines = [extreme_machine(m) for m in RANGES["link_mass"]] + [NOMINAL]
     model = dig_pit(load_scene(len(machines), weld=True), len(machines))
-    data = mujoco.MjData(model)
-    layer = Hydraulics(model, data, machines)
+    return machines, Hydraulics(model, mujoco.MjData(model), machines)
+
+
+def test_random_combined_commands_at_the_corners_keep_floor_relief_and_torque_consistent():
+    machines, layer = corner_scene()
     setting = np.zeros((len(machines), c.NODES))
     for i, m in enumerate(machines):
         setting[i, :c.PUMPS] = m.main_relief
@@ -452,6 +456,19 @@ def test_random_combined_commands_at_the_corners_keep_floor_relief_and_torque_co
     flips = np.array([chatter_per_node(pressures[:, i]) for i in range(len(machines))])
     assert flips[:2].max() <= 0.025
     assert flips[2].max() <= 0.003
+
+
+def test_a_capped_step_keeps_the_attempt_whose_forces_matched_best(monkeypatch):
+    monkeypatch.setattr(oil_layer, "REDO_PASSES", 1)
+    machines, layer = corner_scene()
+    rng = np.random.default_rng(11)
+    mismatch = []
+    for _ in range(50):
+        layer.act(rng.choice([-1.0, 0.0, 1.0], size=(len(machines), 4)))
+        for _ in range(layer.steps_per_decision):
+            mismatch.append(stepped_force_mismatch(layer))
+    assert layer.capped >= 3
+    assert np.array(mismatch)[..., SWING].max() < 0.5e3
 
 
 def stepped_force_mismatch(layer):
