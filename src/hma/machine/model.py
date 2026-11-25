@@ -11,7 +11,7 @@ import mujoco
 import numpy as np
 
 from hma.machine.collision import add_collision_geoms
-from hma.machine.scenery import dress_after_heightfields
+from hma.machine.scenery import dress_after_heightfields, plain_look
 
 ASSETS = Path(__file__).parent / "assets"
 MACHINE_XML = ASSETS / "excavator.xml"
@@ -255,6 +255,7 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
                            objtype=mujoco.mjtObj.mjOBJ_BODY, name1=prefix + "base",
                            name2=prefix + ANCHOR, data=[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0],
                            active=int(weld))
+    plain_look(scene)
     _share_look(scene)
     offsets = [i * MACHINE_SPACING for i in range(n_machines)]
     footprints = [(*GROUND_X, y + GROUND_Y[0], y + GROUND_Y[1]) for y in offsets]

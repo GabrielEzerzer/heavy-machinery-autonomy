@@ -1,12 +1,20 @@
-"""The scene's clip, fog and haze distances are the same in metres at any machine count, and the
-sun's shadow box holds every machine at full reach, in front of the light."""
+"""The scene's clip, fog and haze distances are the same in metres at any machine count, the sun's
+shadow box holds every machine at full reach, and the plain drawn meshes add no mass or contact."""
 
+import mujoco
 import numpy as np
 import pytest
 
 from hma.machine import load_scene
-from hma.machine.model import MACHINE_SPACING, MAX_MACHINES
-from hma.machine.scenery import REACH, SHOULDER, SUN_DIR
+from hma.machine.model import MACHINE_SPACING, MAX_MACHINES, machine_prefix
+from hma.machine.scenery import (
+    DRAWN_GROUP,
+    HIDDEN_GROUP,
+    PLAIN,
+    REACH,
+    SHOULDER,
+    SUN_DIR,
+)
 
 COUNTS = (1, 2, 8, MAX_MACHINES)
 
@@ -37,3 +45,20 @@ def test_sun_shadow_box_holds_every_machine(count):
         across = np.linalg.norm(shoulder - along * direction)
         assert across + REACH <= half + 1e-6
         assert along - REACH > near
+
+
+def test_tracks_and_upper_structure_are_drawn_plain_without_mass_or_contact():
+    model = load_scene(2)
+    default = mujoco.MjvOption()
+    assert default.geomgroup[DRAWN_GROUP] and not default.geomgroup[HIDDEN_GROUP]
+    for i in range(2):
+        for name in ("crawler", "body"):
+            detailed = model.geom(machine_prefix(i) + name)
+            plain = model.geom(machine_prefix(i) + name + PLAIN)
+            assert detailed.group[0] == HIDDEN_GROUP and plain.group[0] == DRAWN_GROUP
+            assert plain.contype[0] == 0 and plain.conaffinity[0] == 0
+            assert plain.bodyid[0] == detailed.bodyid[0]
+            fine, coarse = model.mesh(detailed.dataid[0]), model.mesh(plain.dataid[0])
+            assert coarse.facenum[0] < 0.6 * fine.facenum[0]
+    alone = load_scene(1)
+    np.testing.assert_array_equal(alone.body_mass[:6], model.body_mass[:6])
