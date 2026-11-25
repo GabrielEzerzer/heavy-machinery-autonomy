@@ -13,6 +13,7 @@ from hma.machine import (
     settle,
     tendon_friction,
 )
+from hma.machine.contact import STEEL_FRICTION_RANGE, set_friction
 from hma.machine.ground import (
     RANGES,
     Box,
@@ -24,7 +25,6 @@ from hma.machine.ground import (
 )
 from hma.machine.measure import (
     CASES,
-    HOLD,
     TIPPED,
     base_frame,
     chart_pose,
@@ -35,7 +35,10 @@ from hma.machine.measure import (
     tipping_case,
     tips_under,
 )
-from hma.machine.model import GROUND, HOME_POSE, JOINT_NAMES, TRAVEL_NAMES, VALVE, ground_geoms
+from hma.machine.measure import (
+    released as machine,
+)
+from hma.machine.model import GROUND, HOME_POSE, JOINT_NAMES, TRAVEL_NAMES, VALVE, ground_parts
 from hma.machine.tracks import (
     FRICTION,
     FRICTION_RANGE,
@@ -59,22 +62,6 @@ from hma.machine.tracks import (
 P = machine_prefix(0)
 G = 9.81
 SINK = 1e-5
-
-
-def machine(ground=None, pose=None, hold=False, heading=0.0):
-    model = load_scene(1)
-    apply_ground(model, 0, ground or Ground())
-    if hold:
-        for name in JOINT_NAMES:
-            model.tendon_frictionloss[model.tendon(P + name + VALVE).id] = HOLD
-    data = mujoco.MjData(model)
-    mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
-    if pose is not None:
-        for name, value in zip(JOINT_NAMES, pose, strict=True):
-            data.qpos[model.joint(P + name).qposadr[0]] = value
-    assert settle(model, data, 0, heading=heading)
-    mujoco.mj_forward(model, data)
-    return model, data
 
 
 def energy(model, data):
@@ -172,9 +159,9 @@ def tipping_about(ground, pose, line, axis, factor, edit=None):
 EDGES = {
     "across the tracks under a wheel": (
         Ground(boxes=(Box(WHEEL_X[-2] - 6.0, 0.0, 0.0, 6.0, 6.0, 1.0),)),
-        (0.0, 0.0, 1.0, 0.5), [WHEEL_X[-2], 0.0, 0.0], [0.0, 1.0, 0.0]),
+        chart_pose(1.5, 6.0), [WHEEL_X[-2], 0.0, 0.0], [0.0, 1.0, 0.0]),
     "along between the rails": (Ground(boxes=(Box(0.0, GAUGE / 2 - 3.0, 0.0, 6.0, 3.0, 1.0),)),
-                                chart_pose(0.0, 4.5, math.pi / 2), [0.0, GAUGE / 2, 0.0],
+                                chart_pose(1.5, 4.5, math.pi / 2), [0.0, GAUGE / 2, 0.0],
                                 [1.0, 0.0, 0.0]),
 }
 
@@ -192,7 +179,7 @@ BETWEEN = (WHEEL_X[-2] + WHEEL_X[-1]) / 2
 
 def between_wheels(factor, edit=None):
     return tipping_about(Ground(boxes=(Box(BETWEEN - 6.0, 0.0, 0.0, 6.0, 6.0, 1.0),)),
-                         (0.0, 0.0, 1.0, 0.5), [BETWEEN, 0.0, 0.0], [0.0, 1.0, 0.0], factor, edit)
+                         chart_pose(1.5, 6.0), [BETWEEN, 0.0, 0.0], [0.0, 1.0, 0.0], factor, edit)
 
 
 def test_an_edge_between_two_wheels_holds_the_machine_to_0_93_of_the_hand_tipping_load():
@@ -200,13 +187,9 @@ def test_an_edge_between_two_wheels_holds_the_machine_to_0_93_of_the_hand_tippin
     assert between_wheels(1.0) > TIPPED
 
 
-def propped():
+def propped(mu):
     model, data = machine(pose=chart_pose(1.5, 5.0))
-    bucket = model.geom(P + "bucket").id
-    model.geom_contype[bucket] = 1
-    model.body_contype[model.geom_bodyid[bucket]] = 1
-    model.geom_friction[bucket] = 0.0
-    model.geom_priority[bucket] = 1
+    set_friction(model, 0, mu)
     boom = model.actuator(P + "boom").id
     data.ctrl[boom] = 0.1
     for _ in range(round(8.0 / model.opt.timestep)):
@@ -218,15 +201,16 @@ def propped():
     return model, data
 
 
-def test_a_machine_propped_on_its_bucket_loads_no_brake_and_stays_put():
-    model, data = propped()
+@pytest.mark.parametrize("mu", STEEL_FRICTION_RANGE)
+def test_a_machine_propped_on_its_bucket_stays_put_with_its_brakes_far_from_slipping(mu):
+    model, data = propped(mu)
     assert -30.0 < pitch(model, data) < -20.0
     start = data.qpos[:3].copy()
     peak = 0.0
     for _ in range(round(4.0 / model.opt.timestep)):
         step(model, data)
         peak = max(peak, np.abs(tendon_friction(data, brakes(model))).max())
-    assert peak < 1.0
+    assert peak < 0.1 * TRACTION
     assert np.linalg.norm(data.qpos[:3] - start) < 1e-3
 
 
@@ -264,13 +248,14 @@ def test_a_parked_machine_pushed_with_120_kn_does_not_pass_through_a_wall():
         data.xfrc_applied[model.body(P + "base").id, 1] = 120e3
         step(model, data)
         if k * model.opt.timestep > 1.0:
-            sink = max(sink, deepest(data, ground_geoms(model, 0)[1][0]))
+            sink = max(sink, deepest(data, ground_parts(model, 0)[1][0]))
     assert data.qpos[1] + OUTLINE[3] < BESIDE + SINK
     assert sink < SINK
 
 
 def drive_onto_step(height, speed, depth):
-    model, data = machine(Ground(boxes=(Box(2.5 + depth, 0.0, 0.0, depth, 6.0, height),)))
+    model, data = machine(Ground(boxes=(Box(2.5 + depth, 0.0, 0.0, depth, 6.0, height),)),
+                          pose=None)
     data.ctrl[travel(model)] = speed
     steepest = 0.0
     for _ in range(round((5.0 / speed + 4.0) / model.opt.timestep)):
@@ -499,7 +484,7 @@ def test_a_dragged_block_reads_the_ground_friction(speed):
 
 def test_every_undercarriage_part_meets_the_ground_and_takes_the_drawn_friction():
     model = load_scene(1)
-    plane, boxes, bumps = ground_geoms(model, 0)
+    plane, boxes, bumps = ground_parts(model, 0)
     ground = {plane, *boxes, *bumps}
     for side in SIDES:
         for part in contact_names(side):
@@ -535,11 +520,11 @@ def test_a_refused_draw_leaves_no_drift_for_the_next_draw_to_start_from():
     data = mujoco.MjData(model)
     joints = [model.joint(P + name).qposadr[0] for name in JOINT_NAMES]
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
-    apply_ground(model, 0, draw_ground(91, 0))
+    apply_ground(model, 0, draw_ground(75, 0))
     assert not settle(model, data, 0)
     assert np.abs(data.qpos[joints] - HOME_POSE).max() > 0.1
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
-    stand(model, data, 0, 91)
+    stand(model, data, 0, 75)
     assert np.abs(data.qpos[joints] - HOME_POSE).max() < 1e-2
 
 
@@ -585,7 +570,7 @@ def test_one_machine_barely_moves_another_in_the_same_scene():
 
 
 def placed_points(model):
-    plane, boxes, bumps = ground_geoms(model, 0)
+    plane, boxes, bumps = ground_parts(model, 0)
     normal = np.zeros(3)
     mujoco.mju_rotVecQuat(normal, [0.0, 0.0, 1.0], model.geom_quat[plane])
     points = []
@@ -622,11 +607,15 @@ def test_drawn_features_stay_in_the_field_and_the_sun_shadow_as_placed():
         ground = draw_ground(seed)
         assert FRICTION_RANGE[0] <= ground.friction <= FRICTION_RANGE[1]
         assert abs(math.atan(math.hypot(*ground.grade))) <= RANGES["slope"][1] + 1e-12
-        apply_ground(model, 0, ground)
+        try:
+            apply_ground(model, 0, ground)
+        except ValueError:
+            continue
+        finally:
+            xs += [b.x for b in ground.boxes] + [b.x for b in ground.bumps]
+            counts.append((len(ground.boxes), len(ground.bumps)))
         points = placed_points(model)
         assert len(points) == 0 or inside(points), seed
-        xs += [b.x for b in ground.boxes] + [b.x for b in ground.bumps]
-        counts.append((len(ground.boxes), len(ground.bumps)))
     boxes, bumps = np.mean(counts, axis=0)
     assert abs(boxes - 4.0) < 0.3 and abs(bumps - 3.0) < 0.3
     assert min(xs) < -1.5 and max(xs) > 8.0

@@ -15,6 +15,7 @@ from hma.hydraulics import (
     draw_machine,
 )
 from hma.machine import forward_kinematics, load_scene
+from scenes import dig_pit
 
 LINE = StraightLine((5.0, -1.5, 0.5), (6.5, 1.0, -0.5), 1.4, 4.0)
 CIRCLE = Circle((5.5, 0.0, 0.0), 0.6, 1.4, 7.0)
@@ -37,7 +38,7 @@ def worst_corner(deadband):
 
 
 def late_swing(machine, hold):
-    model = load_scene(1, weld=True)
+    model = dig_pit(load_scene(1, weld=True))
     data = mujoco.MjData(model)
     controller = BaseController(LINE, 10.0)
     layer = Hydraulics(model, data, [machine])
@@ -52,7 +53,7 @@ def late_swing(machine, hold):
 
 
 def tip_errors(path, machine, control_hz, hold=0.5):
-    model = load_scene(1, weld=True)
+    model = dig_pit(load_scene(1, weld=True))
     data = mujoco.MjData(model)
     controller = BaseController(path, control_hz)
     layer = Hydraulics(model, data, [machine], control_hz=control_hz)

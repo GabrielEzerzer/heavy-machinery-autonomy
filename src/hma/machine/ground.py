@@ -1,7 +1,6 @@
-"""Rigid ground for one machine from MuJoCo primitives: a plane, tilted for a slope, with a fixed
-pool of boxes (steps, kerbs, rut banks) and buried spheres (bumps) placed at reset. settle() sets a
-machine down clear of the ground and steps it to rest, refusing a rest that is tipped, moved or off
-the field; stand() redraws a seed's ground until the machine can stand."""
+"""Rigid ground for one machine from MuJoCo primitives: a plane, tilted for a slope and set to a
+level, with a pool of boxes and buried spheres placed at reset, the load set to rest on it.
+settle() steps a machine to rest or refuses; stand() redraws a seed until the machine stands."""
 
 from __future__ import annotations
 
@@ -19,10 +18,15 @@ from hma.machine.model import (
     GROUND_BUMPS,
     GROUND_X,
     GROUND_Y,
+    HOME_KEY,
+    LOAD,
     PARKED,
+    RING,
     WELD,
-    ground_geoms,
+    ground_height,
+    ground_parts,
     machine_prefix,
+    rest_home,
     write_friction,
 )
 from hma.machine.scenery import REACH as SCENERY_REACH
@@ -43,6 +47,8 @@ RANGES = {
     "bump_radius": (0.3, 1.5),
     "friction": tracks.FRICTION_RANGE,
 }
+FEATURE_X = (-3.0, 10.0)
+FEATURE_Y = (-6.0, 6.0)
 REACH = 6.0
 BANK = 2.0
 FIT_TRIES = 40
@@ -87,6 +93,7 @@ class Ground:
     boxes: tuple[Box, ...] = ()
     bumps: tuple[Bump, ...] = ()
     seed: int | None = None
+    level: float = 0.0
 
 
 def inside(points: np.ndarray) -> bool:
@@ -94,8 +101,8 @@ def inside(points: np.ndarray) -> bool:
     sun = np.array(SUN_DIR) / np.linalg.norm(SUN_DIR)
     rel = points - SHOULDER
     across = np.linalg.norm(rel - np.outer(rel @ sun, sun), axis=1)
-    in_field = ((GROUND_X[0] <= points[:, 0]) & (points[:, 0] <= GROUND_X[1])
-                & (GROUND_Y[0] <= points[:, 1]) & (points[:, 1] <= GROUND_Y[1]))
+    in_field = ((FEATURE_X[0] <= points[:, 0]) & (points[:, 0] <= FEATURE_X[1])
+                & (FEATURE_Y[0] <= points[:, 1]) & (points[:, 1] <= FEATURE_Y[1]))
     return bool(np.all(in_field & (across <= SHADOW_REACH)))
 
 
@@ -144,7 +151,7 @@ def _fit(rng: np.random.Generator, grade: tuple[float, float], length: float, wi
     for _ in range(FIT_TRIES):
         heading = float(rng.uniform(0.0, 2 * math.pi))
         n = np.array([math.cos(heading), math.sin(heading)])
-        at = np.array([rng.uniform(*GROUND_X), rng.uniform(*GROUND_Y)])
+        at = np.array([rng.uniform(*FEATURE_X), rng.uniform(*FEATURE_Y)])
         boxes = [Box(*(float(v) for v in at + (offset + (length if grows else 0.0)) * n),
                      heading, length, width, height) for offset in offsets]
         if all(inside(box_points(grade, b)) for b in boxes):
@@ -158,7 +165,8 @@ def _bump(rng: np.random.Generator, grade: tuple[float, float]) -> Bump:
     radius = float(rng.uniform(*RANGES["bump_radius"]))
     height = float(rng.uniform(*RANGES["bump_height"]))
     for _ in range(FIT_TRIES):
-        bump = Bump(float(rng.uniform(*GROUND_X)), float(rng.uniform(*GROUND_Y)), radius, height)
+        bump = Bump(float(rng.uniform(*FEATURE_X)), float(rng.uniform(*FEATURE_Y)), radius,
+                    height)
         if inside(bump_points(grade, bump)):
             return bump
     raise RuntimeError("a drawn bump does not fit in the field")
@@ -208,20 +216,36 @@ def _turned(tilt: np.ndarray, heading: float) -> np.ndarray:
     return quat
 
 
+GEOM_STATE = ("geom_pos", "geom_quat", "geom_size", "geom_rbound", "geom_aabb", "geom_friction",
+              "pair_friction", "bvh_aabb", "geom_sameframe")
+
+
 def apply_ground(model: mujoco.MjModel, index: int, ground: Ground) -> None:
     if len(ground.boxes) > GROUND_BOXES or len(ground.bumps) > GROUND_BUMPS:
         raise ValueError(f"a ground holds at most {GROUND_BOXES} boxes and {GROUND_BUMPS} bumps")
-    if not all(math.isfinite(g) for g in ground.grade):
-        raise ValueError("the grade must be finite")
-    offset = _offset(model, index)
-    plane, boxes, bumps = ground_geoms(model, index)
+    if not all(math.isfinite(g) for g in (*ground.grade, ground.level)):
+        raise ValueError("the grade and level must be finite")
+    saved = {name: getattr(model, name).copy() for name in GEOM_STATE}
+    try:
+        _write_ground(model, index, ground)
+        rest_home(model, index)
+    except ValueError:
+        for name, value in saved.items():
+            getattr(model, name)[:] = value
+        raise
+
+
+def _write_ground(model: mujoco.MjModel, index: int, ground: Ground) -> None:
+    offset = _offset(model, index) + [0.0, 0.0, ground.level]
+    plane, boxes, bumps = ground_parts(model, index)
+    model.geom_sameframe[[plane, *boxes, *bumps]] = mujoco.mjtSameFrame.mjSAMEFRAME_NONE
     centre = ((GROUND_X[0] + GROUND_X[1]) / 2, (GROUND_Y[0] + GROUND_Y[1]) / 2)
     model.geom_pos[plane] = offset + _on_plane(ground.grade, *centre, 0.0)
     model.geom_quat[plane] = _tilt(ground.grade)
     model.geom_size[plane, :2] = np.array([GROUND_X[1] - GROUND_X[0],
                                            GROUND_Y[1] - GROUND_Y[0]]) / 2 / _normal(
                                                ground.grade)[2]
-    model.geom_pos[[*boxes, *bumps]] = offset + [0.0, 0.0, PARKED]
+    model.geom_pos[[*boxes, *bumps]] = _offset(model, index) + [0.0, 0.0, PARKED]
     model.geom_size[[*boxes, *bumps]] = [0.1, 0.1, 0.1]
     for geom, box in zip(boxes, ground.boxes, strict=False):
         pos, quat, size = place_box(ground.grade, box)
@@ -240,29 +264,25 @@ def apply_ground(model: mujoco.MjModel, index: int, ground: Ground) -> None:
         model.geom_rbound[geom] = r
         model.geom_aabb[geom] = [0.0, 0.0, 0.0, r, r, r]
     write_friction(model, index, ground.friction)
+    _world_bounds(model)
 
 
-def ground_height(model: mujoco.MjModel, index: int, points: np.ndarray) -> np.ndarray:
-    plane, boxes, bumps = ground_geoms(model, index)
-    offset = _offset(model, index)
-    rel = np.atleast_2d(points)[:, :2] - offset[:2]
-    normal = np.zeros(3)
-    mujoco.mju_rotVecQuat(normal, [0.0, 0.0, 1.0], model.geom_quat[plane])
-    height = offset[2] - (normal[0] * rel[:, 0] + normal[1] * rel[:, 1]) / normal[2]
-    top = 1e3
-    down = np.array([0.0, 0.0, -1.0])
-    for geom in (*boxes, *bumps):
-        pos = model.geom_pos[geom]
-        if pos[2] < offset[2] + PARKED / 2:
-            continue
-        mat = np.zeros(9)
-        mujoco.mju_quat2Mat(mat, model.geom_quat[geom])
-        for k, (x, y) in enumerate(np.atleast_2d(points)[:, :2]):
-            d = mujoco.mju_rayGeom(pos, mat, model.geom_size[geom], np.array([x, y, top]), down,
-                                   int(model.geom_type[geom]))
-            if d >= 0:
-                height[k] = max(height[k], top - d)
-    return height
+def _world_bounds(model: mujoco.MjModel) -> None:
+    start, count = int(model.body_bvhadr[0]), int(model.body_bvhnum[0])
+    rot = np.zeros(9)
+    for node in range(start + count - 1, start - 1, -1):
+        geom = model.bvh_nodeid[node]
+        if geom >= 0:
+            mujoco.mju_quat2Mat(rot, model.geom_quat[geom])
+            mat = rot.reshape(3, 3)
+            centre = model.geom_pos[geom] + mat @ model.geom_aabb[geom, :3]
+            half = np.abs(mat) @ model.geom_aabb[geom, 3:]
+        else:
+            boxes = model.bvh_aabb[start + model.bvh_child[node]]
+            low = np.min(boxes[:, :3] - boxes[:, 3:], axis=0)
+            high = np.max(boxes[:, :3] + boxes[:, 3:], axis=0)
+            centre, half = (low + high) / 2, (high - low) / 2
+        model.bvh_aabb[node] = [*centre, *half]
 
 
 def _own_joints(model: mujoco.MjModel, index: int) -> np.ndarray:
@@ -290,7 +310,7 @@ def _put(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float, y: fl
     prefix = machine_prefix(index)
     joint = model.joint(prefix + BASE_JOINT)
     q0 = int(joint.qposadr[0])
-    plane, _, _ = ground_geoms(model, index)
+    plane, _, _ = ground_parts(model, index)
     offset = _offset(model, index)
     data.qpos[q0:q0 + 3] = offset + [x, y, 0.0]
     data.qpos[q0 + 3:q0 + 7] = _turned(model.geom_quat[plane], heading)
@@ -301,7 +321,8 @@ def _put(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float, y: fl
         data.qacc_warmstart[dof:dof + width] = 0.0
     mujoco.mj_kinematics(model, data)
     points = _wheel_points(model, data, index)
-    data.qpos[q0 + 2] += float(np.max(ground_height(model, index, points) - points[:, 2]))
+    data.qpos[q0 + 2] += float(np.nanmax(ground_height(model, index, points) - points[:, 2],
+                                         initial=-np.inf))
     base = model.body(prefix + "base").id
     for _ in range(CLEAR_TRIES):
         mujoco.mj_kinematics(model, data)
@@ -321,7 +342,7 @@ def _deepest(model: mujoco.MjModel, data: mujoco.MjData, base: int) -> float:
 
 
 def upright(model: mujoco.MjModel, data: mujoco.MjData, index: int) -> float:
-    plane, _, _ = ground_geoms(model, index)
+    plane, _, _ = ground_parts(model, index)
     normal = np.zeros(3)
     mujoco.mju_rotVecQuat(normal, [0.0, 0.0, 1.0], model.geom_quat[plane])
     up = data.xmat[model.body(machine_prefix(index) + "base").id].reshape(3, 3)[:, 2]
@@ -382,10 +403,19 @@ def stand(model: mujoco.MjModel, data: mujoco.MjData, index: int, seed: int, x: 
                                     + (7 if model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE else 1))
                           for j in _own_joints(model, index)])
     start = data.qpos[own].copy()
+    prefix = machine_prefix(index)
+    load = int(model.joint(prefix + LOAD).qposadr[0])
+    ring = int(model.joint(prefix + RING + "_x").qposadr[0])
+    key = model.key(HOME_KEY).id
     for attempt in range(DRAWS):
         data.qpos[own] = start
         ground = draw_ground(seed, attempt)
-        apply_ground(model, index, ground)
+        try:
+            apply_ground(model, index, ground)
+        except ValueError:
+            continue
+        for q, n in ((load, 7), (ring, 3)):
+            data.qpos[q:q + n] = model.key_qpos[key, q:q + n]
         if settle(model, data, index, x, y, heading):
             return ground
     raise RuntimeError(f"no ground from seed {seed} lets the machine stand at rest")
