@@ -22,10 +22,10 @@ BUCKET = JOINT_NAMES.index("bucket")
 SWING = JOINT_NAMES.index("swing")
 
 
-def layer_for(machine, n=1, weld=True):
+def layer_for(machine, n=1, weld=True, control_hz=10.0):
     model = load_scene(n, weld=weld)
     data = mujoco.MjData(model)
-    return Hydraulics(model, data, [machine] * n)
+    return Hydraulics(model, data, [machine] * n, control_hz=control_hz)
 
 
 def step_response(machine, joint, command, seconds):
@@ -548,23 +548,50 @@ def test_curve_gain_applies_before_the_drawn_speed_limit_clips():
     assert steady_speeds(strong, [0, 0, 0, 0.9])[BUCKET] == pytest.approx(0.972 * top, rel=2e-3)
 
 
-@pytest.mark.parametrize("machine", [NOMINAL, draw_machine(2)], ids=["nominal", "drawn"])
-def test_reversing_against_a_resisting_load_stays_within_the_power_limit(machine):
-    layer = layer_for(machine)
+def loaded_run(machine, loads, schedule, seconds, control_hz=10.0):
+    layer = layer_for(machine, control_hz=control_hz)
     data = layer.data
     dofs, actuators = layer._qvel[0], layer._actuators[0]
-    cap = machine.force_limit
-    commands = np.random.default_rng(3).choice([-1.0, 1.0], size=(60, 1, 4))
-    power = []
-    for u in commands:
-        layer.act(u)
-        for _ in range(layer.steps_per_decision):
-            data.qfrc_applied[dofs] = -0.95 * cap * np.sign(data.ctrl[actuators])
-            layer.step()
-            force = layer.true_state().loads[0] * cap
-            power.append(np.maximum(force * data.ctrl[actuators], 0.0).sum())
-    assert np.mean(power[200:]) <= 1.02 * machine.power
-    assert np.mean(power[200:]) > 0.7 * machine.power
+    commands, power = [], []
+    for k in range(round(seconds / DT)):
+        if k % layer.steps_per_decision == 0:
+            layer.act(np.asarray(schedule(k // layer.steps_per_decision), float)[None])
+        data.qfrc_applied[dofs] = loads(data.ctrl[actuators]) * machine.force_limit
+        layer.step()
+        commands.append(data.ctrl[actuators].copy())
+        force = layer.true_state().loads[0] * machine.force_limit
+        power.append(np.maximum(force * data.ctrl[actuators], 0.0).sum())
+    return np.array(commands), np.array(power)
+
+
+def reversals(commands):
+    steps = np.diff(commands, axis=0)
+    signs = np.sign(np.where(np.abs(steps) > 1e-5, steps, 0.0))
+    return sum(np.count_nonzero(np.diff(s[s != 0])) for s in signs.T)
+
+
+@pytest.mark.parametrize("control_hz", [10.0, 20.0])
+@pytest.mark.parametrize("command, loads, seconds", [
+    ([1, 0, 1, 0], [0, 0, -0.9, 0], 2.5),
+    ([1, 1, 1, 1], [-0.25] * 4, 6.0),
+], ids=["swing-and-loaded-arm", "end-stop"])
+def test_the_power_limit_settles_without_chatter(command, loads, seconds, control_hz):
+    commands, _ = loaded_run(NOMINAL, lambda ctrl: np.array(loads), lambda k: command, seconds,
+                             control_hz)
+    assert reversals(commands[-100:]) == 0
+
+
+@pytest.mark.parametrize("control_hz", [10.0, 20.0])
+@pytest.mark.parametrize("machine", [NOMINAL, draw_machine(2)], ids=["nominal", "drawn"])
+def test_random_reversals_against_a_resisting_load_hold_the_power_over_two_seconds(
+        machine, control_hz):
+    schedule = np.random.default_rng(3).choice([-1.0, 1.0], size=(200, 4))
+    _, power = loaded_run(machine, lambda ctrl: -0.95 * np.sign(ctrl), lambda k: schedule[k],
+                          10.0, control_hz)
+    window = round(2.0 / DT)
+    averages = np.convolve(power[200:], np.ones(window) / window, mode="valid")
+    assert averages.max() <= 1.05 * machine.power
+    assert power[200:].mean() > 0.7 * machine.power
 
 
 def episode(layer, index, machine, commands, others=None):
