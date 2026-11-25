@@ -95,7 +95,6 @@ def draw_hydraulics(model: mujoco.MjModel, data: mujoco.MjData, scene: mujoco.Mj
 def view_option() -> mujoco.MjvOption:
     opt = mujoco.MjvOption()
     opt.sitegroup[:] = 0
-    opt.flags[mujoco.mjtVisFlag.mjVIS_TENDON] = False
     return opt
 
 

@@ -13,7 +13,7 @@ import numpy as np
 from hma.machine import mass, tracks
 from hma.machine.collision import add_collision_geoms
 from hma.machine.mass import body_solids, combine, full_inertia, point
-from hma.machine.scenery import dress_after_heightfields
+from hma.machine.scenery import GROUND_SHAPE, dress_after_heightfields, plain_look
 
 ASSETS = Path(__file__).parent / "assets"
 MACHINE_XML = ASSETS / "excavator.xml"
@@ -262,8 +262,8 @@ def _add_ground(scene: mujoco.MjSpec, index: int, prefix: str, offset: np.ndarra
     for name, count, kind, size in shapes:
         for k in range(count):
             scene.worldbody.add_geom(name=f"{prefix}{name}{k}", type=kind, pos=parked, size=size,
-                                     contype=0, conaffinity=1 << index, material=GROUND,
-                                     friction=friction)
+                                     contype=0, conaffinity=1 << index,
+                                     material=GROUND_SHAPE, friction=friction)
 
 
 def _add_track_pairs(scene: mujoco.MjSpec, prefix: str) -> None:
@@ -324,6 +324,7 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
                            objtype=mujoco.mjtObj.mjOBJ_BODY, name1=prefix + "base",
                            name2=prefix + ANCHOR, data=[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0],
                            active=int(weld))
+    plain_look(scene)
     _share_look(scene)
     offsets = [i * MACHINE_SPACING for i in range(n_machines)]
     footprints = [(*GROUND_X, y + GROUND_Y[0], y + GROUND_Y[1]) for y in offsets]

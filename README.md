@@ -229,7 +229,7 @@ These functions place and track a machine on its ground. A refusal raises `Value
 - `settle` sets the machine down and steps it until it is still.
 - `stand(seed)` redraws the seed's ground, up to 20 times, until the ground is accepted and the machine comes to rest on it. A feature under the block's home position counts as refused ground, so the redraw biases where features land (see **Left out**).
 - `Hydraulics.reset(..., ground=seed)` uses `stand`, then sets the joint loads and the sensor buffer from the settled state.
-- `off_features` is true once a machine's base has left its ground, where nothing is under it.
+- `off_features` is true once a machine's base has left its 27 by 27 m ground. Past the edge the plane still carries it, with no features.
 
 `apply_ground` moves shapes of the world body after the model is compiled. MuJoCo keeps the world body's bounding-volume tree from compile time, so the tree is rebuilt from the moved shapes on every write; otherwise MuJoCo's broad phase would miss contacts with moved shapes outside a pair. The same write marks the ground's shapes as not sharing a frame with their body, because `mj_setConst` would otherwise mark a plane at the origin as fixed to it and ignore its new position.
 
@@ -401,7 +401,7 @@ Other processes were running on the laptop, so single runs vary by up to a third
 - **Rolling resistance.** None is modelled: on flat ground a track rolls with no drive force.
 - **Brake creep.** The parking brake holds through a soft constraint, so a parked machine creeps by about 0.1 mm in 4 s at 0.9 of the friction angle. A spring-set brake holds still.
 - **Travel hydraulics.** The power limit is a fixed 45.5 kW and the stall force a fixed 102 kN. There is no travel circuit, crossover relief or two-speed shift.
-- **The ground's edge.** Each ground covers 27 by 27 m, and a machine that drives off it falls; `off_features` reports it.
+- **The ground's edge.** Features lie within each machine's 27 by 27 m, but its plane collides without end, so a machine that drives past the edge carries on along the same grade: moved 20 m out on flat ground it stood on all 45 contacts. `off_features` reports when the base has left that area. The drawn plane stops at the edge, so on sloped ground the level surround meets it at a step with a gap below.
 - **Where features are drawn.** The block's home is 7 m ahead of the swing centre, and ground with a feature under it is refused: 48 of the first draws for 200 seeds were refused and redrawn. Drawn features therefore sit under the block's home less often than elsewhere.
 - **Cylinders and bucket linkage.** They have no collision shape, so they pass through the ground and the load. They stand 18 to 41 cm outside the link pieces. Shapes for them would need bodies moved by the joint angles, which in MuJoCo means closed kinematic loops ([issue 41](../../issues/41)).
 - **Uncovered parts of the upper structure.** Handrails, mirrors and the engine hood above 1.0 m have no collision shape: up to 66.6 cm of mesh lies outside every hull. The load hangs in front of the upper structure and cannot reach them. The ground reaches them only after the machine has rolled past its counterweight. A hood shape within 10 cm of the mesh would need 19 pieces ([issue 35](../../issues/35)).
