@@ -38,7 +38,7 @@ VALVE_SOLIMP = (0.999, 0.9999, 0.001)
 
 GROUND_CELL = 0.1
 GROUND_HALF = 13.5
-GROUND_X = (-GROUND_HALF, GROUND_HALF)
+GROUND_X = (-GROUND_HALF - GROUND_CELL, GROUND_HALF + GROUND_CELL)
 GROUND_Y = (-GROUND_HALF, GROUND_HALF)
 GROUND_DEPTH = 6.0
 GROUND_TOP = 2.0
@@ -278,11 +278,14 @@ def write_ground(model: mujoco.MjModel, index: int, heights: np.ndarray) -> None
     if not np.all(np.isfinite(heights) & (heights >= -GROUND_DEPTH) & (heights <= GROUND_TOP)):
         raise ValueError(f"heights must lie within [{-GROUND_DEPTH}, {GROUND_TOP}] m")
     hf = model.hfield(machine_prefix(index) + GROUND)
-    start = int(hf.adr[0])
-    model.hfield_data[start:start + heights.size] = (
-        (heights + GROUND_DEPTH) / (GROUND_DEPTH + GROUND_TOP)
-    ).ravel()
-    rest_home(model, index)
+    cells = slice(int(hf.adr[0]), int(hf.adr[0]) + heights.size)
+    before = model.hfield_data[cells].copy()
+    model.hfield_data[cells] = ((heights + GROUND_DEPTH) / (GROUND_DEPTH + GROUND_TOP)).ravel()
+    try:
+        rest_home(model, index)
+    except ValueError:
+        model.hfield_data[cells] = before
+        raise
 
 
 def ground_geoms(model: mujoco.MjModel, index: int) -> np.ndarray:
@@ -332,6 +335,31 @@ def ground_overlap(model: mujoco.MjModel, data: mujoco.MjData, index: int) -> fl
     return float(worst)
 
 
+def placement_fault(model: mujoco.MjModel, data: mujoco.MjData, index: int) -> str | None:
+    mujoco.mj_forward(model, data)
+    mine = set(load_geoms(model, index).tolist())
+    ground = set(ground_geoms(model, index).tolist())
+    for c in data.contact[:data.ncon]:
+        pair = {c.geom1, c.geom2}
+        if pair & mine and not pair & ground:
+            return "the load would sit against the machine there"
+    if ground_overlap(model, data, index) > 0:
+        return "the ground there would pass between the load's contact spheres"
+    return None
+
+
+def support_plane(xy: np.ndarray, heights: np.ndarray) -> np.ndarray:
+    best, lowest = None, np.inf
+    for trio in itertools.combinations(range(len(xy)), 3):
+        rows = np.c_[np.ones(3), xy[list(trio)]]
+        if abs(np.linalg.det(rows)) < 1e-9:
+            continue
+        plane = np.linalg.solve(rows, heights[list(trio)])
+        if np.all(np.c_[np.ones(len(xy)), xy] @ plane >= heights - 1e-9) and plane[0] < lowest:
+            best, lowest = plane, plane[0]
+    return best
+
+
 def rest_pose(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float, y: float,
               yaw: float) -> np.ndarray:
     prefix = machine_prefix(index)
@@ -345,8 +373,8 @@ def rest_pose(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float, 
     heights = np.array([ground_height(model, data, index, a, b) for a, b in xy])
     if None in heights:
         raise ValueError("the load must be placed on this machine's ground")
-    slope = np.linalg.lstsq(np.c_[np.ones(len(xy)), xy - [x, y]], heights.astype(float),
-                            rcond=None)[0]
+    com = model.body_ipos[model.body(prefix + LOAD).id][:2] @ np.array([[c, s], [-s, c]])
+    slope = support_plane(xy - [x, y] - com, heights.astype(float))
     normal = np.array([-slope[1], -slope[2], 1.0]) / np.hypot(np.hypot(*slope[1:]), 1.0)
     level, tilt, quat = np.zeros(4), np.array([1.0, 0.0, 0.0, 0.0]), np.zeros(4)
     mujoco.mju_axisAngle2Quat(level, [0.0, 0.0, 1.0], yaw)
@@ -393,6 +421,9 @@ def rest_home(model: mujoco.MjModel, index: int) -> None:
     q0 = int(model.joint(prefix + LOAD).qposadr[0])
     r0 = int(model.joint(prefix + RING + "_x").qposadr[0])
     load = rest_pose(model, scratch, index, *LOAD_HOME, 0.0)
+    fault = placement_fault(model, scratch, index)
+    if fault is not None:
+        raise ValueError(f"no rest for the load at its home position: {fault}")
     scratch.qpos[r0:r0 + 3] = 0.0
     model.body_pos[model.body(prefix + RING).id] += ring_at_load(model, scratch, index)
     for qpos in (model.key_qpos[key], model.qpos0):

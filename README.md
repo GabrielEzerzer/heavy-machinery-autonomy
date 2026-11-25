@@ -2,7 +2,7 @@
 
 A simulation demo. You type a task in plain English, and a simulated 12-tonne excavator carries it out on rough ground without tipping over. One controller, trained in simulation, handles simulated machines of this type that each behave differently, with no retuning.
 
-**Status: in development.** The machine model and its hydraulics are built, every part of the machine collides with the ground and with itself, it can lift and set down a slung concrete block, and a conventional controller follows bucket paths through the hydraulics. The language step runs on its own: it turns an instruction into a carry, prop, turn or travel task and checks it against the machine's rated lift chart and published safety rules. Rough ground, the planner and the learned controller do not exist yet. An earlier version simulated soil and digging; it was removed and is in the repository's history. The [feature map](#feature-map) lists what is built and what is planned.
+**Status: in development.** The machine model and its hydraulics are built, every part of the machine except the hydraulic cylinders and bucket linkage collides with the ground and with itself ([issue 41](../../issues/41)), it can lift and set down a slung concrete block, and a conventional controller follows bucket paths through the hydraulics. The language step runs on its own: it turns an instruction into a carry, prop, turn or travel task and checks it against the machine's rated lift chart and published safety rules. Rough ground, the planner and the learned controller do not exist yet. An earlier version simulated soil and digging; it was removed and is in the repository's history. The [feature map](#feature-map) lists what is built and what is planned.
 
 ## How it works
 
@@ -157,9 +157,12 @@ The machine's steel draws one friction coefficient per run, uniform in 0.30–0.
 The rigging follows the Construction Plant-hire Association's guidance on excavators used as cranes ([CPA CIG 0801][cig]): the hooking device may sit on the dipper, the quick hitch or the bucket, and slings must hang free at all times.
 
 - **Hook.** A site 0.42 m from the bucket pin, 2 cm outside the back of the bucket.
-- **Master link.** A 2.2 kg point mass, free to slide in any direction, joins the four legs. The mass is that of a grade 80, 8 mm four-leg master link assembly rated 4.25 t ([S3i][s3i]; [Thiele][thiele] lists 2.29 kg for the same size). A link rated for the 5.06 t top of the mass range below would be heavier; the mass is assumed, and small against the load.
-- **Legs.** Each is a tension-only tendon from the master link to one top corner of the block. The legs pivot freely at the master link, so the block can turn about the hook.
-- **Hooked or not.** Two connect constraints hold the master link either to the hook or to the middle of the block's top face. Which one is on is part of the simulation state (`MjData.eq_active`), so it resets with the scene, saves and restores with `mj_getState`, and differs between two `MjData` on one model.
+- **Lifting gear assumed.** A four-leg grade 80 chain sling, 10 mm chain, on four cast-in lifting anchors, one at each top corner of the block. By the uniform method for grade 80 slings, one 10 mm leg is rated 3.15 t, and a three- or four-leg sling 6.70 t at up to 45° from vertical ([Steel & Tube chart][wll], for slings made to AS 3775.2 or equivalent standards). The chart rates three- and four-leg slings the same, allowing for legs that do not share the load equally. 10 mm is the smallest chain whose four-leg rating covers the 5.06 t top of the mass range below. The design factor is 4: chain is rated at a mean stress of 200 N/mm² and must not break below 800 N/mm² ([S3i][s3i-chain], for grade 80 and grade 100; read from a supplier, not from EN 818-4 itself, so unverified against the standard). The anchors are not sized. Lifting anchors for precast concrete are rated under [VDI/BV-BS 6205][vdi6205]; manufacturers' manuals quote factors of 3 against steel failure and 2.5 against concrete failure from it (unverified: the guideline itself was not read).
+- **Readings against the rating.** `leg_tensions` gives each leg's tension and `hook_force` the force on the hook, in newtons. `LEG_WLL` (3.15 t, 30.9 kN) and `SLING_WLL` (6.70 t, 65.7 kN) are the thresholds to compare them against. Nothing acts on them: a reading over the rating changes nothing in the simulation. A 5,000 kg block hanging still reads 14.2 kN per leg and 49.1 kN on the hook. A 3,000 kg block hanging, given 3 m/s downward, peaks at 85.9 kN in one leg (2.8 times its rating, below the 124 kN breaking force) and 268 kN on the hook, against 8.5 kN and 29.5 kN at rest. The peak is set by how soft MuJoCo makes the legs' length limit, not by the stretch of real chain, so it is not a prediction of a real snatch load.
+- **Master link.** A 2.2 kg point mass joins the four legs. The mass is that of a grade 80, 8 mm four-leg master link assembly rated 4.25 t ([S3i][s3i]; [Thiele][thiele] lists 2.29 kg for the same size). The link for a 10 mm sling would be heavier; the mass is assumed, and small against the load.
+- **Attachment.** The master link hangs from the hook as an ideal swivel: a point that turns freely about every axis, without friction. This is a chosen attachment, not a property of a master link on a bucket hook. Left out: the headroom the hook and link take below the bucket, the link binding in the hook, and any resistance to twisting.
+- **Legs.** Each is a tension-only tendon from the master link to one top corner of the block. The legs meet the master link at its point, so the block turns freely about the hook.
+- **Hooked or not.** Two connect constraints hold the master link either to the hook or to the middle of the block's top face. Which one is on is part of the simulation state (`MjData.eq_active`), so it resets with the scene, saves and restores with `mj_getState` and `mj_setState` when the state flags include `mjSTATE_EQ_ACTIVE` (as `mjSTATE_INTEGRATION` and `mjSTATE_USER` do; `mjSTATE_PHYSICS` does not), and differs between two `MjData` on one model.
 - **Hanging free.** The legs clear the bucket only once it is curled far enough. `hook_load` and `hang_load` refuse a pose where a straight leg would pass through any link's mesh. After hooking, a leg can still pass through the bucket if the bucket uncurls; nothing stops that.
 
 One seed draws one load (`draw_load`). The mass, the block's proportions and the leg angle are drawn together, so every load drawn can be lifted 0.3 m clear of the ground within the chart:
@@ -179,14 +182,15 @@ Against the ground, the drawn coefficients of the machine and the load apply, an
 The functions that move the load. A refusal raises `ValueError` and leaves the model and data exactly as they were:
 
 - `apply_load` sets a drawn load on the model. It refuses a side shorter than 0.1 m, the diameter of the contact spheres, and an inertia about the centre of mass that is not physical.
-- `place_load` sets the block at rest on the ground under a point. The block takes the slope under it, and its lowest sphere starts 1 µm inside the contact margin, so it starts at rest instead of falling onto its contacts. It refuses while the sling is hooked, off this machine's ground, against the machine, and where ground pokes up between the spheres.
+- `place_load` sets the block at rest on the ground under a point. The block takes the slope under it: it is set on the lowest plane that lies on or above the ground under every bottom sphere, so at least three spheres carry it. Those start 1 µm inside the contact margin, so the block starts at rest instead of falling onto its contacts. It refuses while the sling is hooked, off this machine's ground, against the machine, and where ground pokes up between the spheres.
+- A reset puts the block at its home position on the ground. `write_ground` and `apply_load` apply the same check as `place_load` there, before anything is written: ground or a load that would leave the block against the machine or with ground between its spheres is refused, the model is left as it was, and the caller can draw again.
 - `hook_load` attaches the sling. It refuses when already hooked, when the hook is not above the block's top face, out of reach of the legs, or where a leg would pass through the machine.
 - `unhook_load` refuses unless the block is resting: its ground contacts carry at least 95% of its weight, and it moves at under 0.01 m/s and 0.01 rad/s. Both thresholds are acceptance choices.
 - `hang_load` starts a run with the block hanging at the full drop below the hook. It refuses a start where the block would touch the machine or come within the contact margin of the ground, or where a leg would pass through the machine.
 
 The friction and load draws are separate functions keyed by seed. A run's reset does not call them yet, because no episode loop exists.
 
-**Ground size.** Each machine's ground is 27 m square around its swing centre. The bucket tip reaches 8.49 m from the swing axis and the hook 7.68 m. The farthest drawn block hangs at most 5.42 m beyond the hook (the leg plus the block's diagonal), so the ground has to reach 13.1 m at every swing angle; the half width is that, rounded up to 13.5 m. Machines in one scene stand 27 m apart.
+**Ground size.** Each machine's ground is 27.2 m along its tracks by 27 m across, around its swing centre. The extra 0.1 m grid cell at each end keeps the height grid from being square, so `write_ground` refuses a transposed array. The bucket tip reaches 8.49 m from the swing axis and the hook 7.68 m. The farthest drawn block hangs at most 5.42 m beyond the hook (the leg plus the block's diagonal), so the ground has to reach 13.1 m at every swing angle; the half width is that, rounded up to 13.5 m. Machines in one scene stand side by side, 27 m apart across their tracks.
 
 **Checks against hand calculations** (`tests/test_machine_contact.py`). The drag rows are within 10%, with the friction force reading 5.3% high. The others are within 1%, and the tests hold them to that:
 
@@ -207,6 +211,8 @@ The friction and load draws are separate functions keyed by seed. A run's reset 
 
 The first row checks the contact against the joint cap, not against a real machine. Pushing the boom down works the rod side of its cylinders, rated 163 to 187 kN·m near this boom angle (see [Cylinders](#cylinders)). The 330 kN·m cap is about twice that, so a real machine pushes about half as hard here.
 
+What the table establishes: the statics, drag and pendulum rows show that the simulation solves the idealised equations the hand calculations use. They do not validate contact compliance, snatch forces, how the attachment articulates or how fast a swinging load's sway dies away against a real machine. The contact settings (stiffness and damping, impedance, margin and the 5 ms step) need a check of their sensitivity to the timestep and to each parameter once the ground and the actuators are replaced.
+
 Other checks in the same file and in `tests/test_machine_load.py`:
 
 - **Driven parts stop at what they hit.** Every joint, swing included, was driven end to end at full speed from five swing angles. The deepest overlap was 6.1 mm, against 24 to 26 mm allowed for the fastest tip speed in each run (6.5 to 6.9 m/s; see **Impact** below). Driven down at full boom speed, the bucket overlaps the ground by 11.8 mm at 4.6 m/s, against 16.9 mm allowed. Collisions not driven in these runs, such as the load against the boom, are not tested this way.
@@ -215,22 +221,23 @@ Other checks in the same file and in `tests/test_machine_load.py`:
   - A ridge higher than the ground clearance carries the whole machine on its belly.
   - The counterweight stops against a mound beside the tracks at 27.7° of swing.
   - A bucket swung over the track corner stops on it, with the arm stalled.
-- **No energy is gained.**
-  - A 3,000 kg block dropped 3 m never gains more energy than its contacts can hold: the largest rise over the lowest energy reached so far is 13.6 J. The bound is the weight of the block and master link times the contact's 1 mm impedance width, 29.5 J. It comes to rest flat, within 0.01 mm of its half height plus the margin.
+- **No energy is gained, up to 6 m/s.**
+  - A 3,000 kg block landing at 5.5 m/s, level and tilted 0.1 and 0.3 rad, at six points within one step's travel, never gains more energy than its contacts can hold, and comes to rest. The bound is the weight of the block and master link times the deeper of the contact's 1 mm impedance width and the block's deepest compression below its rest height. Level, it comes to rest flat, within 0.01 mm of its half height plus the margin.
+  - Landings were scanned at 16 points within one step's travel and tilts up to 0.6 rad. They stay clean up to 6.0 m/s. From 6.5 m/s, below the bucket tip's top speed of 6.9 m/s, one to three landings in 16 gain 16 kJ or more, and dropped from 8 m the block ends under the ground ([issue 52](../../issues/52)). 5.5 m/s is the tested speed, 1 m/s below the first failure. `unhook_load` refuses a block in the air, so no block is let fall. A hooked block moving with the hook, or swinging on its sling, can strike the ground; how fast has not been measured.
   - Pressed at 20 times its weight, the same block sinks 0.011 mm. Released, it does not bounce, and it creeps less than 0.001 mm in 10 s.
 - **A full lift works,** on a welded and on a free base. A 2,000 kg block is lifted 2.37 m, swung 45°, carried 6.4 m, set down, unhooked and left still, within 0.01 mm of its rest height.
-- **The load starts at rest.** Placed, reset, reset onto newly written ground or placed on a 10° slope, it sags less than 0.2 mm and moves at under 1 mm/s over the first second. On the slope it rests tilted with the ground.
-- **Hooked state is simulation state.** A reset, through the hydraulics layer or the home keyframe, returns an unhooked block at rest on the ground with no applied force. Two `MjData` on one model keep their own hooked state, and `mj_getState` and `mj_setState` carry it.
-- **Every draw can be lifted.** For 2,000 seeds, some chart height leaves the drawn block 0.3 m clear below the hook within the over-side rating less the bucket.
+- **The load starts at rest.** Placed, reset, reset onto newly written ground or placed on a 10° slope, it sags less than 0.2 mm and moves at under 1 mm/s over the first second. On the slope it rests tilted with the ground. Reset onto uneven ground (a valley tilted both ways under the block), it settles by under 1 mm onto its supporting spheres and is still at the end. Ground with a ridge under the block's home position, and a load too long to rest beside the bucket there, are refused and change nothing.
+- **Hooked state is simulation state.** A reset, through the hydraulics layer or the home keyframe, returns an unhooked block at rest on the ground with no applied force. Two `MjData` on one model keep their own hooked state, and `mj_getState` and `mj_setState` with `mjSTATE_INTEGRATION` carry it.
+- **Every draw can be lifted.** For 2,000 seeds, the formula that bounds the draw finds a chart height where the drawn block hangs 0.3 m clear below the hook within the over-side rating less the bucket. That checks the formula against itself; the lift is checked in the simulation for the two heaviest and the two tallest of those draws. Each is placed, hooked at its chart row's radius, and lifted on a free base until it is more than 0.3 m clear, with the bucket pin within the chart point, the machine tilting by under 0.5° and the sling carrying the block's static weight to within 2%.
 - **Runs repeat.** The same seeds repeat a contact-rich run bit for bit.
 - **Machines stay independent.** In a two-machine scene, one machine lifts a block while its neighbour props on its bucket. On a welded and on a free base, the lifting machine follows the same path as it does alone, to within 1e-6.
 
 **Throughput.** Measured with `python -m hma.machine.throughput --before <src directory of the previous version>`:
 
 - Steps per second through the hydraulics layer, with the nominal machine on a free base.
-- 20 s timed after 4 s of warm-up, three runs per scene.
+- 20 s timed after 4 s of warm-up, seven runs per scene.
 - Runs alternate between this version and the previous one. In the previous one only the tracks touched the ground, and a payload was a force at the bucket tip.
-- The computer running these was loaded by other work, so the absolute rates cannot be compared with the hydraulics section's figures. The ratios can, because the runs were taken in turn; the range shows their spread.
+- The computer running these was loaded by other work that came and went during the measurement. The one-machine scenes ran 3 to 4 times slower than in an earlier measurement, and at times slower than the eight-machine scenes. The absolute rates are therefore not given. The ratios can be compared, because each run of this version was taken straight after the same run of the previous one; the range shows their spread.
 
 The scenes:
 
@@ -238,14 +245,14 @@ The scenes:
 - **Propping:** the boom pushed down at a third of full command onto level ground, which lifts the tracks.
 - **Carrying:** a 2,000 kg block hanging (previously a 2,000 kg force), with random swing commands.
 
-| Scene | Before | After | After / before, median (range) |
+| Scene | After / before, median | Range over seven runs | Contacts after |
 |---|---|---|---|
-| 1 machine standing | 2,788–4,198 | 1,459–1,668 | 0.45 (0.40–0.55) |
-| 1 machine propping | 2,773–4,002 | 1,432–3,403 | 0.43 (0.36–1.23) |
-| 1 machine carrying | 4,078–4,570 | 1,458–1,735 | 0.36 (0.36–0.38) |
-| 8 machines standing | 519–665 | 226–265 | 0.40 (0.39–0.45) |
-| 8 machines propping | 594–1,087 | 463–567 | 0.55 (0.44–0.95) |
-| 8 machines carrying | 733–798 | 435–512 | 0.59 (0.56–0.67) |
+| 1 machine standing | 0.68 | 0.54–0.75 | 43 |
+| 1 machine propping | 0.72 | 0.67–1.14 | 23 |
+| 1 machine carrying | 0.72 | 0.65–0.76 | 25 |
+| 8 machines standing | 0.39 | 0.34–0.56 | 344 |
+| 8 machines propping | 0.61 | 0.47–0.72 | 184 |
+| 8 machines carrying | 0.55 | 0.47–0.60 | 195 |
 
 Each standing machine's block resting on the ground adds 18 contacts. A scene of eight standing machines therefore solves 344 contacts, against 200 before.
 
@@ -256,10 +263,10 @@ Left out or limited, with what each changes:
 - **Tail swing.** The upper structure's mesh reaches 2.50 m from the swing centre at its rear corners; the [ZX120 spec sheet][zx120] gives 2.13 m. Collision follows the mesh, so a swung counterweight meets an obstacle up to 0.37 m early. The difference is in the source mesh, not in the conversion. The sheet gives the same 2,130 mm for both the rear-end swing radius and the rear-end length, so the real counterweight's back is an arc about the swing centre. The source mesh has a flat back 2.21 m behind the swing axis, with square corners 1.20 m either side of it. In the source file the swing axis passes through the centre of the swing bearing, the units are metres and no transform is applied.
 - **Drag speed.** The ground is a height field, and dragged teeth catch on its grid. Friction over normal force on flat ground, set to 0.4, reads 0.411 at 0.09 m/s of tip speed (0.02 rad/s of swing), 0.440 at 0.24 m/s, 0.458 at 0.47 m/s, 0.465 at 0.94 m/s and 0.549 at 1.41 m/s. At the fastest, 49% of the normal force arrives through contacts tilted more than 5° and the bucket hops. On a 10° slope the fastest drag reads 0.433.
 - **Contacts per pair.** MuJoCo keeps at most 50 contacts between a large shape and a height field and drops the rest in grid order. That leaves a large flat shape supported on one side only, which is why the load rests on spheres. The belly, the counterweight and a boom lying flat still rest on whole pieces. A free machine set down with its belly on a flat pad clear of the tracks keeps 50 belly contacts and rocks through 4.5° over 10 s without settling. Ground built from primitive shapes would not have this cap.
-- **Propping chatter.** A bucket propping a free machine touches the ground on 28% of steps, at about 40 Hz, with the tip shaking at 6 cm/s RMS. Halving the timestep halves the shaking. The contact force pulses with it, so a force sensor would read it ([issue 42](../../issues/42)).
+- **Propping chatter.** While the boom is driven down onto the ground on a free machine, the bucket chatters. At a third of full command it levers the machine over backwards, from 9° to 23° to 48° of tilt over 14 s. The bucket touches the ground on 23–27% of steps, at 54 Hz falling to 23 Hz as the machine tilts, with the tip moving at 6 cm/s RMS. Released, the bucket settles in contact on every step; with the base welded there is no chatter. Halving the timestep halves the amplitude and raises the frequency to 70–86 Hz. A plane under the bucket instead of the height field, or no contact margin, changes nothing. The cause is the driven speed valve with its force cap, acting on a free base at the 5 ms step. The contact force pulses with it, so a force sensor would read it. The valve and force cap are being replaced by a model of the oil in the cylinders, and this check has to be repeated on that model ([issue 42](../../issues/42)).
 - **The load's spheres.** Ground features narrower than half the block can poke between its 26 contact spheres, and its edges are rounded to 5 cm.
 - **Impact.** A part arriving at speed v overlaps what it hits by up to v × 10 ms / e before the soft contact stops it: 18.4 mm at 5 m/s.
-- **Rigging.** The ground does not deform and the sling legs do not stretch. The legs are straight lines meeting at one point; they do not wrap around the bucket, and nothing stops them passing through it if the bucket uncurls while hooked. There is no damping in the legs or from the air, so a hanging block sways and spins for longer than it would on a real machine.
+- **Rigging.** The sling, hook, master link, lifting anchors and the machine's structure are rigid and cannot break. Surviving a contact or a snatch in the simulation says nothing about whether a real boom, cab, bucket or anchor would survive it; the readings above only report the sling's load against its rating. The ground does not deform and the sling legs do not stretch. The legs are straight lines meeting at one point; they do not wrap around the bucket, and nothing stops them passing through it if the bucket uncurls while hooked. There is no damping in the legs or from the air, so a hanging block sways and spins for longer than it would on a real machine.
 - **Friction.** There is one coefficient per run for all of the machine's steel and one for the load. Friction is the same everywhere on the ground, with no difference between static and sliding friction.
 
 [geo5]: https://finesoftware.eu/help/geo5/en/table-of-ultimate-friction-factors-for-dissimilar-materials-01/
@@ -267,6 +274,9 @@ Left out or limited, with what each changes:
 [misumi]: https://us.misumi-ec.com/blog/coefficient-of-friction/
 [cig]: https://www.shiregroup-idbs.gov.uk/wp-content/uploads/2018/01/CPA-CIG0801-Excavators-Used-as-Cranes-Rev2-090301.pdf
 [s3i]: https://www.s3i.co.uk/master-link-assembly-grade-80-lifting-ring.php
+[s3i-chain]: https://www.s3i.co.uk/lifting-chain.php
+[wll]: https://steelandtube.co.nz/sites/default/files/catalogues/Steel%20%26%20Tube%20Lifting%20Sling%20Working%20Load%20Limit%20Chart_web.pdf
+[vdi6205]: https://vdi.de/en/home/vdi-standards/details/vdibv-bs-6205-lifting-inserts-and-lifting-systems-for-precast-concrete-elements
 [thiele]: https://thiele.de/en/products/industry/lifting-technology/lifting-products-grade-80/fixed-size-master-links-tab4-for-3-and-4-leg-chain-slings
 
 ### Base controller
@@ -379,7 +389,7 @@ A feature is **done** when it runs from a clean checkout and its checks pass.
 | Machine model | A 12 t class excavator with swing, boom, arm and bucket joints. Each joint takes a speed command and has a force limit. The base can be held still or left free to slide and tip | Done |
 | Hydraulics model | Gives each machine its own delay, sluggishness, dead zone, lever-to-speed curve, flow limit, speed and force limits, slack in the joints, weights, and sensor noise and latency | Done |
 | Baseline controller | A conventional controller tuned once on the standard machine | Done: follows paths in free air |
-| Rough ground | Slopes, steps and edges of rigid ground. The machine can slide, rock and tip, and the arm and bucket meet the ground | In progress: every part of the machine meets the ground; ground shapes are not generated yet |
+| Rough ground | Slopes, steps and edges of rigid ground. The machine can slide, rock and tip, and the arm and bucket meet the ground | In progress: every part of the machine except the cylinders and bucket linkage meets the ground ([issue 41](../../issues/41)); ground shapes are not generated yet |
 | Carried load | A load with real mass on the bucket | Done: a rigid concrete block on a four-leg sling; its mass, size and leg angle are drawn together so every draw can be lifted 0.3 m clear within the over-side chart rating |
 | Planner | Turns a checked specification into paths for the bucket and the load | Planned |
 | Cylinder forces | Joint force limits from the hydraulic cylinders' sizes and positions | In progress: geometry, sizes and static checks done; the simulation still uses constant caps |

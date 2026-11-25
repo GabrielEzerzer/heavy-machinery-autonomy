@@ -1,6 +1,6 @@
 """A precast concrete block on a four-leg sling from a lifting point on the back of the bucket:
-drawn per episode, placed, hooked and unhooked. Hooked or not is simulation state (the master
-link's two connect equalities in data.eq_active), so it resets, saves and restores with MjData."""
+drawn per episode, placed, hooked and unhooked. Hooked or not lives in data.eq_active (two
+connect equalities): it resets with MjData, and mj_getState saves it with mjSTATE_EQ_ACTIVE."""
 
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ from hma.machine.model import (
     load_geoms,
     load_points,
     machine_prefix,
+    placement_fault,
     rest_home,
     rest_pose,
     ring_at_load,
@@ -55,7 +56,14 @@ RANGES = {
     "friction": (0.45, 0.70),
 }
 LEGS = 4
+TONNE_FORCE = 1000.0 * 9.80665
+LEG_WLL = 3.15 * TONNE_FORCE
+SLING_WLL = 6.70 * TONNE_FORCE
+DESIGN_FACTOR = 4.0
 RESTING_SHARE = 0.95
+LOAD_FIELDS = ("body_mass", "body_ipos", "body_inertia", "body_iquat", "body_pos", "geom_size",
+               "geom_rbound", "geom_aabb", "geom_friction", "geom_pos", "site_pos", "tendon_range",
+               "key_qpos", "qpos0")
 STILL_SPEED = 0.01
 
 
@@ -135,6 +143,20 @@ def apply_load(model: mujoco.MjModel, index: int, load: Load, scratch: mujoco.Mj
                          "inertia about the centre of mass is not physical")
     if np.linalg.det(axes) < 0:
         axes[:, 0] = -axes[:, 0]
+    saved = {name: getattr(model, name).copy() for name in LOAD_FIELDS}
+    try:
+        _write_load(model, index, load, values, axes)
+        rest_home(model, index)
+    except ValueError:
+        for name, value in saved.items():
+            getattr(model, name)[:] = value
+        raise
+    mujoco.mj_setConst(model, scratch)
+
+
+def _write_load(model: mujoco.MjModel, index: int, load: Load, values: np.ndarray,
+                axes: np.ndarray) -> None:
+    half, com = np.array(load.half), np.array(load.com)
     prefix, body, geom, *_, tendons = _ids(model, index)
     quat = np.zeros(4)
     mujoco.mju_mat2Quat(quat, axes.ravel())
@@ -155,8 +177,6 @@ def apply_load(model: mujoco.MjModel, index: int, load: Load, scratch: mujoco.Mj
                                                                       half[2]]
     model.site_pos[model.site(prefix + LOAD_TOP).id] = [0.0, 0.0, half[2]]
     model.tendon_range[tendons] = [0.0, load.leg]
-    rest_home(model, index)
-    mujoco.mj_setConst(model, scratch)
 
 
 def legs_cross_machine(model: mujoco.MjModel, data: mujoco.MjData, index: int,
@@ -223,11 +243,9 @@ def place_load(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float,
     scratch.qpos[q0:q0 + 7] = rest_pose(model, scratch, index, x, y, yaw)
     scratch.qvel[v0:v0 + 6] = 0.0
     _stow(model, scratch, index)
-    mujoco.mj_forward(model, scratch)
-    if _foreign_contacts(model, scratch, index, allow_ground=True):
-        raise ValueError("the load would sit against the machine there")
-    if ground_overlap(model, scratch, index) > 0:
-        raise ValueError("the ground there would pass between the load's contact spheres")
+    fault = placement_fault(model, scratch, index)
+    if fault is not None:
+        raise ValueError(fault)
     _commit(model, data, scratch)
 
 
@@ -300,8 +318,18 @@ def unhook_load(model: mujoco.MjModel, data: mujoco.MjData, index: int) -> None:
     _commit(model, data, scratch)
 
 
-def sling_tension(model: mujoco.MjModel, data: mujoco.MjData, index: int) -> float:
+def leg_tensions(model: mujoco.MjModel, data: mujoco.MjData, index: int) -> np.ndarray:
     tendons = _ids(model, index)[-1]
-    rows = ((data.efc_type[:data.nefc] == mujoco.mjtConstraint.mjCNSTR_LIMIT_TENDON)
-            & np.isin(data.efc_id[:data.nefc], tendons))
-    return float(np.abs(data.efc_force[:data.nefc][rows]).sum())
+    limit = data.efc_type[:data.nefc] == mujoco.mjtConstraint.mjCNSTR_LIMIT_TENDON
+    return np.array([np.abs(data.efc_force[:data.nefc][limit & (data.efc_id[:data.nefc] == t)])
+                     .sum() for t in tendons])
+
+
+def sling_tension(model: mujoco.MjModel, data: mujoco.MjData, index: int) -> float:
+    return float(leg_tensions(model, data, index).sum())
+
+
+def hook_force(model: mujoco.MjModel, data: mujoco.MjData, index: int) -> float:
+    rows = ((data.efc_type[:data.nefc] == mujoco.mjtConstraint.mjCNSTR_EQUALITY)
+            & (data.efc_id[:data.nefc] == _equalities(model, index)[0]))
+    return float(np.linalg.norm(data.efc_force[:data.nefc][rows]))

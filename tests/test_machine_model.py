@@ -276,7 +276,7 @@ def worst_tilt(swing, payload):
 
 
 def test_loaded_bucket_tilts_alike_swung_left_and_right():
-    left, right = (worst_tilt(s, 1200.0)[0] for s in (math.pi / 2, -math.pi / 2))
+    left, right = (worst_tilt(s, 2200.0)[0] for s in (math.pi / 2, -math.pi / 2))
     assert left < 0.05 and right < 0.05
     left, right = (worst_tilt(s, 3000.0)[0] for s in (math.pi / 2, -math.pi / 2))
     assert left > 1.0 and right > 1.0
@@ -391,6 +391,8 @@ def test_write_ground_rejects_bad_input():
     with pytest.raises(ValueError):
         write_ground(model, 0, np.zeros((3, 3)))
     with pytest.raises(ValueError):
+        write_ground(model, 0, np.zeros(ground_shape()).T)
+    with pytest.raises(ValueError):
         write_ground(model, 0, np.full(ground_shape(), -GROUND_DEPTH - 0.1))
     with pytest.raises(ValueError):
         write_ground(model, 0, np.full(ground_shape(), np.nan))
@@ -398,7 +400,7 @@ def test_write_ground_rejects_bad_input():
 
 def test_ground_grid_covers_the_work_area_and_depth():
     xs, ys = ground_axes()
-    assert ground_shape() == (len(ys), len(xs))
+    assert ground_shape() == (len(ys), len(xs)) and len(xs) != len(ys)
     assert math.isclose(xs[1] - xs[0], 0.1) and math.isclose(ys[1] - ys[0], 0.1)
     assert xs[0] < -2.5 and xs[-1] > 9.0 and ys[0] < -5.0 and ys[-1] > 5.0
     assert GROUND_DEPTH >= 6.0

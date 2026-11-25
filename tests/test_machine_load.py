@@ -8,11 +8,18 @@ from hma.hydraulics.layer import Hydraulics
 from hma.hydraulics.params import NOMINAL
 from hma.machine import HOME_KEY, JOINT_NAMES, ground_axes, ground_shape, load_scene, write_ground
 from hma.machine.contact import steel_geoms
-from hma.machine.kinematics import ARM_LENGTH, BOOM_LENGTH, BOOM_PIVOT, BUCKET_LENGTH
+from hma.machine.kinematics import (
+    ARM_LENGTH,
+    BOOM_LENGTH,
+    BOOM_PIVOT,
+    BUCKET_LENGTH,
+    SWING_HEIGHT,
+)
 from hma.machine.load import (
     HOOK_REACH,
     LIFT_CLEARANCE,
     LIFT_HEIGHTS,
+    LOAD_FIELDS,
     RANGES,
     Load,
     apply_load,
@@ -29,12 +36,15 @@ from hma.machine.model import (
     CONTACT_MARGIN,
     GROUND_HALF,
     LOAD,
+    LOAD_HOME,
     LOAD_POINT_RADIUS,
     LOAD_POINTS,
     TRACK_FEET,
     ground_geoms,
+    ground_overlap,
     machine_prefix,
 )
+from hma.machine.statics import CHART
 
 P = machine_prefix(0)
 HANG_POSE = (0.0, -1.0, 1.6, 2.3)
@@ -42,6 +52,7 @@ LIFT_POSE = (0.0, -0.6, 1.6, 2.3)
 CROSSING_POSE = (0.0, -1.0, 1.2, 2.0)
 BURIED_POSE = (0.0, -0.2, 2.0, 2.3)
 SEEDS = range(2000)
+G = 9.81
 SAG = 2e-4
 STILL = 1e-3
 
@@ -217,9 +228,9 @@ def test_refused_placements_leave_model_and_data_unchanged():
     xs, _ = ground_axes()
     inset = model.geom_size[model.geom(P + LOAD).id][0] - LOAD_POINT_RADIUS
     heights = np.zeros(ground_shape())
-    heights[:, np.abs(xs - (7.0 + inset / 2)) < 0.06] = 0.3
+    heights[:, np.abs(xs - (5.0 + inset / 2)) < 0.06] = 0.3
     write_ground(model, 0, heights)
-    assert_refused(model, data, lambda m, d, i: place_load(m, d, i, 7.0, 0.0),
+    assert_refused(model, data, lambda m, d, i: place_load(m, d, i, 5.0, 4.0),
                    "between the load's contact spheres")
     model, data = scene()
     placed_and_hooked(model, data)
@@ -279,6 +290,40 @@ def test_reset_puts_the_load_on_newly_written_ground():
     assert moved < SAG and fastest < STILL
 
 
+
+def ridge(x):
+    xs, _ = ground_axes()
+    heights = np.zeros(ground_shape())
+    heights[:, int(np.argmin(np.abs(xs - x)))] = 0.3
+    return heights
+
+
+def test_ground_or_load_with_no_rest_at_home_is_refused_and_changes_nothing():
+    model, data = scene(2000.0)
+    small = model.geom_size[model.geom(P + LOAD).id].copy()
+    ground, key = model.hfield_data.copy(), model.key_qpos.copy()
+    with pytest.raises(ValueError, match="home position"):
+        write_ground(model, 0, ridge(LOAD_HOME[0] + small[0] / 2))
+    np.testing.assert_array_equal(model.hfield_data, ground)
+    np.testing.assert_array_equal(model.key_qpos, key)
+    write_ground(model, 0, ridge(LOAD_HOME[0] + small[0] + 0.2))
+    fields = {name: getattr(model, name).copy() for name in LOAD_FIELDS}
+    with pytest.raises(ValueError, match="home position"):
+        apply_load(model, 0, block(5000.0, length_ratio=2.0), mujoco.MjData(model))
+    for name, value in fields.items():
+        np.testing.assert_array_equal(getattr(model, name), value, err_msg=name)
+
+
+def test_reset_rests_the_load_on_uneven_ground():
+    model, data = scene(3000.0)
+    xs, ys = ground_axes()
+    write_ground(model, 0, 0.06 * np.abs(xs[None, :] - 7.2) + 0.03 * ys[:, None])
+    mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
+    mujoco.mj_forward(model, data)
+    assert ground_overlap(model, data, 0) < 0
+    moved, _ = resting_still(model, data)
+    assert moved < 1e-3 and body_speed(model, data, P + LOAD) < STILL
+
 def collides(model, a, b):
     ba, bb = model.geom_bodyid[a], model.geom_bodyid[b]
     if not (model.geom_contype[a] & model.geom_conaffinity[b]
@@ -304,7 +349,7 @@ def test_the_load_meets_each_other_shape_through_one_kind_of_its_own():
         assert not collides(model, ground, box) and all(collides(model, ground, s) for s in spheres)
 
 
-def test_every_draw_can_be_lifted_clear_within_the_side_rating():
+def test_every_draw_fits_below_the_hook_within_the_side_rating():
     for seed in SEEDS:
         load = draw_load(seed)
         half = np.array(load.half)
@@ -314,6 +359,51 @@ def test_every_draw_can_be_lifted_clear_within_the_side_rating():
                    and drop + 2 * half[2] <= height - HOOK_REACH - LIFT_CLEARANCE + 1e-9
                    for height, rating in LIFT_HEIGHTS.items())
 
+
+
+def leg_drop(load):
+    return math.sqrt(load.leg ** 2 - load.half[0] ** 2 - load.half[1] ** 2)
+
+
+def pin_at(model, data, radius, height):
+    px, pz = radius - BOOM_PIVOT[0], SWING_HEIGHT + BOOM_PIVOT[2] - height
+    arm = math.acos((px * px + pz * pz - BOOM_LENGTH ** 2 - ARM_LENGTH ** 2)
+                    / (2 * BOOM_LENGTH * ARM_LENGTH))
+    boom = math.atan2(pz, px) - math.atan2(ARM_LENGTH * math.sin(arm),
+                                           BOOM_LENGTH + ARM_LENGTH * math.cos(arm))
+    pose(model, data, (math.pi / 2, boom, arm, 2.4))
+
+
+def test_heaviest_and_tallest_draws_are_hooked_and_lifted_clear_over_the_side():
+    radius = {h: max((float(side.strip("*")), r) for (hh, r), (_, side) in CHART.items()
+                     if hh == h)[1] for h in LIFT_HEIGHTS}
+    loads = sorted((draw_load(s) for s in SEEDS), key=lambda d: d.mass)[-2:]
+    loads += sorted((draw_load(s) for s in SEEDS), key=lambda d: 2 * d.half[2] + leg_drop(d))[-2:]
+    for load in loads:
+        height = min(h for h, kg in LIFT_HEIGHTS.items() if load.mass <= kg
+                     and leg_drop(load) + 2 * load.half[2] <= h - HOOK_REACH - LIFT_CLEARANCE)
+        model = load_scene(1)
+        apply_load(model, 0, load, mujoco.MjData(model))
+        data = mujoco.MjData(model)
+        mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
+        target, pin = 2 * load.half[2] + 0.9 * leg_drop(load), height
+        for _ in range(4):
+            pin_at(model, data, radius[height], pin)
+            pin += target - data.site_xpos[model.site(P + "hook").id][2]
+        place_load(model, data, 0, *hook_xy(model, data))
+        hook_load(model, data, 0)
+        body, base = model.body(P + LOAD).id, model.body(P + "base").id
+        data.ctrl[model.actuator(P + "boom").id] = -0.2
+        for _ in range(round(3.0 / model.opt.timestep)):
+            mujoco.mj_step(model, data)
+            assert data.xmat[base][8] > math.cos(math.radians(0.5))
+            if data.xipos[body][2] - load.half[2] > LIFT_CLEARANCE + CONTACT_MARGIN:
+                break
+        assert data.xipos[body][2] - load.half[2] > LIFT_CLEARANCE + CONTACT_MARGIN
+        anchor = data.xanchor[model.joint(P + "bucket").id]
+        assert anchor[2] <= height and math.hypot(anchor[0], anchor[1]) <= radius[height]
+        assert sling_tension(model, data, 0) == pytest.approx(
+            load.mass * G / math.cos(load.leg_angle), rel=0.02)
 
 def test_ground_reaches_past_the_hook_plus_the_longest_sling_and_block():
     hook_reach = BOOM_PIVOT[0] + BOOM_LENGTH + ARM_LENGTH + HOOK_REACH

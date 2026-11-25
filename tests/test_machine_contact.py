@@ -21,12 +21,16 @@ from hma.machine import (
 from hma.machine.collision import LINK_MESH, PIECES, link_triangles
 from hma.machine.contact import STEEL_FRICTION_RANGE, draw_friction, set_friction
 from hma.machine.load import (
+    LEG_WLL,
     RANGES,
+    SLING_WLL,
     apply_load,
     block,
     draw_load,
     hang_load,
+    hook_force,
     hook_load,
+    leg_tensions,
     place_load,
     sling_tension,
     unhook_load,
@@ -239,6 +243,25 @@ def test_joint_loads_with_a_hanging_load_match_statics():
         assert abs(sim) == pytest.approx(abs(hand), rel=0.01)
 
 
+
+def test_sling_readings_match_statics_and_a_snatch_reads_over_the_rating():
+    model, data = hung(5000.0)
+    run(model, data, 3.0)
+    block_weight = model.body_mass[model.body(P + "load").id] * G
+    legs = leg_tensions(model, data, 0)
+    assert legs == pytest.approx(block_weight / 4 / math.cos(math.radians(30.0)), rel=0.01)
+    assert hook_force(model, data, 0) == pytest.approx(block_weight + RING_MASS * G, rel=0.01)
+    assert legs.max() < LEG_WLL and hook_force(model, data, 0) < SLING_WLL
+    v0 = model.jnt_dofadr[model.joint(P + LOAD).id]
+    r0 = model.jnt_dofadr[model.joint(P + RING + "_x").id]
+    data.qvel[[v0 + 2, r0 + 2]] = -3.0
+    peaks = []
+    run(model, data, 1.0, lambda: peaks.append((leg_tensions(model, data, 0).max(),
+                                                hook_force(model, data, 0))))
+    leg, hook = np.max(peaks, axis=0)
+    assert leg > LEG_WLL and hook > SLING_WLL
+    assert np.linalg.norm(data.qvel[v0:v0 + 3]) < 0.5
+
 AUDIT_POSES = [
     ("base", (19.6, 152.0, 64.8)),
     ("upper", (-70.0, 152.0, 84.3)),
@@ -440,22 +463,43 @@ def resting_load(mass):
     return model, data, model.body(P + LOAD).id, model.geom_size[model.geom(P + LOAD).id]
 
 
-def test_dropped_load_never_gains_energy_and_comes_to_rest_flat():
+LANDING_SPEED = 5.5
+
+
+def land(tilt, phase):
     model, data, body, half = resting_load(3000.0)
-    q0 = model.joint(P + LOAD).qposadr[0]
-    data.qpos[q0 + 2] += 3.0
-    data.qpos[q0 + 3:q0 + 7] = [math.cos(0.1), math.sin(0.1), 0.0, 0.0]
-    r0 = model.joint(P + RING + "_x").qposadr[0]
+    rest = data.xipos[body][2]
+    q0, v0 = model.joint(P + LOAD).qposadr[0], model.joint(P + LOAD).dofadr[0]
+    lift = 0.5 + phase * LANDING_SPEED * model.opt.timestep
+    data.qpos[q0 + 2] += lift
+    data.qpos[q0 + 3:q0 + 7] = [math.cos(tilt / 2), math.sin(tilt / 2), 0.0, 0.0]
+    r0, w0 = model.joint(P + RING + "_x").qposadr[0], model.joint(P + RING + "_x").dofadr[0]
     data.qpos[r0:r0 + 3] = ring_at_load(model, data, 0)
+    data.qvel[v0 + 2] = data.qvel[w0 + 2] = -math.sqrt(LANDING_SPEED ** 2 - 2 * G * lift)
     mujoco.mj_forward(model, data)
     bodies = (body, model.body(P + RING).id)
-    energy = [sum(load_energy(model, data, b) for b in bodies)]
-    run(model, data, 3.0, lambda: energy.append(sum(load_energy(model, data, b) for b in bodies)))
+    energy, low = [sum(load_energy(model, data, b) for b in bodies)], [data.xipos[body][2]]
+
+    def track():
+        energy.append(sum(load_energy(model, data, b) for b in bodies))
+        low.append(data.xipos[body][2])
+
+    run(model, data, 3.0, track)
     energy = np.array(energy)
-    held = sum(model.body_mass[b] for b in bodies) * G * CONTACT_SOLIMP[2]
-    assert (energy - np.minimum.accumulate(energy)).max() < held
-    assert data.xipos[body][2] == pytest.approx(half[2] + CONTACT_MARGIN, abs=1e-5)
-    assert data.xmat[body][8] > math.cos(math.radians(0.01))
+    weight = sum(model.body_mass[b] for b in bodies) * G
+    held = weight * max(CONTACT_SOLIMP[2], rest - min(low))
+    return (energy - np.minimum.accumulate(energy)).max(), held, model, data, body, half
+
+
+@pytest.mark.parametrize("tilt", [0.0, 0.1, 0.3])
+def test_load_landing_at_speed_gains_no_energy_and_comes_to_rest(tilt):
+    for phase in np.linspace(0.0, 1.0, 6, endpoint=False):
+        rise, held, model, data, body, half = land(tilt, phase)
+        assert rise < held
+        assert np.abs(data.cvel[body]).max() < 1e-3
+    if tilt == 0.0:
+        assert data.xipos[body][2] == pytest.approx(half[2] + CONTACT_MARGIN, abs=1e-5)
+        assert data.xmat[body][8] > math.cos(math.radians(0.01))
 
 
 def test_pressed_load_neither_sinks_nor_bounces_back_nor_creeps():
