@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from hma.soil import FORCE_CAP, NOMINAL, SoilParams, cutting_force, sample_soil
-from hma.soil.force import BACK_GAIN, failure_angle, fee_factors, rake_limit
+from hma.soil.force import failure_angle, fee_factors, rake_limit
 
 WIDTH = 0.61
 STIFF = SoilParams(105.0e3, 105.0e3, 0.8, 22.0e3, 0.4, 300.0)
@@ -36,9 +36,9 @@ def test_no_spike_sweeping_the_rake_through_the_singular_region():
         values = np.array([force(soil, 0.3, rake) for rake in rakes])
         assert np.abs(np.diff(values)).max() < 600.0
         at_limit = force(soil, 0.3, rake_limit(soil))
-        beyond = values[rakes > rake_limit(soil)]
-        assert beyond.max() <= BACK_GAIN * at_limit * (1 + 1e-9)
-        assert beyond.min() >= at_limit * (1 - 1e-9)
+        assert np.all(values[rakes > rake_limit(soil)] == at_limit)
+        assert failure_angle(soil, rake_limit(soil)) == math.pi / 4 - soil.friction_angle / 2
+        assert fee_factors(soil, rake_limit(soil))[1] < 20.0
 
 
 def test_force_is_continuous_in_depth_and_vanishes_with_it():
@@ -79,7 +79,7 @@ def test_spoil_costs_its_weight_without_cohesion_and_blends_continuously():
     assert values[-1] == force(weight_only, depth, rake, load=0.0)
 
 
-def test_the_failure_angle_minimises_the_weight_factor():
+def test_the_failure_angle_minimises_the_weight_factor_above_the_passive_angle():
     def n_gamma(soil, rake, beta):
         phi, delta = soil.friction_angle, soil.steel_friction_angle
         return ((1 / math.tan(rake) + 1 / math.tan(beta)) * math.sin(phi + beta)
@@ -90,6 +90,8 @@ def test_the_failure_angle_minimises_the_weight_factor():
             beta = failure_angle(soil, rake)
             assert fee_factors(soil, rake)[0] == pytest.approx(n_gamma(soil, rake, beta))
             best = n_gamma(soil, rake, beta)
-            for other in np.linspace(0.02, math.pi - soil.friction_angle
+            floor = math.pi / 4 - soil.friction_angle / 2
+            assert beta >= floor
+            for other in np.linspace(floor, math.pi - soil.friction_angle
                                      - soil.steel_friction_angle - rake - 0.02, 50):
                 assert best <= n_gamma(soil, rake, other) * (1 + 1e-4)

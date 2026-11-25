@@ -16,8 +16,6 @@ CAP_SHARPNESS = 4
 EDGE_THICKNESS = 0.02
 RAKE_MARGIN = 0.1
 SINGULAR_MARGIN = 0.1
-BACK_RAMP = 0.2
-BACK_GAIN = 2.0
 SURCHARGE_DEPTH = 0.05
 TABLE_RAKES = 256
 TABLE_BETAS = 2048
@@ -31,7 +29,8 @@ def _failure_angles(soil: SoilParams) -> tuple[float, float, list[float], float]
     betas = np.linspace(0.0, 1.0, TABLE_BETAS)[1:-1][None, :] * (top - rakes)
     n_gamma = ((1 / np.tan(rakes) + 1 / np.tan(betas)) * np.sin(phi + betas)
                / np.sin(delta + rakes + phi + betas))
-    best = betas[np.arange(TABLE_RAKES), np.argmin(n_gamma, axis=1)].tolist()
+    floor = math.pi / 4 - phi / 2
+    best = np.maximum(betas[np.arange(TABLE_RAKES), np.argmin(n_gamma, axis=1)], floor).tolist()
     table = (RAKE_MARGIN, float(rakes[1, 0] - rakes[0, 0]), best)
     limit = top - SINGULAR_MARGIN
     for _ in range(100):
@@ -94,8 +93,6 @@ def raw_force(soil: SoilParams, sums: tuple[float, float, float, float], rake: f
     separation = (soil.unit_weight * moment * n_gamma
                   + (soil.cohesion * n_cohesion + soil.adhesion * n_adhesion) * firm
                   + load * n_surcharge * wetted)
-    past = min(max((effective_rake(rake) - rake_limit(soil)) / BACK_RAMP, 0.0), 1.0)
-    separation *= 1.0 + (BACK_GAIN - 1.0) * past * past * (3.0 - 2.0 * past)
     penetration = (soil.penetration_factor * passive_coefficient(soil) * soil.unit_weight
                    * firm * EDGE_THICKNESS * abs(attack_cos))
     return separation + penetration

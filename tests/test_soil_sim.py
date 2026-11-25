@@ -31,6 +31,7 @@ PREFIX = machine_prefix(0)
 STIFF = SoilParams(105.0e3, 105.0e3, 0.8, 22.0e3, 0.4, 300.0)
 LOOSE = SoilParams(0.0, 0.0, 0.3, 17.0e3, 0.2, 0.0)
 BURIED = (np.array([6.0, 0.0, -0.25]), PITCH_DIG)
+BETWEEN_CELLS = (np.array([6.05, 0.0, -0.25]), PITCH_DIG)
 
 
 def machine(params=NOMINAL):
@@ -73,6 +74,21 @@ def advance(model, data, soil, steps):
 @pytest.fixture(scope="module")
 def nominal():
     return run_cycle()
+
+
+def tendon_forces(data, soil):
+    rows = data.efc_type == mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON
+    return [float(data.efc_force[rows & (data.efc_id == t)].sum()) for t in soil.tendons]
+
+
+def joint_loads(model, data):
+    return [joint_load(model, data, 0, j) for j in JOINT_NAMES]
+
+
+def reversals(series, rows=slice(None)):
+    d = np.diff(np.asarray(series), axis=0)
+    flips = (d[:-1] * d[1:] < 0) & (np.abs(d[:-1]) > 1e3) & (np.abs(d[1:]) > 1e3)
+    return int(flips[rows].sum())
 
 
 def cells_near(soil, x, y, radius):
@@ -177,27 +193,91 @@ def test_holding_the_bucket_at_its_limit_stalls_like_a_free_bucket():
     assert pinned_resistance >= 0.9 * free_resistance > 100e3
 
 
-def test_a_jittery_vertical_descent_changes_the_force_smoothly():
-    model, data, soil = machine(LOOSE)
+@pytest.mark.parametrize("params", [LOOSE, NOMINAL, STIFF], ids=["loose", "nominal", "stiff"])
+def test_a_jittery_vertical_descent_changes_the_forces_smoothly(params):
+    model, data, soil = machine(params)
     point = np.array([6.0, 0.0, 0.3])
     place(model, data, soil, point, 1.0)
     joints = [model.joint(PREFIX + j).qposadr[0] for j in JOINT_NAMES]
     acts, rng = actuators(model), np.random.default_rng(0)
-    forces, limits = [], []
+    forces, loads, in_soil = [], [], 0
     for _ in range(160):
         point = point - np.array([0.0, 0.0, 0.01])
         target = inverse_kinematics(point + np.array([0.0, rng.normal(0.0, 0.003), 0.0]), 1.0)
         data.ctrl[acts] = np.clip(3.0 * (target - data.qpos[joints]), -0.5, 0.5)
         for _ in range(20):
             advance(model, data, soil, 1)
-            forces.append(soil.edge_force(data).copy())
-            limits.append(soil.resistance)
+            forces.append(tendon_forces(data, soil))
+            loads.append(joint_loads(model, data))
+            in_soil += soil.resistance > 1e3
         soil.control_step(model, data)
-    forces, limits = np.array(forces), np.array(limits)
-    both = (limits[1:] > 1e3) & (limits[:-1] > 1e3)
-    jumps = np.linalg.norm(np.diff(forces, axis=0), axis=1)[both]
-    assert both.sum() > 1500
-    assert jumps.max() < 2.0e3
+    steady = ~np.isin(np.arange(1, len(loads) - 1) % 20, (19, 0))
+    assert in_soil > 1500
+    assert np.abs(np.diff(forces, axis=0)).max() < 5e3
+    assert np.abs(np.diff(loads, axis=0)).max() < 20e3
+    assert reversals(forces) == 0
+    assert reversals(loads, steady) == 0
+
+
+def test_a_stall_begins_holds_and_releases_without_jumps():
+    model, data, soil = machine(STIFF)
+    place(model, data, soil, *BURIED)
+    data.ctrl[model.actuator(PREFIX + "arm").id] = 0.2
+    forces, loads = [], []
+    for k in range(2800):
+        if k == 2400:
+            data.ctrl[:] = 0.0
+        advance(model, data, soil, 1)
+        forces.append(tendon_forces(data, soil))
+        loads.append(joint_loads(model, data))
+        if k % 20 == 19:
+            soil.control_step(model, data)
+    assert np.abs(np.diff(forces, axis=0)).max() < 10e3
+    assert np.abs(np.diff(loads, axis=0)).max() < 30e3
+    assert reversals(forces) == 0 and reversals(loads) == 0
+
+
+def test_a_tiny_perturbation_stays_tiny():
+    def drag(nudge):
+        model, data, soil = machine()
+        place(model, data, soil, *BURIED)
+        data.ctrl[model.actuator(PREFIX + "arm").id] = 0.2
+        for k in range(50):
+            if k == 10:
+                data.qvel[model.joint(PREFIX + "arm").dofadr[0]] += nudge
+            step(model, data, [soil])
+        joints = [model.joint(PREFIX + j).qposadr[0] for j in JOINT_NAMES]
+        return data.qpos[joints].copy(), soil.resistance, soil.heights.copy()
+
+    (q0, r0, h0), (q1, r1, h1) = drag(0.0), drag(1e-12)
+    assert np.abs(q1 - q0).max() < 1e-9
+    assert abs(r1 - r0) < 1e-3
+    assert np.abs(h1 - h0).max() < 1e-9
+
+
+def test_a_digging_neighbour_leaves_a_machines_soil_unchanged():
+    def run(command):
+        model = load_scene(2, weld=True)
+        data = mujoco.MjData(model)
+        soils = [Soil(model, 0), Soil(model, 1)]
+        for i in (0, 1):
+            data.qpos[[model.joint(machine_prefix(i) + j).qposadr[0] for j in JOINT_NAMES]] = (
+                inverse_kinematics(*BURIED))
+        for soil in soils:
+            soil.reset(model, data)
+        data.ctrl[actuators(model)] = command
+        data.ctrl[model.actuator(machine_prefix(1) + "arm").id] = 0.2
+        resistance = []
+        for _ in range(50):
+            step(model, data, soils)
+            resistance.append(soils[1].resistance)
+        return soils[1].heights.copy(), np.array(resistance), soils[1].bucket_volume
+
+    resting, digging = run((0.0, 0.0, 0.0, 0.0)), run((0.0, 0.0, 0.2, 0.0))
+    assert np.abs(digging[0] - resting[0]).max() < 1e-12
+    assert np.abs(digging[1] - resting[1]).max() < 1e-6
+    assert abs(digging[2] - resting[2]) < 1e-12
+
 
 def test_dragging_through_spoil_costs_less_than_through_undisturbed_soil():
     def drag(spoil):
@@ -217,33 +297,93 @@ def test_dragging_through_spoil_costs_less_than_through_undisturbed_soil():
     assert spoil < 0.3 * firm
     assert spoil_travel > 5.0 * firm_travel
 
-def test_a_sliding_edge_meets_exactly_the_resistance_against_its_motion():
-    model, data, soil = machine()
+
+@pytest.mark.parametrize("params", [NOMINAL, STIFF], ids=["nominal", "stiff"])
+def test_the_soil_never_pushes_and_each_axis_stays_within_its_limit(params):
+    model, data, soil = machine(params)
     acts = actuators(model)
     jac = np.zeros((3, model.nv))
-    moving, sliding, misaligned = 0, 0, 0
+    loaded = 0
     for command in itertools.product((-0.3, 0.0, 0.3), repeat=4):
         if not any(command):
             continue
         place(model, data, soil, *BURIED)
         data.ctrl[acts] = command
-        for _ in range(30):
+        for k in range(140):
             soil.substep(model, data)
-            limit = soil.resistance
+            limits = np.array(soil.limits)
             mujoco.mj_step(model, data)
             mujoco.mj_jacSite(model, data, jac, None, soil.tip)
-            force, velocity = soil.edge_force(data), jac @ data.qvel
-            magnitude, speed = np.linalg.norm(force), np.linalg.norm(velocity)
-            assert magnitude <= 1.001 * limit
-            if limit > 1e3 and speed > 1e-2:
-                moving += 1
-                assert -(force @ velocity) > 0.0
-                if magnitude >= 0.99 * limit:
-                    sliding += 1
-                    misaligned += -(force @ velocity) < 0.99 * magnitude * speed
-    assert sliding > 1000
-    assert sliding > 0.99 * moving
-    assert misaligned < 0.01 * sliding
+            forces = np.abs(tendon_forces(data, soil))
+            assert np.all(forces <= limits * (1 + 1e-9))
+            assert soil.edge_force(data) @ (jac @ data.qvel) <= 1e-6
+            loaded += forces.max() > 1e3
+            if k % 20 == 19:
+                soil.control_step(model, data)
+    assert loaded > 5000
+
+
+def price(params, command, start=BETWEEN_CELLS):
+    model, data, soil = machine(params)
+    place(model, data, soil, *start)
+    data.ctrl[actuators(model)] = command
+    jac, work = np.zeros((3, model.nv)), 0.0
+    for k in range(200):
+        advance(model, data, soil, 1)
+        mujoco.mj_jacSite(model, data, jac, None, soil.tip)
+        work -= soil.edge_force(data) @ (jac @ data.qvel) * model.opt.timestep
+        if k % 20 == 19:
+            soil.control_step(model, data)
+    cut = soil.bucket_volume + soil.loose.sum() * soil.grid.cell_area + soil.lost_volume
+    return cut, work
+
+
+def test_back_first_ploughing_pays_at_least_half_the_forward_price():
+    forward_cut, forward_work = price(NOMINAL, (0.0, 0.0, 0.2, 0.0))
+    back_cut, back_work = price(NOMINAL, (0.0, 0.0, -0.2, 0.0))
+    assert back_cut > 0.01
+    assert back_work / back_cut >= 0.5 * forward_work / forward_cut
+
+
+def test_pulsing_against_a_stall_gets_no_further_than_pushing():
+    def push(pulsed):
+        model, data, soil = machine(STIFF)
+        place(model, data, soil, *BURIED)
+        arm = model.actuator(PREFIX + "arm").id
+        start = data.site_xpos[soil.tip].copy()
+        for k in range(400):
+            data.ctrl[arm] = 0.0 if pulsed and (k // 20) % 2 else 0.2
+            advance(model, data, soil, 1)
+            if k % 20 == 19:
+                soil.control_step(model, data)
+        return np.linalg.norm(data.site_xpos[soil.tip] - start)
+
+    assert push(True) <= push(False) + 1e-3
+
+
+def test_commands_that_cancel_at_the_tip_against_a_pinned_bucket_meet_the_soil():
+    model, data, soil = machine(STIFF)
+    joints = [model.joint(PREFIX + j).qposadr[0] for j in JOINT_NAMES]
+    q = inverse_kinematics(*BURIED)
+    q[3] = model.joint(PREFIX + "bucket").range[0]
+    mujoco.mj_resetData(model, data)
+    data.qpos[joints] = q
+    mujoco.mj_forward(model, data)
+    soil.reset(model, data, np.full(soil.grid.shape, data.site_xpos[soil.tip][2] + 0.3))
+    jac = np.zeros((3, model.nv))
+    mujoco.mj_jacSite(model, data, jac, None, soil.tip)
+    cols = [model.joint(PREFIX + j).dofadr[0] for j in ("boom", "arm", "bucket")]
+    null = np.linalg.svd(jac[:, cols])[2][-1]
+    null = -null / null[2]
+    data.ctrl[actuators(model)] = np.r_[0.0, null / np.max(np.abs(null) / [0.6, 0.8, 1.2])]
+    start, held = data.site_xpos[soil.tip].copy(), []
+    for k in range(400):
+        advance(model, data, soil, 1)
+        held.append(max(np.abs(tendon_forces(data, soil))))
+        if k % 20 == 19:
+            soil.control_step(model, data)
+    assert np.linalg.norm(data.site_xpos[soil.tip] - start) < 0.02
+    assert max(held) > 50e3
 
 
 def test_a_stalled_swing_leaves_the_curl_no_cheaper():
@@ -270,7 +410,7 @@ def test_sweeping_sideways_is_resisted_until_the_swing_stalls():
     place(model, data, soil, *BURIED)
     data.ctrl[model.actuator(PREFIX + "swing").id] = 0.3
     advance(model, data, soil, 100)
-    assert soil.resistance > 0.0
+    assert soil.limits[1] >= 0.99 * soil.limits[0] > 10e3
     assert abs(joint_load(model, data, 0, "swing")) == pytest.approx(FORCE_CAPS["swing"], rel=0.01)
     assert abs(data.site_xpos[soil.tip][1]) < 0.02
 
@@ -291,7 +431,7 @@ def test_an_edge_coasting_into_soil_is_stopped_at_the_wall():
     peak = 0.0
     for _ in range(600):
         advance(model, data, soil, 1)
-        peak = max(peak, soil.resistance)
+        peak = max(peak, *soil.limits)
     assert data.qpos[swing] < 0.25
     assert peak > 20e3
 
@@ -318,7 +458,7 @@ def test_moving_the_free_base_drags_the_edge_against_the_soil():
     assert buried < 0.5 * free
 
 
-def test_a_resting_edge_stays_quiet_and_an_edge_above_ground_feels_nothing():
+def test_a_resting_edge_is_held_quietly_and_an_edge_above_ground_feels_nothing():
     def rest(heights):
         model, data, soil = machine()
         place(model, data, soil, *BURIED)
@@ -345,9 +485,7 @@ def test_a_resting_edge_stays_quiet_and_an_edge_above_ground_feels_nothing():
     place(model, data, soil, *BURIED)
     data.qvel[:] = 0.0
     soil.substep(model, data)
-    assert soil.resistance == 0.0
-    mujoco.mj_step(model, data)
-    assert not soil.edge_force(data).any()
+    assert min(soil.limits) > 10e3
     place(model, data, soil, np.array([6.0, 0.0, 1.5]), PITCH_DIG)
     data.ctrl[actuators(model)] = 0.3
     for _ in range(100):
@@ -371,16 +509,14 @@ def test_the_back_of_the_bucket_spills_instead_of_filling():
 def test_an_edge_at_the_grid_border_is_resisted_as_it_is_inland():
     model, data, soil = machine()
     place(model, data, soil, np.array([0.0, 5.93, -0.25]), PITCH_DIG)
-    start = soil.ground_volume()
     data.ctrl[model.actuator(PREFIX + "arm").id] = -0.2
-    resistance = []
+    limits = []
     for _ in range(40):
         advance(model, data, soil, 1)
-        resistance.append(soil.resistance)
+        limits.append(soil.limits)
     assert data.site_xpos[soil.edges, 1].max() > soil.grid.y0 + soil.grid.cell * (
-        soil.grid.shape[0] - 1) - soil.grid.cell
-    assert min(resistance[5:]) > 50e3
-    assert start - soil.ground_volume() < 0.005
+        soil.grid.shape[0] - 1)
+    assert np.all(np.array(limits[5:]) > 0.5 * np.array(limits[0]))
 
 def test_ground_under_the_tracks_is_protected():
     model, data, soil = machine()
