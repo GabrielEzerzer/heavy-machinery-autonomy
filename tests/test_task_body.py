@@ -1,5 +1,9 @@
+import pytest
+
 from hma.machine import statics
 from hma.task.body import SIDE_ROWS, Capacity, rating_cells
+from hma.task.capacity import cells, compute
+from hma.task.capacity_table import TABLE
 
 
 def side(cells):
@@ -45,6 +49,17 @@ def test_machine_body_geometry(body):
     assert body.boom_arm_angles(20.0, 0.0, 0.0) == ()
 
 
-def test_machine_body_rates_a_chart_cell_from_the_model_statics(body):
-    found = body.lift_capacity(6.0, 0.0)
-    assert isinstance(found, Capacity) and found.tipping_kg > 0 and found.hydraulic_kg > 0
+def test_machine_body_rates_a_chart_cell_from_the_capacity_table(body):
+    assert body.lift_capacity(6.0, 0.0) == Capacity(*TABLE[(0.0, 6.0)])
+    assert body.lift_capacity(7.04, 1.5) is None
+
+
+def test_the_capacity_table_matches_the_machine_statics():
+    stale = "the machine changed: run python -m hma.task.capacity"
+    fresh = compute()
+    assert fresh.keys() == TABLE.keys() == set(cells()), stale
+    for key, value in fresh.items():
+        if value is None:
+            assert TABLE[key] is None, (key, stale)
+        else:
+            assert TABLE[key] == pytest.approx(value, abs=0.5), (key, stale)

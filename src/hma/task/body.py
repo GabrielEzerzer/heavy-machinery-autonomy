@@ -1,11 +1,10 @@
 # The machine-body seam: lift ratings, plan size, track footprint, travel reach, boom-arm angles.
 # Ratings are the manufacturer's chart (hma.machine.statics.CHART plus its at-max-reach column)
-# and the model's statics at the same cells. Machine frame as in hma.machine.kinematics.
+# and the model statics at the same cells, from hma.task.capacity_table. Frame as in kinematics.
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from functools import cache
 from typing import Protocol
 
 import mujoco
@@ -13,6 +12,7 @@ import numpy as np
 
 from hma.machine import JOINT_NAMES, inverse_kinematics, load_scene, machine_prefix, statics
 from hma.machine.model import TRACK_FEET
+from hma.task.capacity_table import TABLE
 
 PITCHES_DEG = tuple(range(-180, 180, 15))
 REACH_SCAN_M = (12.0, 0.05)
@@ -76,18 +76,9 @@ def rating_cells(radius_m: float, rows: dict[float, list[Cell]] = SIDE_ROWS) -> 
     return found or None
 
 
-@cache
-def _statics() -> statics.Machine:
-    return statics.Machine()
-
-
-@cache
 def model_capacity(radius_m: float, height_m: float) -> Capacity | None:
-    found = statics.lift(_statics(), height_m, radius_m, statics.MAIN_RELIEF)
-    _statics().done()
-    if found is None:
-        return None
-    return Capacity(float(found["side_tip"]), float(found["hydraulic"]))
+    found = TABLE[(height_m, radius_m)]
+    return None if found is None else Capacity(*found)
 
 
 def _poses(x: float, y: float, z: float) -> list[np.ndarray]:

@@ -14,6 +14,7 @@ from hma.task.checks import (
     check_rules,
     check_schema,
     lift_samples,
+    machine_problem,
 )
 from hma.task.scene import HazardKind
 
@@ -249,6 +250,16 @@ def test_demo_ground_joins_up_where_the_machine_drives_on(scene):
     assert all(h2 < h1 < 0 for h1, h2 in zip(bank, bank[1:], strict=False))
     assert scene.ground((-6.0, 0.0)).height_m == pytest.approx(-2 * math.tan(math.radians(35)))
     assert scene.ground((-10.0, 0.0)).height_m == pytest.approx(bank[-1])
+
+
+def test_the_track_footprint_turns_with_the_heading(scene, body):
+    beside = with_zone(scene, Zone("T", "slope", box(1.5, 10, -10, 10), 0.0, 0.5, 0.0))
+    assert machine_problem(beside, body, Pose(0.0, 0.0, 90.0), "lifting") is None
+    problem = machine_problem(beside, body, Pose(0.0, 0.0, 0.0), "lifting")
+    assert "more than one slope" in problem
+    ahead = with_zone(scene, Zone("T", "slope", box(-10, 10, 1.5, 10), 0.0, 0.5, 90.0))
+    assert machine_problem(ahead, body, Pose(0.0, 0.0, 0.0), "lifting") is None
+    assert "more than one slope" in machine_problem(ahead, body, Pose(0.0, 0.0, 90.0), "lifting")
 
 
 def test_travel_slope_along_and_across(scene, body):
