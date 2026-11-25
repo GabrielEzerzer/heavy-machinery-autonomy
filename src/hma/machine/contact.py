@@ -21,12 +21,6 @@ def steel_geoms(model: mujoco.MjModel, index: int) -> np.ndarray:
                      for link, pieces in PIECES.items() for name in pieces])
 
 
-def ground_geoms(model: mujoco.MjModel, index: int) -> np.ndarray:
-    bit = 1 << index
-    return np.flatnonzero((model.geom_bodyid == 0) & (model.geom_contype == 0)
-                          & (model.geom_conaffinity & bit != 0))
-
-
 def set_friction(model: mujoco.MjModel, index: int, friction: float) -> None:
     if not np.isfinite(friction) or friction < 0:
         raise ValueError("friction must be finite and not negative")

@@ -103,7 +103,7 @@ def test_ten_hertz_proportional_control_settles_on_each_joint(name, step):
     assert max(abs(e) for e in errors[-20:]) < 2e-3
 
 
-@pytest.mark.parametrize("pose", [(0.0, 0.0, 0.6, 0.0), (0.0, 0.3, 0.8, 2.0)])
+@pytest.mark.parametrize("pose", [(0.0, 0.0, 0.6, 2.3), (0.0, 0.3, 0.8, 2.0)])
 def test_zero_command_drift_under_full_payload(pose):
     machine = Machine(pose, payload=PAYLOAD)
     machine.run(0.5)
@@ -118,7 +118,7 @@ def test_each_joint_lifts_and_holds_the_loaded_arm_across_its_range(name):
     lo, hi = JOINT_LIMITS[name]
     if name == "bucket":
         lo = SLUNG_CURL
-    pose = dict(zip(JOINT_NAMES, (0.0, 0.0, 0.8, 2.3), strict=True))
+    pose = dict(zip(JOINT_NAMES, (0.0, 0.0, 1.6, 2.3), strict=True))
     pose[name] = lo + 0.15
     machine = Machine(tuple(pose.values()), payload=PAYLOAD)
     speed = SPEED_LIMITS[name]

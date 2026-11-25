@@ -19,12 +19,7 @@ from hma.machine import (
     write_ground,
 )
 from hma.machine.collision import LINK_MESH, PIECES, link_triangles
-from hma.machine.contact import (
-    STEEL_FRICTION_RANGE,
-    draw_friction,
-    ground_geoms,
-    set_friction,
-)
+from hma.machine.contact import STEEL_FRICTION_RANGE, draw_friction, set_friction
 from hma.machine.load import (
     RANGES,
     apply_load,
@@ -38,18 +33,23 @@ from hma.machine.load import (
 )
 from hma.machine.model import (
     CONTACT_MARGIN,
+    CONTACT_SOLIMP,
     CONTACT_SOLREF,
-    GRAVITY_BODIES,
     LOAD,
     LOAD_DENSITY,
     MACHINE_SPACING,
+    RING,
+    RING_MASS,
     TRACK_FEET,
     VALVE,
+    ground_geoms,
+    ring_at_load,
 )
 from hma.machine.render import PARTS
 
 P = machine_prefix(0)
 G = 9.81
+GRAVITY_BODIES = ("boom", "arm", "bucket")
 F6 = np.zeros(6)
 
 
@@ -133,7 +133,7 @@ def test_pressed_bucket_ground_reaction_matches_statics_at_the_boom_cap():
     for joint in ("arm", "bucket"):
         assert abs(valve_load(model, data, joint)) < 0.99 * FORCE_CAPS[joint]
     hand = (tau + gravity_moment(model, data, GRAVITY_BODIES, xp)) / (centre[0] - xp)
-    assert force[2] == pytest.approx(hand, rel=0.10)
+    assert force[2] == pytest.approx(hand, rel=0.01)
 
 
 def test_propped_machine_bucket_reaction_matches_statics():
@@ -148,7 +148,7 @@ def test_propped_machine_bucket_reaction_matches_statics():
     tracks, xr = resultant(body_contacts(model, data, "base"))
     weight = data.subtree_com[base], model.body_subtreemass[base] * G
     hand = weight[1] * (weight[0][0] - xr[0]) / (xb[0] - xr[0])
-    assert bucket[2] == pytest.approx(hand, rel=0.10)
+    assert bucket[2] == pytest.approx(hand, rel=0.01)
     assert bucket[2] + tracks[2] == pytest.approx(weight[1], rel=0.01)
 
 
@@ -192,7 +192,7 @@ def test_dragged_bucket_slides_at_the_friction_force():
     assert s[:, 2].mean() == pytest.approx(mu * normal * radius, rel=0.10)
 
 
-def hung(mass, angles=(0.0, -1.0, 1.2, 2.0)):
+def hung(mass, angles=(0.0, -1.0, 1.6, 2.3)):
     model, data = home(weld=True)
     apply_load(model, 0, block(mass), mujoco.MjData(model))
     pose(model, data, angles)
@@ -220,20 +220,23 @@ def test_hanging_load_swings_at_the_compound_pendulum_period():
     xs = np.array(xs) - np.mean(xs)
     up = np.where((xs[:-1] < 0) & (xs[1:] >= 0))[0]
     period = np.diff(np.array(ts)[up]).mean()
-    assert period == pytest.approx(hand, rel=0.10)
+    assert period == pytest.approx(hand, rel=0.01)
 
 
 def test_joint_loads_with_a_hanging_load_match_statics():
     model, data = hung(3000.0)
     run(model, data, 3.0)
     hook = data.site_xpos[model.site(P + "hook").id]
-    weight = model.body_mass[model.body(P + "load").id] * G
+    weight = (model.body_mass[model.body(P + "load").id] + RING_MASS) * G
+    block_weight = model.body_mass[model.body(P + "load").id] * G
+    assert sling_tension(model, data, 0) == pytest.approx(
+        block_weight / math.cos(math.radians(30.0)), rel=0.01)
     chain = {"boom": ("boom", "arm", "bucket"), "arm": ("arm", "bucket"), "bucket": ("bucket",)}
     for joint, bodies in chain.items():
         x = pivot_x(model, data, joint)
         hand = gravity_moment(model, data, bodies, x) + weight * (hook[0] - x)
         sim = valve_load(model, data, joint)
-        assert abs(sim) == pytest.approx(abs(hand), rel=0.10)
+        assert abs(sim) == pytest.approx(abs(hand), rel=0.01)
 
 
 AUDIT_POSES = [
@@ -290,7 +293,7 @@ def test_bucket_swung_over_the_track_corner_stops_on_it():
 def test_driving_every_joint_end_to_end_passes_nothing_through_anything(swing):
     model, data = home(weld=True)
     pose(model, data, (math.radians(swing), -0.6, 1.9, 0.6))
-    periods = {"boom": 5.0, "arm": 3.0, "bucket": 2.0}
+    periods = {"swing": 7.0, "boom": 5.0, "arm": 3.0, "bucket": 2.0}
     tip = model.site(P + TIP_SITE).id
     worst, fastest, velocity = 0.0, 0.0, np.zeros(6)
     for k in range(round(15.0 / model.opt.timestep)):
@@ -442,13 +445,17 @@ def test_dropped_load_never_gains_energy_and_comes_to_rest_flat():
     q0 = model.joint(P + LOAD).qposadr[0]
     data.qpos[q0 + 2] += 3.0
     data.qpos[q0 + 3:q0 + 7] = [math.cos(0.1), math.sin(0.1), 0.0, 0.0]
+    r0 = model.joint(P + RING + "_x").qposadr[0]
+    data.qpos[r0:r0 + 3] = ring_at_load(model, data, 0)
     mujoco.mj_forward(model, data)
-    energy = [load_energy(model, data, body)]
-    run(model, data, 3.0, lambda: energy.append(load_energy(model, data, body)))
+    bodies = (body, model.body(P + RING).id)
+    energy = [sum(load_energy(model, data, b) for b in bodies)]
+    run(model, data, 3.0, lambda: energy.append(sum(load_energy(model, data, b) for b in bodies)))
     energy = np.array(energy)
-    assert (energy - np.minimum.accumulate(energy)).max() < 1e-4 * energy[0]
-    assert data.xipos[body][2] == pytest.approx(half[2] + CONTACT_MARGIN, abs=1e-3)
-    assert data.xmat[body][8] > math.cos(math.radians(0.5))
+    held = sum(model.body_mass[b] for b in bodies) * G * CONTACT_SOLIMP[2]
+    assert (energy - np.minimum.accumulate(energy)).max() < held
+    assert data.xipos[body][2] == pytest.approx(half[2] + CONTACT_MARGIN, abs=1e-5)
+    assert data.xmat[body][8] > math.cos(math.radians(0.01))
 
 
 def test_pressed_load_neither_sinks_nor_bounces_back_nor_creeps():
@@ -457,15 +464,15 @@ def test_pressed_load_neither_sinks_nor_bounces_back_nor_creeps():
     rest = data.xipos[body][2]
     data.xfrc_applied[body, 2] = -20.0 * model.body_mass[body] * G
     run(model, data, 1.0)
-    assert rest - data.xipos[body][2] < 1e-3
+    assert rest - data.xipos[body][2] < 1e-4
     data.xfrc_applied[body] = 0.0
     heights = []
     run(model, data, 10.0, lambda: heights.append(data.xipos[body][2]))
-    assert max(heights) - rest < 1e-3
-    assert abs(heights[-1] - heights[len(heights) // 10]) < 1e-4
+    assert max(heights) - rest < 1e-5
+    assert abs(heights[-1] - heights[len(heights) // 10]) < 1e-6
 
 
-LIFT_POSE = (0.0, -0.45, 1.2, 2.3)
+LIFT_POSE = (0.0, -0.6, 1.6, 2.3)
 
 
 def lift_cycle(model, data, index=0, mass=2000.0):
@@ -486,13 +493,14 @@ def lift_cycle(model, data, index=0, mass=2000.0):
     return load, trace, phase
 
 
-def test_load_is_lifted_carried_swung_and_set_down_on_its_sling():
-    model, data = home(weld=True)
+@pytest.mark.parametrize("weld", [True, False])
+def test_load_is_lifted_carried_swung_and_set_down_on_its_sling(weld):
+    model, data = home(weld=weld)
     load, _, phase = lift_cycle(model, data)
     body = model.body(P + LOAD).id
     start = data.xpos[body].copy()
     phase("boom", -0.2, 3.0)
-    assert data.xpos[body][2] - start[2] > 1.0
+    assert data.xpos[body][2] - start[2] > 2.0
     assert sling_tension(model, data, 0) == pytest.approx(
         load.mass * G / math.cos(load.leg_angle), rel=0.01)
     phase("swing", 0.5, math.pi / 4 / 0.5)
@@ -501,9 +509,9 @@ def test_load_is_lifted_carried_swung_and_set_down_on_its_sling():
     unhook_load(model, data, 0)
     phase("boom", -0.2, 2.0)
     moved = data.xpos[body] - start
-    assert math.hypot(moved[0], moved[1]) > 2.0
-    assert data.xpos[body][2] == pytest.approx(load.half[2] + CONTACT_MARGIN, abs=2e-3)
-    assert np.abs(data.cvel[body]).max() < 1e-3
+    assert math.hypot(moved[0], moved[1]) > 6.0
+    assert data.xpos[body][2] == pytest.approx(load.half[2] + CONTACT_MARGIN, abs=1e-5)
+    assert np.abs(data.cvel[body]).max() < 1e-6
 
 
 def test_same_draws_repeat_bit_for_bit():
@@ -558,17 +566,20 @@ def test_only_contact_shapes_collide_and_drawn_parts_are_no_geom():
                        drawn).any()
 
 
-def test_one_machine_working_in_contact_does_not_change_its_neighbour():
-    alone, data = home(1, weld=True)
+@pytest.mark.parametrize("weld", [True, False])
+def test_one_machine_working_in_contact_does_not_change_its_neighbour(weld):
+    alone, data = home(1, weld=weld)
     _, solo, phase = lift_cycle(alone, data)
     phase("boom", -0.2, 3.0)
-    pair, data = home(2, weld=True)
+    pair, data = home(2, weld=weld)
     pose(pair, data, (0.0, -0.5, 1.6, 1.0))
     command(pair, data, "boom", 0.1)
     command(pair, data, "swing", 0.1)
     _, shared, phase = lift_cycle(pair, data, index=1)
     phase("boom", -0.2, 3.0)
-    assert ground_contacts(pair, data, "bucket")
+    touched = []
+    run(pair, data, 0.1, lambda: touched.append(bool(ground_contacts(pair, data, "bucket"))))
+    assert any(touched)
     got, want = np.array(shared), np.array(solo)
     for j in range(alone.njnt):
         width = 7 if alone.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE else 1
@@ -579,3 +590,41 @@ def test_one_machine_working_in_contact_does_not_change_its_neighbour():
             mine[:, 1] -= MACHINE_SPACING
         np.testing.assert_allclose(mine, want[:, a:a + width], atol=1e-6)
 
+
+
+def hull_planes(model, geom):
+    mesh = model.geom_dataid[geom]
+    adr = model.mesh_graphadr[mesh]
+    nvert, nface = model.mesh_graph[adr:adr + 2]
+    start = adr + 2 + 3 * nvert + 3 * nface
+    faces = model.mesh_graph[start:start + 3 * nface].reshape(-1, 3)
+    first = model.mesh_vertadr[mesh]
+    rot = np.zeros(9)
+    mujoco.mju_quat2Mat(rot, model.geom_quat[geom])
+    verts = (model.mesh_vert[first:first + model.mesh_vertnum[mesh]] @ rot.reshape(3, 3).T
+             + model.geom_pos[geom])
+    tri = verts[faces]
+    normal = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    normal /= np.linalg.norm(normal, axis=1)[:, None]
+    offset = np.einsum("ij,ij->i", normal, tri[:, 0])
+    inward = normal @ verts.mean(axis=0) > offset
+    normal[inward], offset[inward] = -normal[inward], -offset[inward]
+    support = (verts @ normal.T - offset).max(axis=0) < 1e-6
+    return normal[support], offset[support]
+
+
+def test_every_mesh_vertex_lies_inside_a_piece_except_the_documented_parts():
+    model = load_scene(1)
+    for link in PIECES:
+        verts = np.unique(link_triangles(link).reshape(-1, 3), axis=0)
+        outside = np.full(len(verts), np.inf)
+        for geom in pieces(model, link):
+            normal, offset = hull_planes(model, geom)
+            outside = np.minimum(outside, (verts @ normal.T - offset).max(axis=1))
+        bare = verts[outside > 0.01]
+        if link == "upper":
+            assert np.all(bare[:, 2] > 1.0)
+        elif link == "base":
+            assert np.all((bare[:, 2] > 0.8) & (np.hypot(bare[:, 0], bare[:, 1]) < 0.77))
+        else:
+            assert len(bare) == 0

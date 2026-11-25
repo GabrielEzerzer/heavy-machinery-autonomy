@@ -75,7 +75,7 @@ def _boom_pieces() -> dict[str, list]:
 def _upper_pieces() -> dict[str, list]:
     return {
         "rear": box((-BIG, -BIG, -BIG), (-0.72, BIG, 1.0)),
-        "cab": box((-0.72, 0.21, 0.0), (BIG, 1.3, 1.8)),
+        "cab": box((-0.72, 0.21, -BIG), (BIG, 1.3, 1.8)),
         "roof_guard": box((-0.72, 0.21, 1.8), (BIG, 1.3, 2.27)),
         "right": box((-0.72, -BIG, 0.07), (0.15, -0.54, 1.0)),
         "deck_right": box((-0.72, -BIG, -BIG), (BIG, -0.555, 0.07)),
@@ -83,6 +83,8 @@ def _upper_pieces() -> dict[str, list]:
         "step_box": box((0.15, -BIG, 0.07), (0.66, -0.54, 0.45)),
         "step_front_outer": box((0.66, -BIG, 0.07), (BIG, -0.9, 0.45)),
         "step_front_inner": box((0.66, -0.9, 0.07), (BIG, -0.54, 0.45)),
+        "right_front": box((0.15, -BIG, 0.45), (BIG, -0.54, 1.0)),
+        "turret": box((-0.72, -0.54, 0.07), (BIG, 0.21, 1.0)),
     }
 
 
@@ -144,7 +146,7 @@ def _region_edges(region: list) -> list[tuple[np.ndarray, np.ndarray]]:
     return edges
 
 
-def _segment_triangle_hits(p: np.ndarray, q: np.ndarray, tri: np.ndarray) -> np.ndarray:
+def segment_hits(p: np.ndarray, q: np.ndarray, tri: np.ndarray) -> np.ndarray:
     d = q - p
     e1, e2 = tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]
     h = np.cross(d, e2)
@@ -172,7 +174,7 @@ def clipped_points(tri: np.ndarray, region: list) -> np.ndarray:
         hit = starts[cross] + t[:, None] * (ends[cross] - starts[cross])
         points.append(hit[_inside(hit, region)])
     for p, q in _region_edges(region):
-        points.append(_segment_triangle_hits(p, q, tri))
+        points.append(segment_hits(p, q, tri))
     return np.unique(np.vstack(points).round(9), axis=0)
 
 

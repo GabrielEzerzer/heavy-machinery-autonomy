@@ -94,7 +94,7 @@ def dress_after_heightfields(scene: mujoco.MjSpec, footprints: list[tuple[float,
     vis.global_.offwidth, vis.global_.offheight = 1280, 720
     vis.quality.shadowsize = 8192 if len(swing_axes) == 1 else 4096
     vis.quality.offsamples = 4
-    vis.map.shadowclip = reach / extent
+    vis.map.shadowclip = float(np.nextafter(np.float32(reach / extent), np.float32(np.inf)))
     vis.map.haze = 0.4
     vis.map.fogstart, vis.map.fogend = FOG_START / extent, FOG_END / extent
     vis.map.znear, vis.map.zfar = NEAR / extent, FAR / extent

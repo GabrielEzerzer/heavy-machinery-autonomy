@@ -23,6 +23,7 @@ from hma.machine import (
     HOME_KEY,
     JOINT_NAMES,
     VALVE,
+    WELD,
     load_scene,
     machine_prefix,
     tendon_friction,
@@ -116,6 +117,13 @@ class Hydraulics:
         self._own_joints = [[j for j in range(model.njnt)
                              if model.joint(j).name.startswith(machine_prefix(i))]
                             for i in range(self.n)]
+        self._own_bodies = [[b for b in range(model.nbody)
+                             if model.body(b).name.startswith(machine_prefix(i))]
+                            for i in range(self.n)]
+        self._own_equalities = [[e for e in range(model.neq)
+                                 if model.equality(e).name.startswith(machine_prefix(i))
+                                 and model.equality(e).name != machine_prefix(i) + WELD]
+                                for i in range(self.n)]
         reference = load_scene(1, weld=True)
         nominal_ids = [reference.body(machine_prefix(0) + b).id for b in BODY_NAMES]
         self._nominal_bodies = [_body_solid(reference, b) for b in nominal_ids]
@@ -277,7 +285,9 @@ class Hydraulics:
             data.qvel[v0:v0 + nv] = 0.0
             data.qacc_warmstart[v0:v0 + nv] = 0.0
             data.qfrc_applied[v0:v0 + nv] = 0.0
-        data.xfrc_applied[self._bodies[index]] = 0.0
+        data.xfrc_applied[self._own_bodies[index]] = 0.0
+        own = self._own_equalities[index]
+        data.eq_active[own] = model.eq_active0[own]
         if pose is not None:
             data.qpos[self._qpos[index]] = pose
         data.ctrl[self._actuators[index]] = 0.0
