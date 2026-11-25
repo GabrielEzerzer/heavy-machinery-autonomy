@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from hma.task import DEMO_SCENE, StandInArm
+from hma.task import DEMO_SCENE, MachineArm
 
 MOCK = Path(__file__).resolve().parents[1] / "mock" / "model_outputs"
 
@@ -41,4 +41,4 @@ def scene():
 
 @pytest.fixture
 def arm():
-    return StandInArm()
+    return MachineArm()
