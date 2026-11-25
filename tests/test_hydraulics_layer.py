@@ -535,3 +535,14 @@ def test_free_air_motion_never_reaches_the_power_limit():
             assert np.array_equal(*runs)
     assert np.array_equal(steady_speeds(NOMINAL, [0, -1, 1, 1]),
                           steady_speeds(unlimited, [0, -1, 1, 1]))
+
+
+def test_curve_gain_applies_before_the_drawn_speed_limit_clips():
+    limits = only("limits")
+    top = limits.speed_limit[BUCKET]
+    weak = replace(limits, gain=np.array([1.0, 1.0, 1.0, 0.92]))
+    strong = replace(limits, gain=np.array([1.0, 1.0, 1.0, 1.08]))
+    assert steady_speeds(weak, [0, 0, 0, 1.0])[BUCKET] == pytest.approx(0.92 * top, rel=2e-3)
+    for command in (0.95, 1.0):
+        assert steady_speeds(strong, [0, 0, 0, command])[BUCKET] == pytest.approx(top, rel=2e-3)
+    assert steady_speeds(strong, [0, 0, 0, 0.9])[BUCKET] == pytest.approx(0.972 * top, rel=2e-3)

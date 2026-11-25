@@ -13,7 +13,7 @@ from hma.hydraulics.params import NOMINAL, NOMINAL_SPEEDS
 from hma.machine import JOINT_NAMES, inverse_kinematics
 from hma.machine.model import VALVE_GAIN, VALVE_INERTIA
 
-CONTROLLER_GAIN = 1.0
+CONTROLLER_GAIN = 0.25
 CONTROLLER_LEAD = float(NOMINAL.delay[0] + NOMINAL.lag[0]) + VALVE_INERTIA / VALVE_GAIN
 
 

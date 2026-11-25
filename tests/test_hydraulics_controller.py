@@ -4,11 +4,51 @@ import mujoco
 import numpy as np
 import pytest
 
-from hma.hydraulics import NOMINAL, RANGES, BaseController, Circle, Hydraulics, StraightLine
+from hma.hydraulics import (
+    NOISE,
+    NOMINAL,
+    RANGES,
+    BaseController,
+    Circle,
+    Hydraulics,
+    StraightLine,
+    draw_machine,
+)
 from hma.machine import forward_kinematics, load_scene
 
 LINE = StraightLine((5.0, -1.5, 0.5), (6.5, 1.0, -0.5), 1.4, 4.0)
 CIRCLE = Circle((5.5, 0.0, 0.0), 0.6, 1.4, 7.0)
+
+
+def steepest_curve():
+    low, high = RANGES["curve_weight"]
+    weights = np.array([high, low, low, low])
+    return np.tile(np.concatenate([[0.0], np.cumsum(weights) / weights.sum()]), (4, 1))
+
+
+def worst_corner(deadband):
+    top = {name: RANGES[name][1] for name in RANGES}
+    return replace(NOMINAL, delay=np.full(4, top["delay"]), lag=np.full(4, top["lag"]),
+                   sensor_latency=top["sensor_latency"], gain=np.full(4, top["gain"]),
+                   speed_limit=NOMINAL.speed_limit * top["speed_limit"], curve=steepest_curve(),
+                   deadband=np.full(4, deadband), backlash=np.full(4, top["backlash"]),
+                   position_noise=NOISE["position"], velocity_noise=NOISE["velocity"],
+                   load_noise=NOISE["load"], seed=4242)
+
+
+def late_swing(machine, hold):
+    model = load_scene(1, weld=True)
+    data = mujoco.MjData(model)
+    controller = BaseController(LINE, 10.0)
+    layer = Hydraulics(model, data, [machine])
+    layer.reset(0, machine, pose=controller.reference(0.0))
+    tips = []
+    for _ in range(round((LINE.duration + hold) * 10)):
+        layer.act(controller(data.time, layer.observe().positions[0])[None])
+        for _ in range(layer.steps_per_decision):
+            layer.step()
+        tips.append(forward_kinematics(layer.true_state().positions[0])[0])
+    return np.ptp(np.array(tips[-20:]), axis=0).max()
 
 
 def tip_errors(path, machine, control_hz, hold=0.5):
@@ -42,6 +82,16 @@ def test_base_controller_settles_on_the_slowest_machine_in_range():
                       lag=np.full(4, RANGES["lag"][1]))
     errors = tip_errors(LINE, slowest, 10.0, hold=10.0)
     assert errors[-200:].max() < 0.1 * errors.max()
+
+
+@pytest.mark.parametrize(("deadband", "hold"), [(0.0, 30.0), (RANGES["deadband"][1], 10.0)])
+def test_base_controller_stops_swinging_on_the_worst_corner_of_every_range(deadband, hold):
+    assert late_swing(worst_corner(deadband), hold) < 0.03
+
+
+def test_base_controller_settles_on_drawn_machines_that_swing_at_a_higher_gain():
+    for seed in (158, 174, 143, 247, 124):
+        assert late_swing(draw_machine(seed), hold=10.0) < 0.02
 
 
 def test_nominal_machine_tracks_a_circle_within_centimetres():
