@@ -30,6 +30,7 @@ JOINTS = {
     "bucket_joint": "bucket",
 }
 TIP_JOINT = "bucket_end_joint"
+EDGE_BAND = 0.05
 COLORS = {
     "crawler": "0.18 0.18 0.19 1",
     "body": "0.93 0.62 0.12 1",
@@ -209,7 +210,17 @@ def build_mjcf(urdf: ET.Element, meshes: dict[str, tuple[np.ndarray, np.ndarray]
     xyz, rot = origin(tip.find("origin"))
     ET.SubElement(parent, "site", name="bucket_tip", pos=fmt(xyz), quat=fmt(matrix_quat(rot)),
                   size="0.04", rgba="1 0 0 1", group="2")
+    for name, end in zip(("bucket_edge_right", "bucket_edge_left"),
+                         cutting_edge_ends(meshes["bucket_link"][0], xyz), strict=True):
+        ET.SubElement(parent, "site", name=name, pos=fmt(end), quat=fmt(matrix_quat(rot)),
+                      size="0.03", rgba="1 0 0 1", group="2")
     return root
+
+
+def cutting_edge_ends(bucket: np.ndarray, tip: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    along = tip / np.linalg.norm(tip)
+    near_edge = bucket[bucket @ along >= np.linalg.norm(tip) - EDGE_BAND]
+    return (tip + [0.0, near_edge[:, 1].min(), 0.0], tip + [0.0, near_edge[:, 1].max(), 0.0])
 
 
 def convert(source: Path) -> None:

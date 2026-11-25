@@ -16,6 +16,8 @@ JOINT_NAMES = ("swing", "boom", "arm", "bucket")
 BODY_NAMES = ("base", "upper", "boom", "arm", "bucket")
 BASE_JOINT = "base_free"
 TIP_SITE = "bucket_tip"
+EDGE_SITES = ("bucket_edge_right", "bucket_edge_left")
+SOIL_AXES = ("soil_0", "soil_1", "soil_2")
 TRACK_FEET = "track_"
 ANCHOR = "anchor"
 WELD = "base_weld"
@@ -42,6 +44,7 @@ MACHINE_SPACING = 14.0
 MAX_MACHINES = 31
 
 TIMESTEP = 0.005
+SOLVER_TOLERANCE = 1e-12
 
 
 def machine_prefix(index: int) -> str:
@@ -91,6 +94,12 @@ def _machine_spec(index: int, weld: bool) -> mujoco.MjSpec:
         act.set_to_velocity(kv=VALVE_GAIN)
         act.ctrllimited = mujoco.mjtLimited.mjLIMITED_TRUE
         act.ctrlrange = [-SPEED_LIMITS[name], SPEED_LIMITS[name]]
+    for name in SOIL_AXES:
+        spec.worldbody.add_body(name=name, mocap=True).add_site(name=name)
+        soil = spec.add_tendon(name=name, frictionloss=0.0, solref_friction=[2 * TIMESTEP, 1.0],
+                               solimp_friction=[*VALVE_SOLIMP, 0.5, 2.0])
+        soil.wrap_site(name)
+        soil.wrap_site(TIP_SITE)
     return spec
 
 
@@ -116,6 +125,7 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
     scene.meshdir = str(ASSETS)
     scene.option.timestep = TIMESTEP
     scene.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+    scene.option.tolerance = SOLVER_TOLERANCE
     scene.visual.global_.offwidth = 1280
     scene.visual.global_.offheight = 720
     scene.visual.quality.shadowsize = 4096
