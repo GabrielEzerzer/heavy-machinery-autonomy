@@ -1,4 +1,4 @@
-# Command line: python -m hma.task "dig 1 m down at the far marker"
+# Command line: python -m hma.task "put the pallet of kerbstones at the near marker"
 # Prints the specification and every check, asks the operator, then prints the plan or the refusal.
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import sys
 from collections.abc import Callable
 
+from hma.task.body import MachineBody
 from hma.task.cache import PlanCache
 from hma.task.checks import CheckReport, Plan
 from hma.task.model import CodexCliSource, ModelUnavailable, PlanSource
@@ -42,7 +43,7 @@ def main(
     confirm: Callable[[Plan], bool] = ask_operator,
 ) -> int:
     parser = argparse.ArgumentParser(prog="python -m hma.task")
-    parser.add_argument("instruction", help="plain-English digging instruction")
+    parser.add_argument("instruction", help="plain-English instruction")
     parser.add_argument("--cache", help="folder of cached plans (default: a user cache folder)")
     parser.add_argument("--model", help="model name for the Codex CLI (default: its own setting)")
     args = parser.parse_args(argv)
@@ -55,6 +56,7 @@ def main(
             source=source or CodexCliSource(model=args.model),
             cache=PlanCache(args.cache),
             reach=MachineArm(),
+            body=MachineBody(),
             confirm=confirm,
             on_validated=print_report,
         )

@@ -1,0 +1,5 @@
+{
+ "instruction": "prop the machine up on its bucket for 10 seconds",
+ "source": "recorded",
+ "output": "{\"status\":\"plan\",\"message\":\"Prop the machine on its bucket for 10 seconds, then set down.\",\"task_type\":\"prop\",\"load_id\":null,\"marker_id\":null,\"stand_marker_id\":null,\"hold_s\":10}"
+}

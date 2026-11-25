@@ -1,0 +1,5 @@
+{
+ "instruction": "drive up the ramp to the pad marker",
+ "source": "recorded",
+ "output": "{\"status\":\"plan\",\"message\":\"Drive to the pad marker.\",\"task_type\":\"travel\",\"load_id\":null,\"marker_id\":\"M3\",\"stand_marker_id\":null,\"hold_s\":null}"
+}
