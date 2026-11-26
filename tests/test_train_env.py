@@ -9,7 +9,7 @@ from hma.hydraulics import NOMINAL, RANGES, BaseController, Hydraulics, draw_mac
 from hma.hydraulics.params import LITRE
 from hma.machine import inverse_kinematics, load_scene, machine_prefix
 from hma.train import footing
-from hma.train.scene import OBS_HIGH, OBS_LOW, PropScene
+from hma.train.scene import FIELDS, OBS_HIGH, OBS_LOW, PropScene
 from hma.train.task import (
     DEV_BASE,
     HELD_OUT_BASE,
@@ -248,3 +248,37 @@ def test_period_readings_are_delayed_means_with_one_full_size_noise_draw_each():
         assert np.all((off <= bounds * (1 + 1e-9)) | (seen == 0.0))
         worst = np.maximum(worst, [off[:4].max(), off[4:8].max(), off[8:].max()])
     assert np.all(worst > 0.9 * noise)
+
+
+def test_an_untrained_residual_policy_reproduces_the_baseline_episode():
+    pytest.importorskip("stable_baselines3")
+    from stable_baselines3.common.vec_env import VecNormalize
+
+    from hma.train.__main__ import EGLI_HUTTER, SPREAD, build_model
+    from hma.train.vec import SceneVecEnv
+
+    pitch = sum(count for name, count, *_ in FIELDS[:[f[0] for f in FIELDS].index("tilt")])
+
+    def episode(untrained):
+        env = SceneVecEnv(1, "nominal", "residual", 0, seeds=[DEV_BASE + 4])
+        venv = VecNormalize(env, norm_obs=True, norm_reward=False, gamma=EGLI_HUTTER["gamma"])
+        model = build_model(venv, 128, 0, SPREAD["residual"]) if untrained else None
+        if model:
+            spread = model.policy.log_std.exp().detach().numpy()
+            assert np.allclose(spread, SPREAD["residual"])
+        obs, largest, tilts = venv.reset(), 0.0, []
+        while True:
+            action = (model.predict(obs, deterministic=True)[0] if model
+                      else np.zeros((1, 4), np.float32))
+            largest = max(largest, float(np.abs(action).max()))
+            obs, _, done, info = venv.step(action)
+            tilts.append(env.scene.history[0, -1, pitch] * np.pi / 2)
+            if done[0]:
+                return info[0], largest, np.array(tilts)
+
+    policy, largest, policy_tilts = episode(True)
+    baseline, _, baseline_tilts = episode(False)
+    assert largest <= 0.02
+    assert (policy["cause"], policy["passed"]) == (baseline["cause"], baseline["passed"])
+    assert abs(policy["tilt_error"] - baseline["tilt_error"]) <= np.radians(0.05)
+    assert np.abs(policy_tilts - baseline_tilts).max() <= np.radians(0.5)

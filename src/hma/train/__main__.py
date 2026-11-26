@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import pickle
 import time
 from pathlib import Path
@@ -18,6 +19,8 @@ from hma.train.task import RUNGS, dev_seeds
 REPO = Path(__file__).resolve().parents[3]
 EGLI_HUTTER = {"gamma": 0.97, "learning_rate": 1e-3, "n_epochs": 10}
 NET = [128, 128]
+MINI_BATCHES = 4
+SPREAD = {"residual": 0.02, "direct": 1.0}
 SMOKE = {"procs": 2, "machines": 2, "n_steps": 16, "steps": 256, "dev_size": 4, "seconds": 2.0}
 
 
@@ -38,13 +41,16 @@ def _curve_callback(out: Path, seconds: float | None, every: int, save):
             self.start = time.perf_counter()
             self.finished: list[dict] = []
             self.rollouts = 0
+            self.collect = 0.0
+            self.mark = self.start
             path = out / "curve.csv"
             fresh = not path.exists()
             self.file = open(path, "a", newline="", encoding="utf-8")
             self.writer = csv.writer(self.file)
             if fresh:
                 self.writer.writerow(["timesteps", "seconds", "episodes", "mean_return",
-                                      "pass_rate", "tilt_error_deg", "early_end_share"])
+                                      "pass_rate", "tilt_error_deg", "early_end_share",
+                                      "collect_share"])
 
         def _on_step(self) -> bool:
             for info in self.locals["infos"]:
@@ -52,8 +58,13 @@ def _curve_callback(out: Path, seconds: float | None, every: int, save):
                     self.finished.append(info)
             return seconds is None or time.perf_counter() - self.start < seconds
 
+        def _on_rollout_start(self) -> None:
+            self.mark = time.perf_counter()
+
         def _on_rollout_end(self) -> None:
             self.rollouts += 1
+            now = time.perf_counter()
+            self.collect += now - self.mark
             done = self.finished
             if done:
                 self.writer.writerow([
@@ -61,7 +72,8 @@ def _curve_callback(out: Path, seconds: float | None, every: int, save):
                     float(np.mean([d["episode"]["r"] for d in done])),
                     float(np.mean([d["passed"] for d in done])),
                     float(np.degrees(np.mean([d["tilt_error"] for d in done]))),
-                    float(np.mean([d["cause"] is not None for d in done]))])
+                    float(np.mean([d["cause"] is not None for d in done])),
+                    round(self.collect / (now - self.start), 3)])
                 self.file.flush()
             self.finished = []
             if every and self.rollouts % every == 0:
@@ -71,6 +83,16 @@ def _curve_callback(out: Path, seconds: float | None, every: int, save):
             self.file.close()
 
     return Curve()
+
+
+def build_model(venv, n_steps: int, seed: int, spread: float):
+    from stable_baselines3 import PPO
+
+    batch = max(venv.num_envs * n_steps // MINI_BATCHES, 8)
+    return PPO("MlpPolicy", venv, n_steps=n_steps, batch_size=batch,
+               policy_kwargs={"net_arch": {"pi": NET, "vf": NET},
+                              "log_std_init": math.log(spread)},
+               seed=seed, device="cpu", verbose=0, **EGLI_HUTTER)
 
 
 def train(args) -> None:
@@ -86,8 +108,10 @@ def train(args) -> None:
     resume = args.resume and (checkpoint / "model.zip").exists()
     if resume:
         config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
-        for key in ("rung", "mode", "procs", "machines", "seed"):
-            setattr(args, key, config[key])
+        for key in ("rung", "mode", "procs", "machines", "seed", "spread"):
+            setattr(args, key, config.get(key))
+    if args.spread is None:
+        args.spread = SPREAD[args.mode]
     envs = ProcVecEnv(args.procs, args.machines, args.rung, args.mode, args.seed)
     print(f"workers: {envs.pids}", flush=True)
     try:
@@ -104,10 +128,7 @@ def train(args) -> None:
         else:
             venv = VecNormalize(envs, norm_obs=True, norm_reward=False,
                                 gamma=EGLI_HUTTER["gamma"])
-            batch = max(envs.num_envs * args.n_steps // 4, 8)
-            model = PPO("MlpPolicy", venv, n_steps=args.n_steps, batch_size=batch,
-                        policy_kwargs={"net_arch": {"pi": NET, "vf": NET}}, seed=args.seed,
-                        device="cpu", verbose=0, **EGLI_HUTTER)
+            model = build_model(venv, args.n_steps, args.seed, args.spread)
 
         def save() -> None:
             checkpoint.mkdir(exist_ok=True)
@@ -118,7 +139,7 @@ def train(args) -> None:
                 pickle.dump(envs.snapshot(), f)
             (checkpoint / "config.json").write_text(json.dumps(
                 {"rung": args.rung, "mode": args.mode, "procs": args.procs,
-                 "machines": args.machines, "seed": args.seed,
+                 "machines": args.machines, "seed": args.seed, "spread": args.spread,
                  "timesteps": int(model.num_timesteps)}), encoding="utf-8")
 
         seconds = args.minutes * 60.0 if args.minutes else None
@@ -176,6 +197,9 @@ def main(argv: list[str] | None = None) -> None:
     train_args.add_argument("--n-steps", type=int, default=128, help="rollout length per machine")
     train_args.add_argument("--minutes", type=float, default=None, help="stop after this time")
     train_args.add_argument("--every", type=int, default=10, help="checkpoint every N rollouts")
+    train_args.add_argument("--spread", type=float, default=None,
+                            help="starting action spread (default per mode: "
+                                 f"{SPREAD['residual']} residual, {SPREAD['direct']} direct)")
     train_args.add_argument("--seed", type=int, default=0)
     train_args.add_argument("--resume", action="store_true", help="continue from --out")
     score_args = commands.choices["score"]

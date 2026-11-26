@@ -379,7 +379,7 @@ Resetting one machine leaves every other machine's trajectory unchanged to the b
 - The hydraulics layer computes its network products over all machines and then picks the rows it needs. Its arithmetic therefore does not depend on how many machines take a correction at once.
 - The scene switches off the solver's warm start (`mjDSBL_WARMSTART`). MuJoCo decides whether to warm-start once for the whole scene ([computation docs](https://mujoco.readthedocs.io/en/stable/computation/index.html)).
 
-Switching off the warm start is a solver setting, not physics. On three baseline episodes it changed the tilt by under 1e-4°, and every outcome stayed the same. It costs about 24% of throughput with eight machines: 92 against 122 control steps per second.
+The warm start stays off: machines in one scene that are independent to the bit are worth more than the throughput. It is a solver setting, not physics. On three baseline episodes it changed the tilt by under 1e-4°, and every outcome stayed the same. It costs about 24% of throughput with eight machines: 92 against 122 control steps per second. It does not push the solver to its iteration limit. Over three baseline episodes each on the nominal machine and on a stiffest corner (about 14,000 physics steps per case), no step stopped at the limit of 100 iterations, with the warm start off or on. With it off, a step took 4.4 to 5.5 iterations on average and at most 33; with it on, 1.7 to 2.6 on average and at most 35.
 
 **Decisions and timing.** The controller decides 10 times a second, and each decision is held for 20 physics steps of 5 ms. An episode runs in five phases:
 
@@ -504,11 +504,25 @@ Training uses PPO from Stable-Baselines3, with these settings:
 
 - two hidden layers of 128 for both the policy and the value function;
 - observation normalisation;
+- a starting action spread (the standard deviation of the policy's sampled actions) of 0.02 in `residual` mode and 1.0 in `direct` mode, set with `--spread`;
 - one maths thread per process and one scene per worker process.
 
 It checkpoints the model, the normalisation statistics and every scene's snapshot, so a resume carries on in the middle of the same episodes.
 
-Three starting settings, γ = 0.97, learning rate 1e-3 and 10 epochs, are attributed to [Egli and Hutter][eh] (also [arXiv 2106.07369](https://arxiv.org/abs/2106.07369)). They have not been checked against the paper's text. Everything else is a Stable-Baselines3 default or a choice made here, including the rollout length (128 decisions per machine) and the batch (a quarter of the rollout).
+An untrained policy in `residual` mode should behave like the baseline it adds to. Its mean action starts within 0.02 of zero. Its sampled actions, though, add noise to every valve command, and the pass mark is sensitive to that noise. Here is an untrained policy sampled as in training, on the 64 development seeds of the nominal rung:
+
+| Starting spread | Pass | Mean tilt error | Early ends |
+|---|---|---|---|
+| baseline alone | 66% | 1.51° | 0 |
+| 1.0 (the Stable-Baselines3 default) | 0% | 5.54° | 0 |
+| 0.3 | 0% | 4.28° | 0 |
+| 0.1 | 19% | 2.24° | 0 |
+| 0.05 | 53% | 1.75° | 0 |
+| 0.02 | 62% | 1.58° | 0 |
+
+The default of 0.02 is the largest spread tried that stays within one sampling error (about 6 points on 64 episodes) of the baseline. The suite checks the untrained policy's deterministic episode against the baseline's when Stable-Baselines3 is installed.
+
+Three settings, γ = 0.97, learning rate 0.001 and 10 optimisation epochs, are from Table III of [Egli and Hutter][eh] (page 5), which trains a tracking policy for an excavator arm with PPO. Several other settings in that table match a Stable-Baselines3 default or a choice made here: hidden layers of 128 × 128 with tanh for both networks, 4 mini-batches per update, GAE λ 0.95, clip range 0.2, value coefficient 0.5, gradient norm limit 0.5 and no entropy bonus. The paper's batch of 39k samples, 2 s episodes and 6.7 Hz control are not used. The rollout length (128 decisions per machine) and the starting action spread are choices made here.
 
 Scoring runs the baseline over the development seeds, and the checkpoint too if one is given. It writes one row per episode (`.csv`) and a table (`.md`) with the pass rate, the mean tilt error and the early ends by cause, overall and by thirds of each drawn parameter.
 
