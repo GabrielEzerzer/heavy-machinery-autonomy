@@ -838,7 +838,9 @@ class Hydraulics:
     def observe_mean(self) -> Observation:
         ends = self._clean_head - self._latency_steps
         steps = (ends[None, :] - np.arange(self.steps_per_decision)[:, None]) % self._clean_len
-        rows = self._clean[steps, :, self._machine_index].mean(axis=0)
+        samples = self._clean[steps, :, self._machine_index]
+        np.maximum(samples[:, :, 2:], 0.0, out=samples[:, :, 2:])
+        rows = samples.mean(axis=0)
         rows += self._mean_noise * np.moveaxis(self._noise, 0, 1)
         np.maximum(rows[:, 2:], 0.0, out=rows[:, 2:])
         return Observation(rows[:, 0], rows[:, 1], np.stack([rows[:, 2], rows[:, 3]], axis=-1))

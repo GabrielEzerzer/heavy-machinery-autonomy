@@ -350,7 +350,7 @@ The gain is set by the corner where every range is at its worst at once: 0.6 s d
 
 1. The machine: `draw_machine(seed)` on rungs 2 and 3, `NOMINAL` on rung 1. This uses stream `(seed, 0)`; the layer's per-step noise uses `(seed, 1)` and its per-decision noise `(seed, 5)`.
 2. The ground and the steel friction: `draw_ground(seed)` on rung 3, from stream `(seed, 3, 0)`, with friction from `draw_friction` on stream `(seed, 2)`. Other rungs get flat ground and the nominal friction of 0.5.
-3. The task, from stream `(seed, 10, attempt)`: target tilt, ramp and hold times, where the tip goes down, its start height above the ground there, and the bucket pitch. The attempt counts up until the baseline's path is within reach at every 0.05 s of the episode.
+3. The task, from stream `(seed, 10, attempt)`: target tilt, ramp and hold times, where the tip goes down, its start height above the ground there, and the bucket pitch. The attempt counts up until the tip's path is within reach at every 0.05 s of the episode twice over: as the baseline plans it on level ground, and pressing at the drawn ground height under the tip.
 4. The start pose: inverse kinematics of that path at time zero.
 5. The IMU's biases, then its noise draws, from stream `(seed, 11)`.
 
@@ -371,13 +371,13 @@ A checkpoint (`PropScene.snapshot`) holds:
 - the layer's arrays and random states (`Hydraulics.snapshot`);
 - the scene's per-machine arrays and IMU random states.
 
-A restore redoes every machine's writes from its seed, then sets the state and arrays. The replay that follows matches the original bit for bit.
+A restore redoes every machine's writes from its seed, then sets the state and arrays. The replay that follows matches the original bit for bit. MuJoCo's warning counters are not part of that state; the scene clears them at the start of every decision and reads them after every physics step, so a restore never inherits a count.
 
 Resetting one machine leaves every other machine's trajectory unchanged to the bit. Three things make this hold:
 
 - MuJoCo's constraint islands are on by default and give each machine its own solve.
 - The hydraulics layer computes its network products over all machines and then picks the rows it needs. Its arithmetic therefore does not depend on how many machines take a correction at once.
-- The scene switches off the solver's warm start (`mjDSBL_WARMSTART`). MuJoCo decides whether to warm-start once for the whole scene ([computation docs](https://mujoco.readthedocs.io/en/stable/computation/index.html)).
+- The scene switches off the solver's warm start (`mjDSBL_WARMSTART`). MuJoCo decides whether to warm-start once for the whole scene, before the islands are solved: `warmstart()` compares the cost of the warm-start acceleration with that of the unconstrained acceleration over all degrees of freedom and keeps one for every island ([`engine_forward.c`, MuJoCo 4.0.1, lines 1077 to 1136][mj-warmstart]).
 
 The warm start stays off: machines in one scene that are independent to the bit are worth more than the throughput. It is a solver setting, not physics. On three baseline episodes it changed the tilt by under 1e-4°, and every outcome stayed the same. It costs about 24% of throughput with eight machines: 92 against 122 control steps per second. It does not push the solver to its iteration limit. Over three baseline episodes each on the nominal machine and on a stiffest corner (about 14,000 physics steps per case), no step stopped at the limit of 100 iterations, with the warm start off or on. With it off, a step took 4.4 to 5.5 iterations on average and at most 33; with it on, 1.7 to 2.6 on average and at most 35.
 
@@ -395,19 +395,30 @@ The controller sees the reference now, 0.5 s ahead and 1.0 s ahead.
 
 | Values | Sensor and where it sits | Source |
 |---|---|---|
-| 4 joint angles (swing, boom, arm, bucket) | an encoder on the swing axis; an IMU or inclinometer on each of the boom, arm and bucket links | joint angles from IMUs on each link in [HEAP][heap]; swing encoder unverified |
+| 4 joint angles (swing, boom, arm, bucket) | a draw-wire encoder on each boom, arm and bucket cylinder; a gear-tooth sensor on the swing ring | [HEAP][heap] |
 | 4 joint speeds | the same sensors | [HEAP][heap] |
 | 8 chamber pressures (two per cylinder, two swing motor ports) | a pressure transducer on each port | pressure sensors on the actuators in [HEAP][heap] |
 | 3 angular rates, 3 specific forces | an IMU on the upper structure, at its origin on the swing axis | cabin and chassis IMUs in [HEAP][heap] |
-| undercarriage pitch and roll since the start | estimated from that IMU and the measured swing angle | roll and pitch to 0.1° from an AHRS of the [Ellipse-A][sbg] class; 0.2° for the [MTi-630][xsens] |
+| undercarriage pitch and roll since the start | estimated from that IMU and the measured swing angle | roll and pitch to 0.4° under typical dynamics (0.1° static) for an AHRS of the [Ellipse-A][sbg] class, RMS not stated; 0.5° RMS dynamic (0.2° static) for the [MTi-630][xsens] (datasheet MT1603P, Table 3) |
 | 4 commands sent at the last decision | the controller's own output | none needed |
 | 3 reference tilts (now, +0.5 s, +1.0 s) | the task | none needed |
 
+HEAP measures its arm joints two ways: draw-wire encoders on the cylinders (Sick BCG05), which it uses for control because they read accurately and without delay, and IMUs on the links, which it uses for the bucket's pose. The encoders report at 100 Hz over CAN. The swing angle comes from inductive sensors on the slewing ring's gear teeth, at 0.92° resolution, fused with the cabin and chassis IMUs ([HEAP][heap], section on sensing). The encoder fits the joint readings here. Against it the drawn joint noise (±0.02 rad, after [Egli and Hutter][eh]) and sensor latency (up to 0.2 s) are conservative: HEAP's encoders deliver a reading every 10 ms.
+
 Each reading is an average over the 20 physics steps of a decision:
 
-- **Joint angles, speeds and pressures** come from `Hydraulics.observe_mean`. Each is the mean of the true readings over the 20 steps that ended one sensor latency ago, plus the drawn pressure offset, plus one uniform noise draw per reading. The draw is at the full stated size (±0.02 rad, ±0.05 rad/s, ±0.1 MPa), not that size divided by √20. Pressures are clipped at zero.
+- **Joint angles, speeds and pressures** come from `Hydraulics.observe_mean`. Each is the mean of the true readings over the 20 steps that ended one sensor latency ago, plus the drawn pressure offset, plus one uniform noise draw per reading. The draw is at the full stated size (±0.02 rad, ±0.05 rad/s, ±0.1 MPa), not that size divided by √20. Each pressure sample is clipped at zero before the mean, and the mean is clipped again after the noise.
 - **Rates and specific forces** are the means of the per-step body values, plus a bias drawn per episode (±0.2 °/s, ±0.05 m/s²) and one noise draw per reading (±0.1 °/s, ±0.05 m/s²).
-- **The tilt** comes from a complementary filter on the IMU's biased signals, with a 2 s time constant, started converged. One draw of ±0.1° is added per reading.
+- **The tilt** is this repository's own estimate, not a vendor's: a complementary filter with a 2 s time constant, started converged, on the simulated gyro and accelerometer signals with their biases, turned to the undercarriage by the measured swing angle. One uniform draw of ±0.87° is added per reading, which has the MTi-630's dynamic 0.5° RMS. The policy sees the tilt since the start: the first reading, draw included, is the zero, and its error stays for the whole episode. That frozen offset is intended. It stands for the error of zeroing the reference when the machine starts, which a real controller also carries.
+
+The filter's own error, against the true tilt, on the `machines` rung:
+
+| Motion | Pitch error RMS | Pitch error max | Roll error RMS | Roll error max |
+|---|---|---|---|---|
+| baseline, 16 development seeds, whole episodes | 0.28° | 0.82° | 0.23° | 0.44° |
+| a fast lowering: the boom driven fully down at mid-hold, the front falling from 17° to 0° at up to 44°/s | 1.83° | 2.62° | 0.04° | 0.08° |
+
+In ordinary motion the per-reading draw (0.5° RMS) is the larger error; it is white and the policy can average it over its 15 frames. In a fast lowering the filter's error is the larger: the accelerometer reads the machine's own acceleration and the landing jolt as tilt, so the estimate lags and is off by up to 2.6° just when the front comes down. A controller that leans on the tilt reading through fast motion will act on a wrong tilt; there it has to lean on the gyro rates and the joint readings.
 
 Rung 1 has no IMU noise or bias, just as the nominal machine has no noise or latency on its other sensors. The IMU sizes are assumed. They sit well above the datasheets' in-run gyro bias (7 to 8 °/h, about 0.002 °/s) and stand for a lower-grade unit.
 
@@ -441,25 +452,31 @@ where:
 - roll is the mean absolute roll since the start, over 5°, capped at 1;
 - slide is the tip's horizontal travel while the bucket touches the ground in consecutive steps, over 0.05 m, capped at 1.
 
-Every term lies in [0, 1], so r lies in [0.01, 1]. The decision on which an episode ends early earns 0 and nothing follows it, so ending early never pays more than going on. The reward uses the true tilt, which only training sees.
+Every term lies in [0, 1], so r lies in [0.01, 1]. The decision on which an episode ends early earns 0 and is terminal: nothing follows it, so ending early never pays more than going on. The end of the schedule is a time limit, not a terminal state: the environment reports it as truncated (`TimeLimit.truncated`) with the final observation, and Stable-Baselines3 then adds the discounted value of that observation to the last reward ([`on_policy_algorithm.py`, `collect_rollouts`][sb3-timeout]). Without that, the last decisions of every episode would look like the decisions before a failure. The reward uses the true tilt, which only training sees.
 
 **Early ends.** These are checked at every physics step and applied at the decision, and the cause is recorded. In order of precedence:
 
-1. `unstable`: a non-finite state, or MuJoCo's bad-acceleration warning (which resets the whole scene);
+1. `unstable`: a non-finite state of that machine, or a MuJoCo bad position, velocity or acceleration warning whose index points into that machine's joints;
 2. `contact`: the belly, the upper structure including the counterweight, the boom or the arm touches the ground;
-3. `tilt`: pitch beyond 35°;
-4. `roll`: roll beyond 10°.
+3. `strike`: the arm or the bucket touches the machine's own undercarriage, upper structure or boom;
+4. `tilt`: pitch beyond 35°;
+5. `roll`: roll beyond 10°.
 
-The end of the schedule is a terminal state, not a time limit.
+On a bad value MuJoCo resets the whole scene's state before going on and records the index of the first bad position or velocity in `lastinfo` (`mj_checkPos`, `mj_checkVel` and `mj_checkAcc` in [`engine_forward.c`][mj-check]). The scene charges only the machine that index belongs to. Every other machine in the scene was reset under it, so its episode is cut short: it ends as truncated, earns 0 on that decision, gives the last observation from before the failure, and is not failed. Scoring runs those seeds again.
+
+A `strike` cannot happen with the swing at zero: a scan of boom, arm and bucket over their joint ranges found no contact between the arm or bucket and the rest of the machine. With the upper structure turned, the bucket reaches the tracks: at a swing of −135° (boom −0.37, arm 2.50, bucket 0.52 rad) its teeth sit 9 cm into a track.
 
 **Pass mark.** The pass mark is separate from the reward. An episode passes when all of these hold:
 
 - it has no early end;
 - the true tilt stays within ±3° of the reference for at least 80% of the hold;
-- the front track edge lands at under 0.3 m/s whenever the front feet regain the ground;
-- the tilt is back within 1° at the end.
+- each of the four front track corners comes down at under 0.3 m/s: its downward speed just before each new contact with the ground, taken from the step before the contact acts;
+- the tilt is back within 1° at the end;
+- at the end, every front corner is within 0.01 m of the ground and moves at under 0.02 m/s.
 
-The 3° band is the reward's scale. It is fifteen times the AHRS accuracy above, so a real machine can measure it. The 80% allows for settling as the hold begins. The 0.3 m/s is an assumed bound, equal to a free fall of 4.6 mm. All of these are fields of `Settings`.
+The 3° band is the reward's scale. It is six times the AHRS's dynamic accuracy above, so a real machine can measure it. The 80% allows for settling as the hold begins. The 0.3 m/s, 0.01 m and 0.02 m/s are assumed bounds, not taken from a source; 0.3 m/s equals a free fall of 4.6 mm. All of these are fields of `Settings`.
+
+On the 64 development seeds of the `nominal` rung, the baseline's landing speeds measured this way have a median of 0.04 m/s, a 90th percentile of 0.18 m/s and a highest of 0.297 m/s, so none reaches the bound; the bound sits just above the nominal baseline's worst landing. On the `machines` rung the median is 0 (most drawn machines never lift the front), the 90th percentile 0.33 m/s and the highest 1.19 m/s, and 8 of 64 reach the bound. The speed of the track centreline taken after the contact had braked the machine, with one flag for all four corners, read 2.1 to 2.8 times lower on eight nominal seeds.
 
 **Rungs and draws.**
 
@@ -468,6 +485,8 @@ The 3° band is the reward's scale. It is fifteen times the AHRS accuracy above,
 | `nominal` | `NOMINAL` | flat | 0.5 |
 | `machines` | drawn | flat | 0.5 |
 | `ground` | drawn | a step of ±0.3 m at 2 m ahead of the swing axis, a grade of ±8° along and ±4° across | 0.30 to 0.70 |
+
+The `ground` rung on this branch is provisional, and its figures are not to be reported. The ground under and behind the tracks is a level pad, the drawn ground is one plane, and the baseline still puts its tip down at the pad's height whatever the drawn height under it. The port to the drawn ground module is [issue 68](../../issues/68).
 
 Every rung draws the same task ranges:
 
@@ -507,9 +526,9 @@ Training uses PPO from Stable-Baselines3, with these settings:
 - a starting action spread (the standard deviation of the policy's sampled actions) of 0.02 in `residual` mode and 1.0 in `direct` mode, set with `--spread`;
 - one maths thread per process and one scene per worker process.
 
-It checkpoints the model, the normalisation statistics and every scene's snapshot, so a resume carries on in the middle of the same episodes.
+It checkpoints the model, the normalisation statistics, every scene's snapshot and which machines start a new episode, so a resume carries on in the middle of the same episodes. A checkpoint is taken at the start of a rollout, after the update, so the saved policy is the one that collects next. It is written to `checkpoint.tmp` and renamed into place; the old one is kept as `checkpoint.old` until the rename is done, and a resume falls back to it. `--steps` is the total over the run and its resumes.
 
-An untrained policy in `residual` mode should behave like the baseline it adds to. Its mean action starts within 0.02 of zero. Its sampled actions, though, add noise to every valve command, and the pass mark is sensitive to that noise. Here is an untrained policy sampled as in training, on the 64 development seeds of the nominal rung:
+An untrained policy in `residual` mode should behave like the baseline it adds to. Its mean action starts within 0.02 of zero. Its sampled actions, though, add noise to every valve command, and the pass mark is sensitive to that noise. Here is an untrained policy sampled as in training, on the 64 development seeds of the nominal rung, measured under the pass mark before it gained the per-corner landing speed and the check that the front tracks end down and still (the baseline passes 62% under the current mark):
 
 | Starting spread | Pass | Mean tilt error | Early ends |
 |---|---|---|---|
@@ -522,9 +541,9 @@ An untrained policy in `residual` mode should behave like the baseline it adds t
 
 The default of 0.02 is the largest spread tried that stays within one sampling error (about 6 points on 64 episodes) of the baseline. The suite checks the untrained policy's deterministic episode against the baseline's when Stable-Baselines3 is installed.
 
-Three settings, γ = 0.97, learning rate 0.001 and 10 optimisation epochs, are from Table III of [Egli and Hutter][eh] (page 5), which trains a tracking policy for an excavator arm with PPO. Several other settings in that table match a Stable-Baselines3 default or a choice made here: hidden layers of 128 × 128 with tanh for both networks, 4 mini-batches per update, GAE λ 0.95, clip range 0.2, value coefficient 0.5, gradient norm limit 0.5 and no entropy bonus. The paper's batch of 39k samples, 2 s episodes and 6.7 Hz control are not used. The rollout length (128 decisions per machine) and the starting action spread are choices made here.
+Three settings, γ = 0.97, learning rate 0.001 and 10 optimisation epochs, are from Table III of [Egli and Hutter][eh] (IEEE Robotics and Automation Letters 7(2), 2022, doi:10.1109/LRA.2022.3152865, page 5), which trains a tracking policy for an excavator arm with PPO. Several other settings in that table match a Stable-Baselines3 default or a choice made here: hidden layers of 128 × 128 with tanh for both networks, 4 mini-batches per update, GAE λ 0.95, clip range 0.2, value coefficient 0.5, gradient norm limit 0.5 and no entropy bonus. The paper's batch of 39k samples, 2 s episodes and 6.7 Hz control are not used. The rollout length (128 decisions per machine) and the starting action spread are choices made here.
 
-Scoring runs the baseline over the development seeds, and the checkpoint too if one is given. It writes one row per episode (`.csv`) and a table (`.md`) with the pass rate, the mean tilt error and the early ends by cause, overall and by thirds of each drawn parameter.
+Scoring runs the baseline over the development seeds, and the checkpoint too if one is given. It writes one row per episode (`.csv`) and a table (`.md`) with the pass rate, the mean tilt error and the early ends by cause, overall and by thirds of each drawn parameter. The seeds are packed in order into scenes of `--machines` (8 by default), so each seed's scene and slot depend only on the seed list and the scene size; `--procs` only spreads the scenes over processes. The table states the scene size. A repeat is bit-exact for a fixed scene size. Unused slots run filler training seeds that are not scored. A seed cut short by a neighbour's solver failure runs again in the same slot, with fresh filler beside it.
 
 **Throughput.** Measured on a 4-core laptop processor with other work using about 30% of it: one process, random residual commands, drawn machines.
 
@@ -541,24 +560,28 @@ Eight machines per scene is the recommended size. Going to 16 gains 18% but halv
 
 | Rung | Pass | Mean tilt error | Early ends |
 |---|---|---|---|
-| `nominal` | 66% | 1.51° | none |
-| `machines` | 8% | 3.75° | 1 tilt |
-| `ground` | 2% | 3.89° | 1 tilt |
+| `nominal` | 62% | 1.51° | none |
+| `machines` | 3% | 3.75° | 1 tilt |
 
-On the nominal machine it fails most often on short ramps (33% pass with ramps of 3 to 4.1 s) and with the tip put down 4.8 to 5.7 m ahead (33%). It does best with the tip 3.6 to 4.8 m ahead (95%). On drawn machines no single drawn parameter explains the failures: the pass rate stays at or under 19% in every third of every parameter.
+Scene size 8. The `ground` rung is provisional and not reported (see Rungs and draws). The baseline never reads the tilt. It assumes level, rigid ground, on the `ground` rung too. A pass rate measured against it is therefore not a comparison against a controller with tilt feedback.
+
+On the nominal machine it fails most often on short ramps (29% pass with ramps of 3 to 4.1 s) and with the tip put down 4.8 to 5.7 m ahead (33%). It does best with the tip 3.6 to 4.8 m ahead (86%). Its two nominal failures that the earlier pass mark let through end with a front corner 10.0 and 11.5 mm off the ground at a tilt of about 0.2°. On drawn machines no single drawn parameter explains the failures: the pass rate stays at or under 10% in every third of every parameter.
 
 **Limits.**
 
-- On this branch the ground under and behind the tracks is a level pad. Only the ground ahead of the tracks is drawn, and it is planar. Slopes under the tracks arrive with the move to the ground module in [issue 53](../../issues/53).
+- On this branch the ground under and behind the tracks is a level pad. Only the ground ahead of the tracks is drawn, and it is planar. Slopes under the tracks arrive with the port to the drawn ground module in [issue 68](../../issues/68).
 - The baseline's geometry assumes the tip stays where it touched down. In the simulation the tip slides forward under load: 0.36 m on one development seed.
 - On the open-centre circuit, a proportional tracker with no integral term stalls short when the load is large or the dead zone wide.
 - Those two faults make the baseline undershoot large targets and leave drawn machines tilted at the end.
 - The IMU model is assumed: its bias and noise sizes, a complementary filter in place of a vendor's estimator, no IMU latency, and specific force by finite difference at the swing axis.
-- Contact flags and the tip position come from the start of each physics step, 5 ms behind the joint state.
+- Contact flags and the tip position come from the start of each physics step, 5 ms behind the joint state. The landing speed is taken at that same instant, before the contact acts.
 - Landing speed counts only in the pass mark, not in the reward.
 
 [sbg]: https://support.sbg-systems.com/sc/el/latest/ellipse-documentation/performance-specifications
-[xsens]: https://mtidocs.xsens.com/sensor-specifications-2
+[xsens]: https://www.farnell.com/datasheets/3045832.pdf
+[mj-warmstart]: https://github.com/google-deepmind/mujoco/blob/4.0.1/src/engine/engine_forward.c#L1077-L1136
+[mj-check]: https://github.com/google-deepmind/mujoco/blob/4.0.1/src/engine/engine_forward.c#L58-L114
+[sb3-timeout]: https://github.com/DLR-RM/stable-baselines3/blob/v2.9.2/stable_baselines3/common/on_policy_algorithm.py#L234-L245
 
 ### Language step
 

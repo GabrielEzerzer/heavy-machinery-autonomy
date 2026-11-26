@@ -52,7 +52,7 @@ class SceneVecEnv(VecEnv):
         self.lengths += 1
         for i in np.flatnonzero(done):
             infos[i]["terminal_observation"] = obs[i].astype(np.float32)
-            infos[i]["TimeLimit.truncated"] = False
+            infos[i]["TimeLimit.truncated"] = infos[i]["truncated"]
             infos[i]["episode"] = {"r": float(self.returns[i]), "l": int(self.lengths[i])}
             obs[i] = self._start(i)
         return obs.astype(np.float32), reward.astype(np.float32), done, infos
@@ -62,11 +62,12 @@ class SceneVecEnv(VecEnv):
                 "queue": None if self.queue is None else list(self.queue),
                 "returns": self.returns.copy(), "lengths": self.lengths.copy()}
 
-    def restore(self, snapshot: dict) -> None:
+    def restore(self, snapshot: dict) -> np.ndarray:
         self.scene.restore(snapshot["scene"])
         self.stream.bit_generator.state = snapshot["stream"]
         self.queue = snapshot["queue"]
         self.returns, self.lengths = snapshot["returns"].copy(), snapshot["lengths"].copy()
+        return self.observations()
 
     def observations(self) -> np.ndarray:
         return self.scene.history.reshape(self.num_envs, -1).astype(np.float32)
@@ -162,10 +163,17 @@ class ProcVecEnv(VecEnv):
     def close(self) -> None:
         if self.closed:
             return
-        self._all("close")
+        self.closed = True
+        for pipe, process in zip(self.pipes, self.processes, strict=True):
+            if process.is_alive():
+                try:
+                    pipe.send(("close", None))
+                    pipe.recv()
+                except (BrokenPipeError, EOFError, ConnectionResetError):
+                    pass
+            pipe.close()
         for process in self.processes:
             process.join(timeout=30)
-        self.closed = True
 
     def get_attr(self, attr_name, indices=None):
         if attr_name == "render_mode":

@@ -104,10 +104,9 @@ def front_feet(model: mujoco.MjModel, index: int) -> np.ndarray:
     return feet[np.isclose(x, x.max())]
 
 
-def front_edge(model: mujoco.MjModel) -> np.ndarray:
-    front = front_feet(model, 0)[0]
-    return np.array([model.geom_pos[front, 0], 0.0,
-                     model.geom_pos[front, 2] - model.geom_size[front, 0]])
+def front_corners(model: mujoco.MjModel) -> np.ndarray:
+    front = front_feet(model, 0)
+    return model.geom_pos[front] - np.outer(model.geom_size[front, 0], (0.0, 0.0, 1.0))
 
 
 class Parking:

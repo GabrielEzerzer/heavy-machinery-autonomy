@@ -1,6 +1,6 @@
-"""Scoring over the fixed development seeds and throughput timing. Each episode's outcome is joined
-with its draws, then grouped overall and by thirds of every drawn parameter into one table per
-controller. Held-out seeds are refused here."""
+"""Scoring over the fixed development seeds and throughput timing. Seeds run in fixed scenes, are
+rerun when a neighbour's solver failure cuts them short, and each outcome is joined with its draws
+and grouped by thirds of every drawn parameter. Held-out and repeated seeds are refused here."""
 
 from __future__ import annotations
 
@@ -15,20 +15,22 @@ from pathlib import Path
 
 import numpy as np
 
-from hma.train.scene import CAUSES
-from hma.train.task import HELD_OUT_BASE
+from hma.train.scene import CAUSES, PropScene
+from hma.train.task import DEV_BASE, HELD_OUT_BASE, training_seed
 from hma.train.vec import SceneVecEnv
 
 DRAWN = ("target", "ramp_up", "hold", "ramp_down", "prop_x", "pitch", "friction", "step", "grade",
          "cross", "delay", "lag", "deadband", "sensor_latency", "counterweight", "link_mass")
 DEGREES = {"target", "pitch"}
+FILLER = DEV_BASE - 1
+ROUNDS = 4
 
 
-def episode_row(scene, info: dict, controller: str) -> dict:
-    index = scene.seeds.index(info["seed"])
-    task, ground, machine = scene.tasks[index], scene.grounds[index], scene.machines[index]
+def episode_row(scene, slot: int, info: dict, controller: str) -> dict:
+    task, ground, machine = scene.tasks[slot], scene.grounds[slot], scene.machines[slot]
     return {
-        "controller": controller, "rung": scene.rung, **info,
+        "controller": controller, "rung": scene.rung, "scene_size": scene.n, "slot": slot,
+        **{k: v for k, v in info.items() if k not in ("truncated", "cut_short")},
         "target": task.target, "ramp_up": task.ramp_up, "hold": task.hold,
         "ramp_down": task.ramp_down, "prop_x": task.prop_x, "pitch": task.pitch,
         "friction": ground.friction, "step": ground.step, "grade": ground.grade,
@@ -49,40 +51,64 @@ def load_policy(checkpoint: Path):
     return lambda obs: model.predict(normalize.normalize_obs(obs), deterministic=True)[0]
 
 
-def run_seeds(rung: str, mode: str, seeds: list[int], machines: int,
+def _filler(round_: int, slot: int, restart: int) -> int:
+    return training_seed(np.random.default_rng((FILLER, round_, slot, restart)))
+
+
+def _run_round(scene: PropScene, pending: dict[int, int], round_: int, policy,
+               controller: str) -> list[dict]:
+    restarts = [0] * scene.n
+    obs = np.stack([scene.reset(slot, pending.get(slot, _filler(round_, slot, 0)))
+                    for slot in range(scene.n)])
+    live, rows = set(pending), []
+    while live:
+        actions = policy(obs.astype(np.float32)) if policy else np.zeros((scene.n, 4))
+        obs, _, done, infos = scene.step(np.asarray(actions, float))
+        for slot in np.flatnonzero(done):
+            slot = int(slot)
+            if slot in live:
+                live.discard(slot)
+                if not infos[slot]["cut_short"]:
+                    rows.append(episode_row(scene, slot, infos[slot], controller))
+                    del pending[slot]
+            restarts[slot] += 1
+            obs[slot] = scene.reset(slot, _filler(round_, slot, restarts[slot]))
+    return rows
+
+
+def run_group(rung: str, mode: str, seeds: list[int], machines: int,
               checkpoint: str | None) -> list[dict]:
-    if any(seed >= HELD_OUT_BASE for seed in seeds):
-        raise ValueError("held-out seeds are never scored")
     import torch
 
     torch.set_num_threads(1)
     policy = load_policy(Path(checkpoint)) if checkpoint else None
     controller = "policy" if checkpoint else "baseline"
-    env = SceneVecEnv(min(machines, len(seeds)), rung, mode, 0, seeds=seeds)
-    wanted, rows = set(seeds), []
-    obs = env.reset()
-    while len(rows) < len(seeds):
-        actions = policy(obs) if policy else np.zeros((env.num_envs, 4))
-        obs, _, done, infos = env.scene.step(np.asarray(actions, float))
-        for i in np.flatnonzero(done):
-            if infos[i]["seed"] in wanted:
-                rows.append(episode_row(env.scene, infos[i], controller))
-                wanted.discard(infos[i]["seed"])
-            obs[i] = env._start(i)
-        obs = obs.astype(np.float32)
-    return rows
+    scene = PropScene(machines, rung, mode)
+    pending, rows = dict(enumerate(seeds)), []
+    for round_ in range(ROUNDS):
+        rows += _run_round(scene, pending, round_, policy, controller)
+        if not pending:
+            return rows
+    raise RuntimeError(f"seeds {sorted(pending.values())} were cut short in {ROUNDS} rounds")
 
 
 def score(rung: str, mode: str, seeds: list[int], machines: int, procs: int,
           checkpoint: str | None) -> list[dict]:
-    chunks = [seeds[k::procs] for k in range(procs) if seeds[k::procs]]
-    if len(chunks) == 1:
-        return run_seeds(rung, mode, chunks[0], machines, checkpoint)
-    with ProcessPoolExecutor(len(chunks), mp_context=get_context("spawn")) as pool:
-        parts = pool.map(run_seeds, [rung] * len(chunks), [mode] * len(chunks), chunks,
-                         [machines] * len(chunks), [checkpoint] * len(chunks))
-        rows = [row for part in parts for row in part]
-    return sorted(rows, key=lambda r: (r["controller"], r["seed"]))
+    if any(seed >= HELD_OUT_BASE for seed in seeds):
+        raise ValueError("held-out seeds are never scored")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("each seed is scored once")
+    groups = [seeds[k:k + machines] for k in range(0, len(seeds), machines)]
+    args = [[rung] * len(groups), [mode] * len(groups), groups, [machines] * len(groups),
+            [checkpoint] * len(groups)]
+    if procs <= 1 or len(groups) == 1:
+        parts = list(map(run_group, *args))
+    else:
+        with ProcessPoolExecutor(min(procs, len(groups)), mp_context=get_context("spawn")) as pool:
+            parts = list(pool.map(run_group, *args))
+    rows = [row for part in parts for row in part]
+    order = {seed: k for k, seed in enumerate(seeds)}
+    return sorted(rows, key=lambda r: (r["controller"], order[r["seed"]]))
 
 
 def _summary(rows: list[dict]) -> str:
@@ -104,6 +130,8 @@ def table(rows: list[dict]) -> str:
     for controller in sorted({r["controller"] for r in rows}):
         mine = [r for r in rows if r["controller"] == controller]
         lines += [f"### {controller}, rung {mine[0]['rung']}", "",
+                  f"Scene size {mine[0]['scene_size']} machines; each seed keeps the slot its "
+                  "place in the seed list gives it.", "",
                   "| group | episodes | pass | tilt error (deg) | early ends |",
                   "|---|---|---|---|---|", "| all " + _summary(mine), ""]
         lines += ["| drawn parameter (range) | episodes | pass | tilt error (deg) | early ends |",

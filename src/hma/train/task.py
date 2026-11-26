@@ -55,6 +55,8 @@ class Settings:
     hold_share: float = 0.8
     landing: float = 0.3
     settled: float = math.radians(1.0)
+    down: float = 0.01
+    still: float = 0.02
 
 
 @dataclass(frozen=True)
@@ -104,21 +106,22 @@ def training_seed(rng: np.random.Generator) -> int:
 
 
 class PropPath:
-    def __init__(self, task: Task, pivot: tuple[float, float, float]):
+    def __init__(self, task: Task, pivot: tuple[float, float, float], height: float = 0.0):
         self.task = task
         self.pivot = pivot
+        self.height = height
 
     def __call__(self, t: float) -> tuple[np.ndarray, float]:
         task, side = self.task, float(BOOM_PIVOT[1])
         if t < task.place:
-            z = task.start_z * (1.0 - _ease(t, task.place))
+            z = self.height + (task.start_z - self.height) * (1.0 - _ease(t, task.place))
             return np.array([task.prop_x, side, z]), task.pitch
         theta = task.tilt(t)
         cx, cz, radius = self.pivot
         c, s = math.cos(theta), math.sin(theta)
         tx = cx * (1.0 - c) + cz * s - radius * theta
         tz = cz * (1.0 - c) - cx * s
-        dx, dz = task.prop_x - tx, -tz
+        dx, dz = task.prop_x - tx, self.height - tz
         return np.array([c * dx + s * dz, side, -s * dx + c * dz]), task.pitch + theta
 
 
@@ -151,6 +154,7 @@ def draw_task(seed: int, settings: Settings, pivot: tuple[float, float, float],
             place=settings.place,
             final=settings.final,
         )
-        if reachable(PropPath(task, pivot), period):
+        if reachable(PropPath(task, pivot), period) and reachable(
+                PropPath(task, pivot, ground), period):
             return task
     raise ValueError(f"no reachable propping task found for seed {seed}")

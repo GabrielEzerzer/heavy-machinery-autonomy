@@ -146,12 +146,16 @@ def test_observations_stay_finite_and_in_bounds_under_random_actions(machine):
     assert np.all((seen >= OBS_LOW) & (seen <= OBS_HIGH))
 
 
-def test_ending_early_never_returns_more_than_continuing_with_the_baseline():
+@pytest.mark.parametrize(("seed", "push", "cause"), [
+    (DEV_BASE, (0.0, 1.0, 0.0, 0.0), "tilt"),
+    (DEV_BASE + 2, (0.0, 1.0, 1.0, 1.0), "contact"),
+])
+def test_ending_early_never_returns_more_than_continuing_with_the_baseline(seed, push, cause):
     switches = [0, 5, 10, 15, 20, 25, None]
     scene = PropScene(len(switches), "nominal", mode="direct")
     for i in range(len(switches)):
-        scene.reset(i, DEV_BASE)
-    push = np.array([0.0, 1.0, 0.0, 0.0])
+        scene.reset(i, seed)
+    push = np.array(push)
     rewards = [[] for _ in switches]
     causes = [None] * len(switches)
     live = np.ones(len(switches), bool)
@@ -172,7 +176,7 @@ def test_ending_early_never_returns_more_than_continuing_with_the_baseline():
         if not live.any():
             break
     pushed = rewards[-1]
-    assert causes[-1] is not None and pushed[-1] == 0.0
+    assert causes[-1] == cause and pushed[-1] == 0.0
     recovered = 0
     for i, start in enumerate(switches[:-1]):
         assert sum(pushed[start:]) <= sum(rewards[i][start:])
@@ -223,8 +227,9 @@ def test_dev_and_held_out_seeds_never_meet_training_seeds():
     assert max(dev_seeds()) < HELD_OUT_BASE <= min(held_out_seeds(10))
 
 
-def test_period_readings_are_delayed_means_with_one_full_size_noise_draw_each():
-    machine = replace(draw_machine(SEED), sensor_latency=0.05)
+@pytest.mark.parametrize("latency", [0.05, RANGES["sensor_latency"][1]])
+def test_period_readings_are_delayed_means_with_one_full_size_noise_draw_each(latency):
+    machine = replace(draw_machine(SEED), sensor_latency=latency)
     model = load_scene(1, weld=True)
     layer = Hydraulics(model, mujoco.MjData(model), [machine])
     commands = np.random.default_rng(8).uniform(-0.5, 0.5, (80, 1, 4))
@@ -236,8 +241,8 @@ def test_period_readings_are_delayed_means_with_one_full_size_noise_draw_each():
         for _ in range(layer.steps_per_decision):
             layer.step()
             state = layer.true_state()
-            truth.append(np.r_[state.positions[0], state.velocities[0],
-                               state.pressures[0].ravel() + machine.pressure_offset.ravel()])
+            pressures = np.maximum(state.pressures[0].ravel() + machine.pressure_offset.ravel(), 0)
+            truth.append(np.r_[state.positions[0], state.velocities[0], pressures])
         if len(truth) < layer.steps_per_decision + lag:
             continue
         window = np.array(truth[-layer.steps_per_decision - lag:len(truth) - lag]).mean(0)

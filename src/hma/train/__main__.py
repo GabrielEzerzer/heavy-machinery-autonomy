@@ -9,6 +9,7 @@ import csv
 import json
 import math
 import pickle
+import shutil
 import time
 from pathlib import Path
 
@@ -21,6 +22,7 @@ EGLI_HUTTER = {"gamma": 0.97, "learning_rate": 1e-3, "n_epochs": 10}
 NET = [128, 128]
 MINI_BATCHES = 4
 SPREAD = {"residual": 0.02, "direct": 1.0}
+CONFIG = ("rung", "mode", "procs", "machines", "seed", "spread")
 SMOKE = {"procs": 2, "machines": 2, "n_steps": 16, "steps": 256, "dev_size": 4, "seconds": 2.0}
 
 
@@ -56,10 +58,16 @@ def _curve_callback(out: Path, seconds: float | None, every: int, save):
             for info in self.locals["infos"]:
                 if "episode" in info:
                     self.finished.append(info)
-            return seconds is None or time.perf_counter() - self.start < seconds
+            if seconds is None or time.perf_counter() - self.start < seconds:
+                return True
+            self.model._last_obs = self.locals["new_obs"]
+            self.model._last_episode_starts = self.locals["dones"]
+            return False
 
         def _on_rollout_start(self) -> None:
             self.mark = time.perf_counter()
+            if every and self.rollouts and self.rollouts % every == 0:
+                save()
 
         def _on_rollout_end(self) -> None:
             self.rollouts += 1
@@ -76,8 +84,6 @@ def _curve_callback(out: Path, seconds: float | None, every: int, save):
                     round(self.collect / (now - self.start), 3)])
                 self.file.flush()
             self.finished = []
-            if every and self.rollouts % every == 0:
-                save()
 
         def _on_training_end(self) -> None:
             self.file.close()
@@ -95,9 +101,59 @@ def build_model(venv, n_steps: int, seed: int, spread: float):
                seed=seed, device="cpu", verbose=0, **EGLI_HUTTER)
 
 
+def save_checkpoint(checkpoint: Path, model, venv, envs, config: dict) -> None:
+    fresh = checkpoint.with_name(checkpoint.name + ".tmp")
+    old = checkpoint.with_name(checkpoint.name + ".old")
+    shutil.rmtree(fresh, ignore_errors=True)
+    fresh.mkdir(parents=True)
+    model.save(fresh / "model.zip")
+    for name, value in (("normalize", venv), ("scenes", envs.snapshot()),
+                        ("starts", np.asarray(model._last_episode_starts, bool))):
+        with open(fresh / f"{name}.pkl", "wb") as f:
+            pickle.dump(value, f)
+    (fresh / "config.json").write_text(
+        json.dumps({**config, "timesteps": int(model.num_timesteps)}), encoding="utf-8")
+    if checkpoint.exists():
+        shutil.rmtree(old, ignore_errors=True)
+        checkpoint.rename(old)
+    fresh.rename(checkpoint)
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def latest_checkpoint(checkpoint: Path) -> Path | None:
+    for path in (checkpoint, checkpoint.with_name(checkpoint.name + ".old")):
+        if (path / "config.json").exists():
+            return path
+    return None
+
+
+def read_config(path: Path) -> dict:
+    return json.loads((path / "config.json").read_text(encoding="utf-8"))
+
+
+def load_checkpoint(path: Path, envs):
+    from stable_baselines3 import PPO
+
+    with open(path / "normalize.pkl", "rb") as f:
+        venv = pickle.load(f)
+    venv.set_venv(envs)
+    model = PPO.load(path / "model.zip", env=venv, device="cpu")
+    with open(path / "scenes.pkl", "rb") as f:
+        raw = envs.restore(pickle.load(f))
+    with open(path / "starts.pkl", "rb") as f:
+        model._last_episode_starts = pickle.load(f)
+    venv.old_obs = raw
+    model._last_obs = venv.normalize_obs(raw)
+    return model, venv, read_config(path)
+
+
+def learn(model, total: int, callback, resume: bool) -> None:
+    model.learn(max(total - model.num_timesteps, 0) if resume else total, callback=callback,
+                reset_num_timesteps=not resume)
+
+
 def train(args) -> None:
     import torch
-    from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import VecNormalize
 
     from hma.train.vec import ProcVecEnv
@@ -105,10 +161,11 @@ def train(args) -> None:
     torch.set_num_threads(1)
     out = output_dir(args.out)
     checkpoint = out / "checkpoint"
-    resume = args.resume and (checkpoint / "model.zip").exists()
+    found = latest_checkpoint(checkpoint) if args.resume else None
+    resume = found is not None
     if resume:
-        config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
-        for key in ("rung", "mode", "procs", "machines", "seed", "spread"):
+        config = read_config(found)
+        for key in CONFIG:
             setattr(args, key, config.get(key))
     if args.spread is None:
         args.spread = SPREAD[args.mode]
@@ -116,35 +173,18 @@ def train(args) -> None:
     print(f"workers: {envs.pids}", flush=True)
     try:
         if resume:
-            with open(checkpoint / "normalize.pkl", "rb") as f:
-                venv = pickle.load(f)
-            venv.set_venv(envs)
-            model = PPO.load(checkpoint / "model.zip", env=venv, device="cpu")
-            with open(checkpoint / "scenes.pkl", "rb") as f:
-                raw = envs.restore(pickle.load(f))
-            venv.old_obs = raw
-            model._last_obs = venv.normalize_obs(raw)
-            model._last_episode_starts = np.zeros(envs.num_envs, bool)
+            model, venv, _ = load_checkpoint(found, envs)
         else:
             venv = VecNormalize(envs, norm_obs=True, norm_reward=False,
                                 gamma=EGLI_HUTTER["gamma"])
             model = build_model(venv, args.n_steps, args.seed, args.spread)
 
         def save() -> None:
-            checkpoint.mkdir(exist_ok=True)
-            model.save(checkpoint / "model.zip")
-            with open(checkpoint / "normalize.pkl", "wb") as f:
-                pickle.dump(venv, f)
-            with open(checkpoint / "scenes.pkl", "wb") as f:
-                pickle.dump(envs.snapshot(), f)
-            (checkpoint / "config.json").write_text(json.dumps(
-                {"rung": args.rung, "mode": args.mode, "procs": args.procs,
-                 "machines": args.machines, "seed": args.seed, "spread": args.spread,
-                 "timesteps": int(model.num_timesteps)}), encoding="utf-8")
+            save_checkpoint(checkpoint, model, venv, envs,
+                            {key: getattr(args, key) for key in CONFIG})
 
         seconds = args.minutes * 60.0 if args.minutes else None
-        model.learn(args.steps, callback=_curve_callback(out, seconds, args.every, save),
-                    reset_num_timesteps=not resume)
+        learn(model, args.steps, _curve_callback(out, seconds, args.every, save), resume)
         save()
         print(f"trained to {model.num_timesteps} steps; checkpoint in {checkpoint}")
     finally:
@@ -159,7 +199,7 @@ def score(args) -> None:
     seeds = dev_seeds(args.dev_size)
     rows = run(args.rung, "residual", seeds, args.machines, args.procs, None)
     if args.checkpoint:
-        config = json.loads((Path(args.checkpoint) / "config.json").read_text(encoding="utf-8"))
+        config = read_config(Path(args.checkpoint))
         rows += run(args.rung, config["mode"], seeds, args.machines, args.procs,
                     str(Path(args.checkpoint).resolve()))
     path = write(rows, out, f"score_{args.rung}")
@@ -201,7 +241,8 @@ def main(argv: list[str] | None = None) -> None:
                             help="starting action spread (default per mode: "
                                  f"{SPREAD['residual']} residual, {SPREAD['direct']} direct)")
     train_args.add_argument("--seed", type=int, default=0)
-    train_args.add_argument("--resume", action="store_true", help="continue from --out")
+    train_args.add_argument("--resume", action="store_true",
+                            help="continue from --out; --steps stays the total")
     score_args = commands.choices["score"]
     score_args.add_argument("--checkpoint", help="a checkpoint directory written by train")
     score_args.add_argument("--dev-size", type=int, default=64)
