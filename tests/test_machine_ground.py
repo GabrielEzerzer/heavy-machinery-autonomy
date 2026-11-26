@@ -14,6 +14,7 @@ from hma.machine import (
     tendon_friction,
 )
 from hma.machine.contact import STEEL_FRICTION_RANGE, set_friction
+from hma.machine.cylinders import MAIN_RELIEF
 from hma.machine.ground import (
     RANGES,
     Box,
@@ -23,12 +24,15 @@ from hma.machine.ground import (
     inside,
     stand,
 )
+from hma.machine.load import place_load
 from hma.machine.measure import (
     CASES,
+    LOAD_AWAY,
     TIPPED,
     base_frame,
     chart_pose,
     hand_tipping_load,
+    hold_arm,
     machine_com,
     run,
     slope,
@@ -63,6 +67,7 @@ P = machine_prefix(0)
 SPEC_PULL_PER_TRACK = 102.0e3 / 2
 G = 9.81
 SINK = 1e-5
+PUSH = 1.0
 
 
 def energy(model, data):
@@ -142,13 +147,13 @@ def test_a_sliding_machine_stops_in_the_coulomb_distance(dof):
 @pytest.mark.parametrize("name", list(CASES))
 def test_tipping_load_is_within_half_a_percent_of_hand_statics(name, factor):
     ground, pose, hand = tipping_case(name)
-    model, data = machine(ground, pose, hold=True)
+    model, data = machine(ground, pose)
     angle = tips_under(model, data, factor * hand)
     assert (angle > TIPPED) if factor > 1 else (angle < TIPPED), angle
 
 
 def tipping_about(ground, pose, line, axis, factor, edit=None):
-    model, data = machine(ground, pose, hold=True)
+    model, data = machine(ground, pose)
     if edit is not None:
         edit(model, data)
         mujoco.mj_forward(model, data)
@@ -189,27 +194,31 @@ def test_an_edge_between_two_wheels_holds_the_machine_to_0_93_of_the_hand_tippin
 
 
 def propped(mu):
-    model, data = machine(pose=chart_pose(1.5, 5.0))
+    model = load_scene(1)
+    data = mujoco.MjData(model)
+    layer = Hydraulics(model, data, [NOMINAL])
+    layer.reset(0, NOMINAL, chart_pose(1.5, 5.0))
+    place_load(model, data, 0, *LOAD_AWAY)
     set_friction(model, 0, mu)
-    boom = model.actuator(P + "boom").id
-    data.ctrl[boom] = 0.1
+    layer.act(np.array([[0.0, PUSH, 0.0, 0.0]]))
     for _ in range(round(8.0 / model.opt.timestep)):
-        step(model, data)
+        layer.step()
         if pitch(model, data) < -25.0:
             break
-    data.ctrl[boom] = 0.0
-    run(model, data, 1.0)
-    return model, data
+    layer.act(np.zeros((1, 4)))
+    for _ in range(round(1.0 / model.opt.timestep)):
+        layer.step()
+    return model, data, layer
 
 
 @pytest.mark.parametrize("mu", STEEL_FRICTION_RANGE)
 def test_a_machine_propped_on_its_bucket_stays_put_with_its_brakes_far_from_slipping(mu):
-    model, data = propped(mu)
+    model, data, layer = propped(mu)
     assert -30.0 < pitch(model, data) < -20.0
     start = data.qpos[:3].copy()
     peak = 0.0
     for _ in range(round(4.0 / model.opt.timestep)):
-        step(model, data)
+        layer.step()
         peak = max(peak, np.abs(tendon_friction(data, brakes(model))).max())
     assert peak < 0.1 * TRACTION
     assert np.linalg.norm(data.qpos[:3] - start) < 1e-3
@@ -391,6 +400,7 @@ def test_braking_from_full_speed_on_flat_takes_the_friction_limited_distance():
 
 def test_a_track_in_the_air_leaves_the_other_its_full_traction():
     model = load_scene(1, weld=True)
+    hold_arm(model)
     data = mujoco.MjData(model)
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
     data.mocap_pos[0, 2] += 1.0
@@ -514,13 +524,13 @@ def test_resets_on_drawn_grounds_start_at_rest_with_steady_load_readings():
     for seed in range(300):
         layer.reset(0, NOMINAL, at=(0.0, 0.0, float(rng.uniform(0.0, 2 * math.pi))),
                     ground=seed)
-        first = layer.true_state().loads[0].copy()
+        first = layer.true_state().pressures[0].copy()
         peak = 0.0
         for _ in range(20):
             layer.step()
             peak = max(peak, np.abs(data.qvel[:6]).max())
         assert peak < 2e-3, seed
-        np.testing.assert_allclose(layer.true_state().loads[0], first, atol=0.01)
+        np.testing.assert_allclose(layer.true_state().pressures[0], first, atol=0.01 * MAIN_RELIEF)
 
 
 def test_a_refused_draw_leaves_no_drift_for_the_next_draw_to_start_from():
@@ -532,9 +542,11 @@ def test_a_refused_draw_leaves_no_drift_for_the_next_draw_to_start_from():
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
     assert not settle(model, data, 0)
     assert np.isfinite(data.qpos).all()
-    assert np.abs(data.qpos[joints] - HOME_POSE).max() > 0.04
+    assert np.linalg.norm(data.qpos[:2]) > 1.0
+    assert np.abs(data.qpos[joints] - HOME_POSE).max() < 1e-3
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
     stand(model, data, 0, 75)
+    assert np.linalg.norm(data.qpos[:2]) < 1e-2
     assert np.abs(data.qpos[joints] - HOME_POSE).max() < 1e-2
 
 
@@ -561,17 +573,18 @@ def test_restoring_the_integration_state_repeats_bit_for_bit():
 def two_machines(busy):
     model = load_scene(2)
     data = mujoco.MjData(model)
-    mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
-    for i in range(2):
-        apply_ground(model, i, Ground())
-        assert settle(model, data, i)
+    layer = Hydraulics(model, data, [NOMINAL] * 2)
     rng = np.random.default_rng(1)
-    other = [model.actuator(machine_prefix(1) + t).id for t in (*JOINT_NAMES, *TRAVEL_NAMES)]
+    other = [model.actuator(machine_prefix(1) + t).id for t in TRAVEL_NAMES]
+    commands = np.zeros((2, len(JOINT_NAMES)))
     for _ in range(200):
         if busy:
+            commands[1] = rng.uniform(-1.0, 1.0, len(JOINT_NAMES))
             data.ctrl[other] = rng.uniform(-1.0, 1.0, len(other)) * model.actuator_ctrlrange[
                 other, 1]
-        step(model, data, 20)
+        layer.act(commands)
+        for _ in range(20):
+            layer.step()
     return data.qpos[:7].copy()
 
 
@@ -637,6 +650,7 @@ def test_off_features_flags_the_machine_that_drove_off_its_own_field():
     data = mujoco.MjData(model)
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
     for i in range(2):
+        hold_arm(model, i)
         apply_ground(model, i, Ground())
         assert settle(model, data, i)
     data.ctrl[[model.actuator(machine_prefix(1) + name).id for name in TRAVEL_NAMES]] = (

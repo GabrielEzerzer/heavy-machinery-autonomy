@@ -1,6 +1,6 @@
-"""Rigid ground for one machine from MuJoCo primitives: a plane, tilted for a slope and set to a
-level, with a pool of boxes and buried spheres placed at reset, the load set to rest on it.
-settle() steps a machine to rest or refuses; stand() redraws a seed until the machine stands."""
+"""Rigid ground for one machine from MuJoCo primitives: a tilted, levelled plane with boxes and
+buried spheres, the load resting on it. settle() steps a machine to rest, arm held, or refuses,
+and puts a welded machine at home height; stand() redraws a seed until the machine stands."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from hma.machine.model import (
     GROUND_X,
     GROUND_Y,
     HOME_KEY,
+    JOINT_NAMES,
     LOAD,
     PARKED,
     RING,
@@ -66,6 +67,7 @@ DRAWS = 20
 CLEAR_TRIES = 8
 MAX_TILT = 15.0
 MAX_SHIFT = 0.3
+HOLD = 1.0e9
 
 
 @dataclass(frozen=True)
@@ -334,6 +336,20 @@ def _put(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float, y: fl
     mujoco.mj_kinematics(model, data)
 
 
+def _hold_at(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float, y: float,
+             heading: float, joints: np.ndarray) -> None:
+    q0 = int(model.joint(machine_prefix(index) + BASE_JOINT).qposadr[0])
+    key = model.key(HOME_KEY).id
+    data.qpos[q0:q0 + 3] = _offset(model, index) + [x, y, model.key_qpos[key, q0 + 2]]
+    data.qpos[q0 + 3:q0 + 7] = _turned(model.key_qpos[key, q0 + 3:q0 + 7], heading)
+    for j in joints:
+        dof = int(model.jnt_dofadr[j])
+        width = 6 if model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE else 1
+        data.qvel[dof:dof + width] = 0.0
+        data.qacc_warmstart[dof:dof + width] = 0.0
+    mujoco.mj_kinematics(model, data)
+
+
 def _deepest(model: mujoco.MjModel, data: mujoco.MjData, base: int) -> float:
     contacts = data.contact[:data.ncon]
     own = ((model.body_rootid[model.geom_bodyid[contacts.geom[:, 0]]] == base)
@@ -362,15 +378,16 @@ def settle(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float = 0.
     data.ctrl[_travel(model, index)] = 0.0
     data.userdata[index] = 0.0
     tracks.used_power(model, data)[index] = 0.0
-    _put(model, data, index, x, y, heading, joints)
     base = model.joint(prefix + BASE_JOINT)
     q0 = int(base.qposadr[0])
     if data.eq_active[model.equality(prefix + WELD).id]:
+        _hold_at(model, data, index, x, y, heading, joints)
         mocap = model.body_mocapid[model.body(prefix + ANCHOR).id]
         data.mocap_pos[mocap] = data.qpos[q0:q0 + 3]
         data.mocap_quat[mocap] = data.qpos[q0 + 3:q0 + 7]
-    else:
-        data.qpos[q0 + 2] += DROP
+        return True
+    _put(model, data, index, x, y, heading, joints)
+    data.qpos[q0 + 2] += DROP
     scratch = mujoco.MjData(model)
     mujoco.mj_copyData(scratch, model, data)
     v0 = int(base.dofadr[0])
@@ -378,12 +395,18 @@ def settle(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float = 0.
     least, most, needed = (round(t / dt) for t in (SETTLE_MIN, SETTLE_MAX, REST_TIME))
     still = 0
     rested = False
-    for n in range(1, most + 1):
-        tracks.step(model, scratch)
-        still = 0 if np.abs(scratch.qvel[v0:v0 + 6]).max() > REST_SPEED else still + 1
-        if still >= needed and n >= least:
-            rested = True
-            break
+    arm = [int(model.joint(prefix + name).dofadr[0]) for name in JOINT_NAMES]
+    kept = model.dof_frictionloss[arm].copy()
+    model.dof_frictionloss[arm] = HOLD
+    try:
+        for n in range(1, most + 1):
+            tracks.step(model, scratch)
+            still = 0 if np.abs(scratch.qvel[v0:v0 + 6]).max() > REST_SPEED else still + 1
+            if still >= needed and n >= least:
+                rested = True
+                break
+    finally:
+        model.dof_frictionloss[arm] = kept
     for j in joints:
         q, v = int(model.jnt_qposadr[j]), int(model.jnt_dofadr[j])
         nq, nv = (7, 6) if model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE else (1, 1)

@@ -1,7 +1,6 @@
-"""Tracks as rows of road wheels that MuJoCo's own collision and solver put on the ground, with a
-travel drive per track. step() keeps the positive drive power of both tracks within the engine's
-share: a force on each drive wheel in data.qfrc_applied, split by shares kept in data.userdata
-with the power each track used in the last step, so a saved integration state replays exactly."""
+"""Tracks as rows of road wheels on MuJoCo's own contact, a travel drive per track. step() caps the
+positive drive power at the engine's share by a force on each drive wheel while its belt runs the
+way its valve turns, split by shares and last-step powers kept in data.userdata for exact replay."""
 
 from __future__ import annotations
 
@@ -81,6 +80,7 @@ def contact_names(side: str) -> tuple[str, ...]:
 class Drives(NamedTuple):
     dofs: np.ndarray
     tendons: np.ndarray
+    valves: np.ndarray
 
 
 _drives: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
@@ -91,14 +91,16 @@ def drives(model: mujoco.MjModel) -> Drives:
     if found is None:
         from hma.machine.model import VALVE, machine_prefix
 
-        dofs, tendons = [], []
+        dofs, tendons, valves = [], [], []
         i = 0
         while mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, machine_prefix(i) + "base") >= 0:
             prefix = machine_prefix(i)
             dofs.append([model.joint(prefix + wheel_name(s, 0)).dofadr[0] for s in SIDES])
             tendons.append([model.tendon(prefix + TRAVEL + s + VALVE).id for s in SIDES])
+            valves.append([model.joint(prefix + TRAVEL + s + VALVE).dofadr[0] for s in SIDES])
             i += 1
-        found = Drives(np.array(dofs, np.intp), np.array(tendons, np.intp))
+        found = Drives(np.array(dofs, np.intp), np.array(tendons, np.intp),
+                       np.array(valves, np.intp))
         _drives[model] = found
     return found
 
@@ -150,7 +152,8 @@ def limit_power(model: mujoco.MjModel, data: mujoco.MjData) -> None:
     used = used_power(model, data)
     share = split_power(belt, used, shares(model, data), model.opt.timestep / SHARE_TIME)
     data.userdata[:len(lay.dofs)] = share[:, 0] - 0.5
-    excess = drive_caps(belt, share) - TRACTION
+    ahead = data.qvel[lay.valves] * belt > 0.0
+    excess = np.where(ahead, drive_caps(belt, share) - TRACTION, 0.0)
     data.qfrc_applied[lay.dofs] = excess * np.sign(belt) * WHEEL_RADIUS
 
 

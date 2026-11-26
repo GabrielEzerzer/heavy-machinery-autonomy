@@ -1,6 +1,6 @@
-"""The base controller: proportional on joint angle error, with reference speed feedforward and no
-integral term, in valve command units. It follows a bucket-tip path of position and pitch over
-time; StraightLine and Circle are free-air paths that start and end at rest."""
+"""The base controller: reference speed feedforward turned into valve openings through the nominal
+circuit at the measured pose and pressures, plus proportional feedback on joint angle error with
+no integral term. StraightLine and Circle are bucket-tip paths that start and end at rest."""
 
 from __future__ import annotations
 
@@ -9,12 +9,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from hma.hydraulics.params import NOMINAL, NOMINAL_SPEEDS
-from hma.machine import JOINT_NAMES, inverse_kinematics
-from hma.machine.model import VALVE_GAIN, VALVE_INERTIA
+from hma.hydraulics.circuit import full_speed, valve_opening
+from hma.hydraulics.params import NOMINAL
+from hma.machine import inverse_kinematics
 
 CONTROLLER_GAIN = 0.25
-CONTROLLER_LEAD = float(NOMINAL.delay[0] + NOMINAL.lag[0]) + VALVE_INERTIA / VALVE_GAIN
+CONTROLLER_LEAD = float(NOMINAL.delay[0] + NOMINAL.lag[0])
+CONTROLLER_RAMP = 0.02
 
 
 def _ease(t: float, duration: float) -> float:
@@ -56,12 +57,12 @@ def _wrap(angle: np.ndarray) -> np.ndarray:
 
 class BaseController:
     def __init__(self, path, control_hz: float, gain: float = CONTROLLER_GAIN,
-                 lead: float = CONTROLLER_LEAD):
+                 lead: float = CONTROLLER_LEAD, ramp: float = CONTROLLER_RAMP):
         self.path = path
         self.period = 1.0 / control_hz
         self.gain = gain
         self.lead = lead
-        self._speed = np.array([NOMINAL_SPEEDS[j] for j in JOINT_NAMES])
+        self.ramp = ramp
 
     def reference(self, t: float) -> np.ndarray:
         position, pitch = self.path(t)
@@ -70,8 +71,12 @@ class BaseController:
             raise ValueError(f"the path at t = {t:.3f} s is out of reach")
         return q
 
-    def __call__(self, t: float, positions: np.ndarray) -> np.ndarray:
+    def __call__(self, t: float, positions: np.ndarray, pressures: np.ndarray) -> np.ndarray:
         ahead = self.reference(t + self.lead)
         feedforward = _wrap(self.reference(t + self.lead + self.period) - ahead) / self.period
-        error = _wrap(self.reference(t) - np.asarray(positions, float))
-        return np.clip((feedforward + self.gain * error) / self._speed, -1.0, 1.0)
+        positions = np.asarray(positions, float)
+        error = _wrap(self.reference(t) - positions)
+        speed = self.gain * error
+        feedback = speed / full_speed(positions, speed)
+        opening = np.sign(feedforward) * valve_opening(positions, feedforward, pressures, self.ramp)
+        return np.clip(opening + feedback, -1.0, 1.0)

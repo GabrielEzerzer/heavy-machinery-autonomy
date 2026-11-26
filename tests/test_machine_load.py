@@ -4,7 +4,6 @@ import mujoco
 import numpy as np
 import pytest
 
-from hma.hydraulics.layer import Hydraulics
 from hma.hydraulics.params import NOMINAL
 from hma.machine import HOME_KEY, JOINT_NAMES, load_scene
 from hma.machine.contact import steel_geoms
@@ -46,6 +45,7 @@ from hma.machine.model import (
 )
 from hma.machine.statics import CHART
 from hma.machine.tracks import TRACK
+from scenes import held, lock_joints
 
 P = machine_prefix(0)
 HANG_POSE = (0.0, -1.0, 1.6, 2.3)
@@ -56,6 +56,7 @@ SEEDS = range(2000)
 G = 9.81
 SAG = 2e-4
 STILL = 1e-3
+RAISE = -1.0
 
 
 def scene(mass=2000.0, n=1, weld=True):
@@ -93,6 +94,12 @@ def body_speed(model, data, name):
 
 
 def run(model, data, seconds):
+    layer = held(model, data)
+    for _ in range(round(seconds / model.opt.timestep)):
+        layer.step()
+
+
+def rigid(model, data, seconds):
     for _ in range(round(seconds / model.opt.timestep)):
         mujoco.mj_step(model, data)
 
@@ -122,8 +129,7 @@ def test_reset_returns_a_clean_unhooked_load_at_rest():
     load = model.body(P + LOAD).id
     data.xfrc_applied[load, :3] = [1e4, 0.0, 1e4]
     run(model, data, 1.0)
-    layer = Hydraulics(model, data, [NOMINAL])
-    layer.reset(0, NOMINAL)
+    held(model, data).reset(0, NOMINAL)
     assert not hooked(model, data, 0)
     assert not data.xfrc_applied[load].any()
     run(model, data, 0.5)
@@ -153,13 +159,14 @@ def test_hooked_state_saves_and_restores_with_mujoco_state():
     hang_load(model, data, 0)
     kind = mujoco.mjtState.mjSTATE_INTEGRATION
     state = np.zeros(mujoco.mj_stateSize(model, kind))
+    lock_joints(model, data)
     mujoco.mj_getState(model, data, state, kind)
-    run(model, data, 0.5)
+    rigid(model, data, 0.5)
     expected = data.qpos.copy()
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
     mujoco.mj_setState(model, data, state, kind)
     assert hooked(model, data, 0)
-    run(model, data, 0.5)
+    rigid(model, data, 0.5)
     np.testing.assert_array_equal(data.qpos, expected)
 
 
@@ -247,8 +254,9 @@ def resting_still(model, data, seconds=1.0):
     load = model.body(P + LOAD).id
     start = data.xpos[load].copy()
     speeds = []
+    layer = held(model, data)
     for _ in range(round(seconds / model.opt.timestep)):
-        mujoco.mj_step(model, data)
+        layer.step()
         speeds.append(body_speed(model, data, P + LOAD))
     return float(np.linalg.norm(data.xpos[load] - start)), max(speeds)
 
@@ -388,16 +396,23 @@ def test_heaviest_and_tallest_draws_are_hooked_and_lifted_clear_over_the_side():
         place_load(model, data, 0, *hook_xy(model, data))
         hook_load(model, data, 0)
         body, base = model.body(P + LOAD).id, model.body(P + "base").id
-        data.ctrl[model.actuator(P + "boom").id] = -0.2
+        layer = held(model, data)
+        layer.act(np.array([[0.0, RAISE, 0.0, 0.0]]))
         for _ in range(round(3.0 / model.opt.timestep)):
-            mujoco.mj_step(model, data)
+            layer.step()
             assert data.xmat[base][8] > math.cos(math.radians(0.5))
             if data.xipos[body][2] - load.half[2] > LIFT_CLEARANCE + CONTACT_MARGIN:
                 break
         assert data.xipos[body][2] - load.half[2] > LIFT_CLEARANCE + CONTACT_MARGIN
         anchor = data.xanchor[model.joint(P + "bucket").id]
         assert anchor[2] <= height and math.hypot(anchor[0], anchor[1]) <= radius[height]
-        assert sling_tension(model, data, 0) == pytest.approx(
+        layer.act(np.zeros((1, 4)))
+        run(model, data, 1.0)
+        tension = []
+        for _ in range(round(1.0 / model.opt.timestep)):
+            layer.step()
+            tension.append(sling_tension(model, data, 0))
+        assert np.mean(tension) == pytest.approx(
             load.mass * G / math.cos(load.leg_angle), rel=0.02)
 
 def test_ground_reaches_past_the_hook_plus_the_longest_sling_and_block():

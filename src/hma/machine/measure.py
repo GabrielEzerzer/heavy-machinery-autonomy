@@ -1,4 +1,5 @@
-"""Measurements of the machine on rigid ground: hand statics against simulated tipping.
+"""Measurements of the machine on rigid ground, its arm held rigidly by joint friction: hand
+statics against simulated tipping.
 Usage: python -m hma.machine.measure"""
 
 from __future__ import annotations
@@ -9,12 +10,11 @@ import math
 import mujoco
 import numpy as np
 
-from hma.machine.ground import Ground, apply_ground, settle
+from hma.machine.ground import HOLD, Ground, apply_ground, settle
 from hma.machine.load import place_load
 from hma.machine.model import (
     HOME_KEY,
     JOINT_NAMES,
-    VALVE,
     load_scene,
     machine_prefix,
 )
@@ -22,7 +22,6 @@ from hma.machine.statics import Machine, reach_load_point
 from hma.machine.tracks import FRICTION, FRONT_LINE, REAR_LINE, SIDE_LINE, step
 
 P = machine_prefix(0)
-HOLD = 1e9
 TIPPED = 0.5
 TRAVEL_POSE = (0.0, -0.8, 2.5, 2.4)
 LOAD_AWAY = (-11.0, 11.0)
@@ -32,12 +31,15 @@ def slope(along=0.0, across=0.0, friction=FRICTION):
     return Ground(grade=(math.tan(along), math.tan(across)), friction=friction)
 
 
-def released(ground=None, pose=TRAVEL_POSE, hold=False, heading=0.0):
+def hold_arm(model, index=0):
+    prefix = machine_prefix(index)
+    model.dof_frictionloss[[model.joint(prefix + name).dofadr[0] for name in JOINT_NAMES]] = HOLD
+
+
+def released(ground=None, pose=TRAVEL_POSE, heading=0.0):
     model = load_scene(1)
     apply_ground(model, 0, ground or Ground())
-    if hold:
-        for name in JOINT_NAMES:
-            model.tendon_frictionloss[model.tendon(P + name + VALVE).id] = HOLD
+    hold_arm(model)
     data = mujoco.MjData(model)
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
     if pose is not None:
@@ -116,7 +118,7 @@ def tipping_case(name):
     height, radius, swing, along, across = CASES[name]
     pose = chart_pose(height, radius, swing)
     ground = slope(along, across)
-    model, data = released(ground, pose=pose, hold=True)
+    model, data = released(ground, pose=pose)
     origin, rot = base_frame(model, data)
     if swing in (0.0, math.pi):
         line = origin + rot @ [FRONT_LINE if swing == 0.0 else REAR_LINE, 0.0, 0.0]
@@ -131,7 +133,7 @@ def sim_tipping_load(name: str, tolerance: float = 0.005) -> tuple[float, float]
     low, high = 0.8 * hand, 1.2 * hand
     while high - low > tolerance * hand:
         middle = (low + high) / 2
-        model, data = released(ground, pose=pose, hold=True)
+        model, data = released(ground, pose=pose)
         if tips_under(model, data, middle) > TIPPED:
             high = middle
         else:

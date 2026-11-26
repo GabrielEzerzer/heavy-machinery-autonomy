@@ -6,7 +6,6 @@ import pytest
 
 from hma.machine import (
     BODY_NAMES,
-    FORCE_CAPS,
     GROUND,
     HOME_KEY,
     HOME_POSE,
@@ -29,14 +28,14 @@ from hma.machine.model import (
     LOAD_POINTS,
     MACHINE_SPACING,
     MAX_MACHINES,
-    SPEED_LIMITS,
-    VALVE,
     ground_geoms,
     ground_height,
 )
 from hma.machine.tracks import WHEEL_MASSES, WHEELS, step
+from scenes import held, lock_joints
 
 LIFT_POSE = (0.0, -0.65, 1.0, 2.4)
+LOWER = 0.3
 SOURCE_LIMITS_DEG = {"boom": (-70.0, 44.0), "arm": (30.0, 152.0), "bucket": (-33.0, 143.0)}
 
 
@@ -78,8 +77,9 @@ def push_base(model, data, index, force, seconds):
 
 
 def settle(model, data, seconds=1.0):
+    layer = held(model, data)
     for _ in range(round(seconds / model.opt.timestep)):
-        step(model, data)
+        layer.step()
 
 
 def hang(model, data, mass):
@@ -106,17 +106,18 @@ def test_joint_limits_match_source():
     assert not model.joint(machine_prefix(0) + "swing").limited
 
 
-def test_every_driven_joint_has_a_speed_valve_capped_at_its_force_limit():
+def test_every_driven_joint_has_an_unlimited_torque_motor_on_the_joint():
     model = load_scene(1)
     prefix = machine_prefix(0)
     for name in JOINT_NAMES:
         act = model.actuator(prefix + name)
-        assert act.trnid[0] == model.joint(prefix + name + VALVE).id
-        np.testing.assert_allclose(act.ctrlrange, [-SPEED_LIMITS[name], SPEED_LIMITS[name]])
-        tendon = model.tendon(prefix + name + VALVE).id
-        assert model.tendon_frictionloss[tendon] == FORCE_CAPS[name]
-        start, count = model.tendon_adr[tendon], model.tendon_num[tendon]
-        assert model.joint(prefix + name).id in model.wrap_objid[start:start + count]
+        assert act.trntype == mujoco.mjtTrn.mjTRN_JOINT
+        assert act.trnid[0] == model.joint(prefix + name).id
+        assert act.gainprm[0] == 1.0 and not act.biasprm.any()
+        assert not act.ctrllimited and not act.forcelimited
+    joint_wraps = model.wrap_type == mujoco.mjtWrap.mjWRAP_JOINT
+    driven = [model.joint(prefix + name).id for name in JOINT_NAMES]
+    assert not np.isin(model.wrap_objid[joint_wraps], driven).any()
 
 
 def test_names_are_prefixed_per_machine():
@@ -267,6 +268,7 @@ def worst_tilt(swing, payload):
     data = home_data(model)
     set_pose(model, data, 0, dict(zip(JOINT_NAMES, (swing, *LIFT_POSE[1:]), strict=True)))
     hang(model, data, payload)
+    lock_joints(model, data)
     base = model.body(machine_prefix(0) + "base").id
     worst, feet = 0.0, []
     for _ in range(round(3.0 / model.opt.timestep)):
@@ -375,7 +377,7 @@ def test_bucket_lowered_onto_raised_ground_stops_on_its_surface():
     data = home_data(model)
     pose = dict(zip(JOINT_NAMES, inverse_kinematics(np.array([5.5, 0.0, 2.3]), 1.0), strict=True))
     set_pose(model, data, 0, pose)
-    data.ctrl[model.actuator(machine_prefix(0) + "boom").id] = 0.1
+    held(model, data).act(np.array([[0.0, LOWER, 0.0, 0.0]]))
     settle(model, data, 6.0)
     mujoco.mj_rnePostConstraint(model, data)
     assert data.site(machine_prefix(0) + TIP_SITE).xpos[2] == pytest.approx(1.5, abs=0.05)

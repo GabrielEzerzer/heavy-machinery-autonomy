@@ -1,6 +1,6 @@
-"""Physics steps per second through the hydraulics layer, standing, propping, carrying and
-travelling, for 1 and 8 machines. With --before <src dir> each run alternates with the same run
-on that tree; a tree without hma.machine.load carries its payload as a force at the bucket tip."""
+"""Steps per second through the hydraulics layer, standing, working the arm, propping, carrying and
+travelling, 1 and 8 machines. --before <src dir> alternates each run with that tree's; a tree with
+no travel drive skips travelling, one without hma.machine.load carries a force at the bucket tip."""
 
 from __future__ import annotations
 
@@ -15,8 +15,10 @@ import mujoco
 import numpy as np
 
 MASS = 2000.0
-POSES = {"standing": (0.0, -0.6, 1.9, 0.6), "propping": (0.0, -0.5, 1.6, 1.0),
-         "carrying": (0.0, -1.0, 1.6, 2.3), "travelling": (0.0, -0.8, 2.5, 2.4)}
+PROP = 0.6
+POSES = {"standing": (0.0, -0.6, 1.9, 0.6), "working": (0.0, -0.6, 1.9, 0.6),
+         "propping": (0.0, -0.5, 1.6, 1.0), "carrying": (0.0, -1.0, 1.6, 2.3),
+         "travelling": (0.0, -0.8, 2.5, 2.4)}
 LOAD_AWAY = (-11.0, 11.0)
 SCENES = [(n, case) for n in (1, 8) for case in POSES]
 
@@ -50,7 +52,9 @@ def measure(n: int, case: str, seconds: float, warmup: float) -> tuple[float, in
 
     def decide() -> None:
         if case == "propping":
-            commands[:, 1] = 1.0 / 3.0
+            commands[:, 1] = PROP
+        elif case == "working":
+            commands[:] = rng.uniform(-1.0, 1.0, commands.shape)
         else:
             commands[:, 0] = rng.uniform(-1.0, 1.0, n)
         if case == "travelling":
@@ -78,10 +82,14 @@ def measure(n: int, case: str, seconds: float, warmup: float) -> tuple[float, in
     return decisions * per / (time.perf_counter() - start), int(data.ncon)
 
 
-def run_one(src: str | None, n: int, case: str, seconds: float, warmup: float) -> dict:
+def run_one(src: str | None, n: int, case: str, seconds: float, warmup: float) -> dict | None:
     env = dict(os.environ)
     if src is not None:
         env["PYTHONPATH"] = src
+    if case == "travelling" and subprocess.run(
+            [sys.executable, "-c", "from hma.machine import TRAVEL_NAMES"], env=env,
+            capture_output=True).returncode:
+        return None
     out = subprocess.run([sys.executable, __file__, "--one", str(n), case, "--seconds",
                           str(seconds), "--warmup", str(warmup)], env=env, check=True,
                          capture_output=True, text=True).stdout
@@ -107,7 +115,9 @@ def main() -> None:
         before, after, ncon = [], [], 0
         for _ in range(args.repeats):
             if args.before:
-                before.append(run_one(args.before, n, case, args.seconds, args.warmup)["rate"])
+                result = run_one(args.before, n, case, args.seconds, args.warmup)
+                if result is not None:
+                    before.append(result["rate"])
             result = run_one(here, n, case, args.seconds, args.warmup)
             after.append(result["rate"])
             ncon = result["ncon"]

@@ -1,6 +1,7 @@
 """Scenes of 12 t class excavators, each on its own ground of primitive geoms; names start with
-machine_prefix(i). ctrl is a joint speed in rad/s or a track speed in m/s, sent through a "_valve"
-joint: read joints by name. Step with hma.machine.tracks.step, which limits travel power."""
+machine_prefix(i). ctrl is the torque on each driven joint in N m, which hma.hydraulics computes
+from the oil pressures, or a track speed in m/s sent through a "_valve" joint. Step with
+hma.machine.tracks.step, which limits travel power."""
 
 from __future__ import annotations
 
@@ -30,12 +31,10 @@ HOME_KEY = "home"
 HOME_POSE = (0.0, -0.6, 1.9, 0.6)
 
 COUNTERWEIGHT_MASS = mass.COUNTERWEIGHT_MASS
-FORCE_CAPS = {"swing": 34.0e3, "boom": 330.0e3, "arm": 244.0e3, "bucket": 122.0e3}
-SPEED_LIMITS = {"swing": 1.0, "boom": 0.6, "arm": 0.8, "bucket": 1.2}
+END_STOP_SOLIMP = (0.999, 0.9999, 0.001)
 VALVE = "_valve"
 VALVE_INERTIA = 1.0e8
 VALVE_GAIN = 5.0e9
-VALVE_SOLIMP = (0.999, 0.9999, 0.001)
 
 GROUND_HALF = 13.5
 GROUND_X = (-GROUND_HALF, GROUND_HALF)
@@ -110,7 +109,7 @@ def _turn_reference_to_home(joint: mujoco.MjsJoint, angle: float) -> None:
 
 
 def _valve(spec: mujoco.MjSpec, name: str, joints: tuple[str, ...], cap: float, limit: float,
-           solimp: tuple[float, float, float] = VALVE_SOLIMP, coef: float = 1.0) -> None:
+           solimp: tuple[float, float, float], coef: float) -> None:
     valve = spec.worldbody.add_body(name=name + VALVE, mass=1.0, inertia=[1.0, 1.0, 1.0],
                                     explicitinertial=True)
     valve.add_joint(name=name + VALVE, axis=[0.0, 0.0, 1.0], armature=VALVE_INERTIA)
@@ -176,8 +175,11 @@ def _machine_spec(index: int) -> mujoco.MjSpec:
         joint = spec.joint(name)
         _turn_reference_to_home(joint, home)
         joint.solref_limit = [2 * TIMESTEP, 1.0]
-        joint.solimp_limit = [*VALVE_SOLIMP, 0.5, 2.0]
-        _valve(spec, name, (name,), FORCE_CAPS[name], SPEED_LIMITS[name])
+        joint.solimp_limit = [*END_STOP_SOLIMP, 0.5, 2.0]
+        joint.solref_friction = [2 * TIMESTEP, 1.0]
+        joint.solimp_friction = [*END_STOP_SOLIMP, 0.5, 2.0]
+        act = spec.add_actuator(name=name, target=name, trntype=mujoco.mjtTrn.mjTRN_JOINT)
+        act.set_to_motor()
     for side in tracks.SIDES:
         _add_track(spec, side)
     add_collision_geoms(spec, 1 << index, CONTACT_SOLREF, CONTACT_SOLIMP, STEEL_FRICTION,
