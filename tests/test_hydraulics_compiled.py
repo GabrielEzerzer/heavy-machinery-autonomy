@@ -15,6 +15,7 @@ WELDED_POSITION = 1e-12
 WELDED_PRESSURE = 1e-4
 WELDED_ENERGY = 1e-12
 DRIVEN_POSITION = 1e-7
+DRIVEN_SETTLED_PRESSURE = 5.0
 DRIVEN_LATE_PRESSURE = 0.1
 DRIVEN_END_ENERGY = 1e-7
 
@@ -91,6 +92,7 @@ def test_the_compiled_step_tracks_the_numpy_step_on_drawn_machines_driving_over_
     layer, gaps = run_side_by_side(welded=False)
     assert layer.redos > 0 and layer.capped > 0 and layer.check_bound > 0
     assert gaps[:, 0].max() <= DRIVEN_POSITION
+    assert gaps[20:, 1].max() <= DRIVEN_SETTLED_PRESSURE
     assert gaps[len(gaps) // 2:, 1].max() <= DRIVEN_LATE_PRESSURE
     assert gaps[-1, 2] <= DRIVEN_END_ENERGY
 
