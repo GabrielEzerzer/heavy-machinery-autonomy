@@ -12,9 +12,20 @@ import numpy as np
 from hma.hydraulics import NOMINAL, BaseController, Hydraulics, draw_machine
 from hma.hydraulics.layer import JOINTS, STATE, SWING
 from hma.machine import TIP_SITE, inverse_kinematics, load_scene, machine_prefix
-from hma.machine.model import BASE_JOINT
+from hma.machine.contact import draw_friction, set_friction
+from hma.machine.ground import GEOM_STATE, Ground, apply_ground, draw_ground
+from hma.machine.kinematics import BOOM_PIVOT
+from hma.machine.model import (
+    ANCHOR,
+    BASE_JOINT,
+    RING,
+    STEEL_FRICTION,
+    ground_geoms,
+    set_const,
+)
+from hma.task.checks import LIMITS
 from hma.train import footing
-from hma.train.task import RUNGS, PropPath, Settings, Task, draw_task
+from hma.train.task import RUNGS, PropPath, Settings, Task, draw_task, reachable
 
 CONTROL_HZ = 10.0
 PREVIEW = (0.0, 0.5, 1.0)
@@ -31,6 +42,9 @@ STRUCK = ("base", "upper", "boom")
 BAD = ("mjWARN_BADQPOS", "mjWARN_BADQVEL", "mjWARN_BADQACC")
 MODES = ("residual", "direct")
 GROUND, FORBIDDEN, BUCKET, FRONT = 1, 2, 3, 4
+LEVEL = Ground()
+HEIGHT_TOLERANCE = 0.05
+PROP_DRAWS = 1000
 FIELDS = (
     ("position", JOINTS, math.pi, -1.0, 1.0),
     ("velocity", JOINTS, 2.0, -5.0, 5.0),
@@ -47,7 +61,7 @@ FRAME_HIGH = np.concatenate([np.full(f[1], f[4]) for f in FIELDS])
 OBS_LOW = np.tile(FRAME_LOW, HISTORY)
 OBS_HIGH = np.tile(FRAME_HIGH, HISTORY)
 SCALE = np.concatenate([np.full(f[1], f[2]) for f in FIELDS])
-EPISODE_ARRAYS = ("k", "steps_total", "pitch0", "roll0", "est0", "sent", "history", "up", "v_prev",
+EPISODE_ARRAYS = ("k", "steps_total", "stance", "est0", "sent", "history", "up", "v_prev",
                   "gyro_bias", "accel_bias", "imu_on", "tip_prev", "apart", "front_prev",
                   "corner_prev", "touched", "rest_load", "rest_count", "landing", "recent",
                   "end_load", "end_steps", "in_band", "hold_steps", "err_total", "done",
@@ -117,8 +131,7 @@ class PropScene:
         self.steps = self.layer.steps_per_decision
         self.dt = self.layer.dt
         self.period = 1.0 / CONTROL_HZ
-        self.parking = footing.Parking(model, n)
-        self.pivot = footing.rear_pivot(model)
+        self.pivot = footing.rear_pivot()
         self.gravity = model.opt.gravity.copy()
         self.filter_gain = self.dt / FILTER_TIME
 
@@ -128,7 +141,15 @@ class PropScene:
         self._swing_q = self.layer._qpos[:, SWING]
         self._swing_v = self.layer._qvel[:, SWING]
         self._upper_at = model.body(machine_prefix(0) + "upper").pos.copy()
-        self._corners = footing.front_corners(model)
+        fronts = footing.front_parts(model, 0)
+        self._per_track = len(fronts[0])
+        self._points = footing.lowest_points(model, np.concatenate(fronts))
+        self._base_body = np.array([model.body(machine_prefix(i) + "base").id for i in range(n)])
+        self._ring_body = np.array([model.body(machine_prefix(i) + RING).id for i in range(n)])
+        self._ring_pos = model.body_pos[self._ring_body].copy()
+        self._ground_rows = [ground_geoms(model, i) for i in range(n)]
+        self._ground_start = [{name: getattr(model, name)[rows].copy() for name in GEOM_STATE
+                               if name.startswith("geom_")} for rows in self._ground_rows]
         self._tips = np.array([model.site(machine_prefix(i) + TIP_SITE).id for i in range(n)])
         self._own_q = [np.concatenate([np.arange(model.jnt_qposadr[j],
                                                  model.jnt_qposadr[j] + size)
@@ -142,7 +163,8 @@ class PropScene:
         qpos_owner = np.full(model.nq, -1)
         dof_owner = np.full(model.nv, -1)
         for i in range(n):
-            self._corner[footing.front_feet(model, i)] = np.arange(len(self._corners))
+            front = np.concatenate(footing.front_parts(model, i))
+            self._corner[front] = np.arange(len(self._points))
             for links, kind in ((STRIKERS, self._striker), (STRUCK, self._struck)):
                 for link in links:
                     body = model.body(machine_prefix(i) + link).id
@@ -154,23 +176,25 @@ class PropScene:
                 qpos_owner[model.jnt_qposadr[j]:model.jnt_qposadr[j] + size] = i
                 dofs = {0: 6, 1: 3}.get(int(model.jnt_type[j]), 1)
                 dof_owner[model.jnt_dofadr[j]:model.jnt_dofadr[j] + dofs] = i
-            for role, geoms in ((GROUND, footing.ground_shapes(model, i)),
+            for role, geoms in ((GROUND, ground_geoms(model, i)),
                                 (FORBIDDEN, footing.forbidden_shapes(model, i)),
-                                (BUCKET, footing.touches_ground(model, i, footing.ALLOWED_LINK)),
-                                (FRONT, footing.front_feet(model, i))):
+                                (BUCKET, footing.bucket_shapes(model, i)),
+                                (FRONT, front)):
                 self._role[geoms] = role
                 self._owner[geoms] = i
 
         self.seeds: list[int | None] = [None] * n
         self.tasks: list[Task | None] = [None] * n
-        self.grounds: list[footing.Ground] = [footing.FLAT] * n
+        self.grounds: list[Ground] = [LEVEL] * n
+        self.frictions = [STEEL_FRICTION[0]] * n
+        self.heights = [0.0] * n
         self.machines = [NOMINAL] * n
+        self.normal = np.tile([0.0, 0.0, 1.0], (n, 1))
         self.controllers: list[BaseController | None] = [None] * n
         self._imu_rngs: list[np.random.Generator | None] = [None] * n
         self.k = np.zeros(n, np.intp)
         self.steps_total = np.zeros(n, np.intp)
-        self.pitch0 = np.zeros(n)
-        self.roll0 = np.zeros(n)
+        self.stance = np.tile([0.0, 0.0, 1.0], (n, 1))
         self.est0 = np.zeros((n, 2))
         self.sent = np.zeros((n, JOINTS))
         self.history = np.zeros((n, HISTORY, FRAME))
@@ -182,15 +206,15 @@ class PropScene:
         self.tip_prev = np.zeros((n, 3))
         self._hop = round(self.settings.hop / self.dt)
         self.apart = np.full(n, self._hop + 1, np.intp)
-        self.front_prev = np.zeros((n, len(self._corners)), bool)
-        self.corner_prev = np.zeros((n, len(self._corners)))
+        self.front_prev = np.zeros((n, len(self._points)), bool)
+        self.corner_prev = np.zeros((n, len(self._points)))
         self.touched = np.zeros(n, bool)
-        self.rest_load = np.zeros((n, len(self._corners)))
+        self.rest_load = np.zeros((n, 2))
         self.rest_count = np.zeros(n, np.intp)
         self.landing = np.zeros(n)
         self.recent = np.zeros((n, HISTORY))
         window = max(1, round(self.settings.window / self.period))
-        self.end_load = np.zeros((n, window, len(self._corners)))
+        self.end_load = np.zeros((n, window, 2))
         self.end_steps = np.zeros((n, window), np.intp)
         self.in_band = np.zeros(n, np.intp)
         self.hold_steps = np.zeros(n, np.intp)
@@ -207,25 +231,83 @@ class PropScene:
                 kind = int(self.model.jnt_type[j])
                 yield j, {0: 7, 1: 4}.get(kind, 1)
 
-    def draw(self, index: int, seed: int) -> tuple:
-        rung = RUNGS[self.rung]
-        machine = draw_machine(seed) if rung.machines else NOMINAL
-        ground = footing.draw_ground(seed) if rung.ground else footing.FLAT
-        task = draw_task(seed, self.settings, self.pivot,
-                         lambda x, y: footing.surface(ground, x, y), self.period)
-        return machine, ground, task
+    def machine_for(self, index: int, seed: int):
+        return draw_machine(seed) if RUNGS[self.rung].machines else NOMINAL
+
+    def _apply(self, index: int, ground: Ground, friction: float) -> None:
+        self.model.body_pos[self._ring_body[index]] = self._ring_pos[index]
+        for name, value in self._ground_start[index].items():
+            getattr(self.model, name)[self._ground_rows[index]] = value
+        apply_ground(self.model, index, ground)
+        footing.park(self.model, index)
+        set_friction(self.model, index, friction)
+        rot = np.zeros(9)
+        mujoco.mju_quat2Mat(rot, self.model.geom_quat[ground_geoms(self.model, index)[0]])
+        self.normal[index] = rot.reshape(3, 3)[:, 2]
+
+    def _plane_frame(self, index: int, ground: Ground) -> tuple[np.ndarray, np.ndarray]:
+        plane = ground_geoms(self.model, index)[0]
+        rot = np.zeros(9)
+        mujoco.mju_quat2Mat(rot, self.model.geom_quat[plane])
+        origin = self.model.body_pos[self.model.body(machine_prefix(index) + ANCHOR).id]
+        return origin + [0.0, 0.0, ground.level], rot.reshape(3, 3)
+
+    def _surface(self, index: int, origin: np.ndarray, rot: np.ndarray):
+        origin, rot = origin.copy(), rot.copy()
+        return lambda x, y: float(footing.height_under(self.model, index, origin, rot,
+                                                       [(x, y)])[0])
+
+    def height_under(self, index: int, x: float, y: float) -> float:
+        body = self._base_body[index]
+        return self._surface(index, self.data.xpos[body],
+                             self.data.xmat[body].reshape(3, 3))(x, y)
+
+    def _start(self, task: Task) -> np.ndarray:
+        return inverse_kinematics(*PropPath(task, self.pivot)(0.0))
+
+    def _settled_even(self, index: int, x: float, y: float) -> bool:
+        body = self._base_body[index]
+        origin, rot = self.data.xpos[body], self.data.xmat[body].reshape(3, 3)
+        stance = footing.height_under(self.model, index, origin, rot, footing.FOOTPRINT)
+        press = footing.height_under(self.model, index, origin, rot, footing.PRESS + [x, y])
+        return bool(np.abs(stance).max() <= footing.EVEN and np.ptp(press) <= footing.EVEN)
+
+    def _stand(self, index: int, seed: int, machine, friction: float) -> tuple:
+        side = float(BOOM_PIVOT[1])
+        for attempt in range(PROP_DRAWS):
+            ground = draw_ground(seed, attempt)
+            if (footing.slope_deg(ground) > LIMITS.bucket_ground_slope_deg
+                    or not footing.even_stance(ground)):
+                continue
+            try:
+                self._apply(index, ground, friction)
+                surface = self._surface(index, *self._plane_frame(index, ground))
+                task = draw_task(seed, self.settings, self.pivot, surface, self.period)
+                if not footing.flat_press(ground, task.prop_x, side):
+                    continue
+                self.layer.reset(index, machine, self._start(task))
+            except (ValueError, RuntimeError):
+                continue
+            height = self.height_under(index, task.prop_x, side)
+            if (self._settled_even(index, task.prop_x, side)
+                    and abs(height - surface(task.prop_x, side)) <= HEIGHT_TOLERANCE
+                    and reachable(PropPath(task, self.pivot, height), self.period)):
+                return ground, task, height
+        raise RuntimeError(f"no ground drawn from seed {seed} gives a propping task")
 
     def _write(self, index: int, seed: int) -> None:
-        machine, ground, task = self.draw(index, seed)
-        path = PropPath(task, self.pivot)
-        position, pitch = path(0.0)
-        pose = inverse_kinematics(position, pitch)
-        footing.apply_ground(self.model, index, ground)
-        self.layer.reset(index, machine, pose)
-        self.parking.park(self.model, self.data, index)
-        self.seeds[index], self.tasks[index] = seed, task
-        self.machines[index], self.grounds[index] = machine, ground
-        self.controllers[index] = BaseController(path, CONTROL_HZ)
+        machine = self.machine_for(index, seed)
+        if RUNGS[self.rung].ground:
+            friction = draw_friction(seed)
+            ground, task, height = self._stand(index, seed, machine, friction)
+        else:
+            friction, ground, height = STEEL_FRICTION[0], LEVEL, 0.0
+            self._apply(index, ground, friction)
+            task = draw_task(seed, self.settings, self.pivot, lambda x, y: 0.0, self.period)
+            self.layer.reset(index, machine, self._start(task))
+        self.seeds[index], self.tasks[index], self.machines[index] = seed, task, machine
+        self.grounds[index], self.frictions[index], self.heights[index] = ground, friction, height
+        self.controllers[index] = BaseController(PropPath(task, self.pivot), CONTROL_HZ)
 
     def reset(self, index: int, seed: int) -> np.ndarray:
         self._write(index, seed)
@@ -237,7 +319,7 @@ class PropScene:
         quat = self.data.qpos[self._base_q[index] + 3:self._base_q[index] + 7]
         rot = _matrices(quat[None])[0]
         up = rot[2]
-        self.pitch0[index], self.roll0[index] = math.atan2(up[0], up[2]), math.atan2(up[1], up[2])
+        self.stance[index] = rot[:, 2]
         swing = self.data.qpos[self._swing_q[index]]
         self.up[index] = _turn(up[None], np.array([-swing]))[0]
         self.v_prev[index] = self._upper_velocity()[index]
@@ -247,7 +329,7 @@ class PropScene:
         self.tip_prev[index] = self.data.site_xpos[self._tips[index]]
         self.apart[index] = self._hop + 1
         self.front_prev[index] = self._contacts()[1][index]
-        self.corner_prev[index] = -self._corner_velocity()[index, 2]
+        self.corner_prev[index] = self._approach(self._part_velocity())[index]
         self.touched[index] = False
         self.rest_load[index] = 0.0
         self.rest_count[index] = 0
@@ -294,12 +376,16 @@ class PropScene:
         arm = rot @ self._upper_at
         return v[self._base_v[:, None] + np.arange(3)] + _cross(omega[..., 0], arm)
 
-    def _corner_velocity(self) -> np.ndarray:
+    def _part_velocity(self, rot: np.ndarray | None = None) -> np.ndarray:
         q, v = self.data.qpos, self.data.qvel
-        rot = _matrices(q[self._base_q[:, None] + np.arange(3, 7)])
-        offsets = rot @ self._corners.T
+        if rot is None:
+            rot = _matrices(q[self._base_q[:, None] + np.arange(3, 7)])
+        offsets = rot @ self._points.T
         omega = rot @ v[self._base_v[:, None] + np.arange(3, 6)][..., None]
         return v[self._base_v[:, None] + np.arange(3)][..., None] + np.cross(omega, offsets, axis=1)
+
+    def _approach(self, velocity: np.ndarray) -> np.ndarray:
+        return -np.einsum("nkp,nk->np", velocity, self.normal)
 
     def _failure(self, failed: np.ndarray, seen: bool) -> bool:
         for warning, owners in self._bad:
@@ -338,7 +424,7 @@ class PropScene:
         holds = np.array([task.hold_span for task in self.tasks])
         in_hold = (times >= holds[:, :1]) & (times < holds[:, 1:])
         resting = times > np.array([[task.length - task.final] for task in self.tasks])
-        load_sum = np.zeros((n, len(self._corners)))
+        load_sum = np.zeros((n, 2))
         fresh = np.zeros(n)
         err_sum = np.zeros(n)
         roll_sum = np.zeros(n)
@@ -361,11 +447,10 @@ class PropScene:
             reset_seen = self._failure(failed, reset_seen)
             q, v = data.qpos, data.qvel
             rot = _matrices(q[base_q[:, None] + np.arange(3, 7)])
-            up = rot[:, 2, :]
-            pitch, roll = _tilts(up)
-            err = np.abs(pitch - self.pitch0 - reference[:, step])
+            pitch, roll = _tilts(np.einsum("nk,nkj->nj", self.stance, rot))
+            err = np.abs(pitch - reference[:, step])
             err_sum += err
-            roll_sum += np.abs(roll - self.roll0)
+            roll_sum += np.abs(roll)
             worst_tilt = np.maximum(worst_tilt, np.abs(pitch))
             worst_roll = np.maximum(worst_roll, np.abs(roll))
             self.in_band += in_hold[:, step] & (err <= s.band)
@@ -403,10 +488,7 @@ class PropScene:
             self.front_prev = front
             if resting[:, step].any():
                 load_sum += np.where(resting[:, step, None], self._front_load(), 0.0)
-            offsets = rot @ self._corners.T
-            corner_v = v[base_v[:, None] + np.arange(3)][..., None] + np.cross(omega, offsets,
-                                                                               axis=1)
-            self.corner_prev = -corner_v[:, 2]
+            self.corner_prev = self._approach(self._part_velocity(rot))
         self.landing = np.maximum(self.landing, fresh)
         self.recent[:, :-1] = self.recent[:, 1:]
         self.recent[:, -1] = fresh
@@ -425,7 +507,8 @@ class PropScene:
         rest = self.rest_load / np.maximum(self.rest_count, 1)[:, None]
         held = self.end_load.sum(1) / np.maximum(self.end_steps.sum(1), 1)[:, None]
         carried = np.min(np.divide(held, rest, out=np.zeros_like(rest), where=rest > 0.0), axis=1)
-        clear = ~bucket & front.all(1)
+        down = front.reshape(n, 2, self._per_track).any(2).all(1)
+        clear = ~bucket & down
         shortfall = np.where(settling, np.where(clear, 1.0 - np.minimum(carried / s.carry, 1.0),
                                                 1.0), 0.0)
         self.k += 1
@@ -446,7 +529,7 @@ class PropScene:
             flags = {"unstable": failed[i], "contact": forbidden[i], "strike": struck[i],
                      "tilt": worst_tilt[i] > s.tilt_limit, "roll": worst_roll[i] > s.roll_limit}
             causes.append(None if cut[i] else next((c for c in CAUSES if flags[c]), None))
-        motion = self._corner_velocity()
+        motion = self._part_velocity()
         obs = np.zeros((n, HISTORY * FRAME))
         terminated = np.zeros(n, bool)
         infos: list[dict] = [{} for _ in range(n)]
@@ -468,9 +551,8 @@ class PropScene:
                 self.done[i] = True
                 self.active[i] = False
                 speed = float(np.linalg.norm(motion[i], axis=0).max())
-                infos[i] = self.outcome(i, causes[i], pitch[i] - self.pitch0[i],
-                                        float(carried[i]), speed, bool(bucket[i]),
-                                        bool(front[i].all()))
+                infos[i] = self.outcome(i, causes[i], pitch[i], float(carried[i]), speed,
+                                        bool(bucket[i]), bool(down[i]))
                 infos[i]["passed"] &= not cut[i]
                 infos[i]["truncated"] = causes[i] is None
                 infos[i]["cut_short"] = bool(cut[i])
@@ -490,7 +572,7 @@ class PropScene:
                 "decisions": int(self.k[index])}
 
     def _front_load(self) -> np.ndarray:
-        load = np.zeros((self.n, len(self._corners)))
+        load = np.zeros((self.n, 2))
         count = self.data.ncon
         if not count:
             return load
@@ -502,13 +584,13 @@ class PropScene:
         for c in hits:
             g = pairs[c, 0] if role[c, 0] == FRONT else pairs[c, 1]
             mujoco.mj_contactForce(self.model, self.data, int(c), force)
-            load[self._owner[g], self._corner[g]] += force[0]
+            load[self._owner[g], self._corner[g] // self._per_track] += force[0]
         return load
 
     def _contacts(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         n = self.n
         bucket, forbidden, strike = (np.zeros(n, bool) for _ in range(3))
-        front = np.zeros((n, len(self._corners)), bool)
+        front = np.zeros((n, len(self._points)), bool)
         count = self.data.ncon
         if count:
             pairs = self.data.contact.geom[:count]
@@ -534,6 +616,8 @@ class PropScene:
         return {
             "n": self.n, "rung": self.rung, "mode": self.mode, "settings": self.settings,
             "seeds": list(self.seeds), "physics": state, "layer": self.layer.snapshot(),
+            "drawn": [list(x) for x in (self.tasks, self.machines, self.grounds, self.frictions,
+                                        self.heights)],
             "episode": {name: np.copy(getattr(self, name)) for name in EPISODE_ARRAYS},
             "imu": [rng.bit_generator.state for rng in self._imu_rngs],
         }
@@ -543,8 +627,17 @@ class PropScene:
             raise ValueError("the snapshot is of a different scene")
         if snapshot["settings"] != self.settings:
             raise ValueError("the snapshot was taken with different settings")
-        for index, seed in enumerate(snapshot["seeds"]):
-            self._write(index, seed)
+        tasks, machines, grounds, frictions, heights = snapshot["drawn"]
+        for index in range(self.n):
+            self._apply(index, grounds[index], frictions[index])
+            self.layer.machines[index] = machines[index]
+            self.layer._apply_mass(index, machines[index])
+            self.controllers[index] = BaseController(PropPath(tasks[index], self.pivot),
+                                                     CONTROL_HZ)
+        set_const(self.model, self.layer._scratch)
+        self.seeds = list(snapshot["seeds"])
+        self.tasks, self.machines, self.grounds = list(tasks), list(machines), list(grounds)
+        self.frictions, self.heights = list(frictions), list(heights)
         mujoco.mj_setState(self.model, self.data, snapshot["physics"], STATE)
         mujoco.mj_forward(self.model, self.data)
         self.layer.restore(snapshot["layer"])

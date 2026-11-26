@@ -38,6 +38,7 @@ from hma.machine.model import (
     rest_home,
     rest_pose,
     ring_at_load,
+    set_const,
 )
 from hma.machine.statics import CHART
 
@@ -151,7 +152,7 @@ def apply_load(model: mujoco.MjModel, index: int, load: Load, scratch: mujoco.Mj
         for name, value in saved.items():
             getattr(model, name)[:] = value
         raise
-    mujoco.mj_setConst(model, scratch)
+    set_const(model, scratch)
 
 
 def _write_load(model: mujoco.MjModel, index: int, load: Load, values: np.ndarray,

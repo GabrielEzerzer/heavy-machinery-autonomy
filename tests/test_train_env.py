@@ -7,7 +7,10 @@ import pytest
 
 from hma.hydraulics import NOMINAL, RANGES, BaseController, Hydraulics, draw_machine
 from hma.hydraulics.params import LITRE
-from hma.machine import inverse_kinematics, load_scene, machine_prefix
+from hma.machine import TRAVEL_NAMES, inverse_kinematics, load_scene, machine_prefix, tracks
+from hma.machine.contact import set_friction
+from hma.machine.ground import Box, Ground, apply_ground
+from hma.machine.model import STEEL_FRICTION
 from hma.train import footing
 from hma.train.scene import OBS_HIGH, OBS_LOW, PropScene
 from hma.train.task import (
@@ -21,6 +24,7 @@ from hma.train.task import (
 )
 
 SEED = DEV_BASE + 3
+BRAKED = DEV_BASE + 30
 
 
 def run(scene, actions):
@@ -36,6 +40,11 @@ def same(a, b):
                for x, y in zip(p, q, strict=True))
 
 
+def model_arrays(model):
+    return {name: getattr(model, name) for name in dir(model)
+            if not name.startswith("_") and isinstance(getattr(model, name), np.ndarray)}
+
+
 def test_zero_residual_is_the_plain_baseline_bit_for_bit():
     scene = PropScene(1, "machines")
     scene.reset(0, SEED)
@@ -45,11 +54,12 @@ def test_zero_residual_is_the_plain_baseline_bit_for_bit():
     model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_WARMSTART)
     data = mujoco.MjData(model)
     layer = Hydraulics(model, data, [NOMINAL])
-    machine, ground, task = scene.draw(0, SEED)
-    path = PropPath(task, footing.rear_pivot(model))
-    footing.apply_ground(model, 0, ground)
+    machine, task = scene.machines[0], scene.tasks[0]
+    path = PropPath(task, footing.rear_pivot())
+    apply_ground(model, 0, Ground())
+    footing.park(model, 0)
+    set_friction(model, 0, STEEL_FRICTION[0])
     layer.reset(0, machine, inverse_kinematics(*path(0.0)))
-    footing.Parking(model, 1).park(model, data, 0)
     mujoco.mj_forward(model, data)
     controller = BaseController(path, 10.0)
     for k in range(60):
@@ -78,6 +88,7 @@ def test_save_restore_and_replay_is_bit_for_bit():
     scene.reset(0, SEED)
     scene.reset(1, SEED + 1)
     run(scene, actions[:20])
+    scene.data.userdata[:] = (0.1, -0.2, 3e3, 0.0, 0.0, 5e2)
     saved = pickle.loads(pickle.dumps(scene.snapshot()))
     straight = run(scene, actions[20:])
     other = PropScene(2, "ground")
@@ -87,15 +98,20 @@ def test_save_restore_and_replay_is_bit_for_bit():
     other.restore(saved)
     assert same(straight, run(other, actions[20:]))
     assert np.array_equal(scene.data.qpos, other.data.qpos)
+    assert np.array_equal(scene.data.userdata, other.data.userdata)
+    written = model_arrays(other.model)
+    for name, value in model_arrays(scene.model).items():
+        assert np.array_equal(value, written[name], equal_nan=True), name
 
 
-def test_resetting_one_machine_leaves_its_neighbours_bit_for_bit():
-    actions = np.random.default_rng(1).uniform(-0.3, 0.3, (120, 4, 4))
-    others = [0, 2, 3]
+@pytest.mark.parametrize("rung, machines, decisions", [("ground", 3, 60), ("nominal", 2, 120)])
+def test_resetting_one_machine_leaves_its_neighbours_bit_for_bit(rung, machines, decisions):
+    actions = np.random.default_rng(1).uniform(-0.3, 0.3, (decisions, machines, 4))
+    others = [i for i in range(machines) if i != 1]
 
     def neighbours(reset_middle):
-        scene = PropScene(4, "ground")
-        for i in range(4):
+        scene = PropScene(machines, rung)
+        for i in range(machines):
             scene.reset(i, SEED + i)
         seen = []
         for k, a in enumerate(actions):
@@ -118,9 +134,8 @@ class Corner(PropScene):
         self.corner = machine
         super().__init__(*args, **kwargs)
 
-    def draw(self, index, seed):
-        _, ground, task = super().draw(index, seed)
-        return self.corner, ground, task
+    def machine_for(self, index, seed):
+        return self.corner
 
 
 STIFFEST = replace(
@@ -206,12 +221,7 @@ def test_no_observation_moves_when_only_unsensed_quantities_change():
         model.geom_friction[model.geom(machine_prefix(0) + "load").id, 0] = 0.2
 
     def far_ground(scene):
-        heights = footing.heights(footing.FLAT)
-        heights[:20, :20] = -1.0
-        hf = scene.model.hfield(machine_prefix(0) + "ground")
-        rows = heights.size
-        scene.model.hfield_data[int(hf.adr[0]):int(hf.adr[0]) + rows] = (
-            (heights + 6.0) / 8.0).ravel()
+        apply_ground(scene.model, 0, Ground(boxes=(Box(-10.0, 10.0, 0.3, 1.0, 1.0, 0.3),)))
 
     def clock(scene):
         scene.data.time += 1234.5
@@ -307,9 +317,8 @@ def test_no_observation_reads_the_valve_delay_lag_or_deadband():
 
     def observed(drawn):
         class Fixed(PropScene):
-            def draw(self, index, seed):
-                _, ground, task = super().draw(index, seed)
-                return drawn, ground, task
+            def machine_for(self, index, seed):
+                return drawn
 
         scene = Fixed(1, "machines", mode="direct")
         seen = [scene.reset(0, SEED)]
@@ -318,3 +327,27 @@ def test_no_observation_reads_the_valve_delay_lag_or_deadband():
         return np.array(seen)
 
     assert np.array_equal(observed(machine), observed(slower))
+
+
+def test_a_propping_episode_holds_its_tracks_on_shut_brakes_and_under_the_solver_limit():
+    scene = PropScene(1, "ground")
+    scene.reset(0, BRAKED)
+    model, data = scene.model, scene.data
+    lay = tracks.drives(model)
+    wheel = model.jnt_qposadr[model.dof_jntid[lay.dofs[0]]]
+    travel = [model.actuator(machine_prefix(0) + name).id for name in TRAVEL_NAMES]
+    start = data.qpos[wheel].copy()
+    seen = {"iterations": 0, "travel": 0.0}
+    step = scene.layer.step
+
+    def watched():
+        step()
+        seen["iterations"] = max(seen["iterations"], int(data.solver_niter.max()))
+        seen["travel"] = max(seen["travel"], float(np.abs(data.ctrl[travel]).max()))
+
+    scene.layer.step = watched
+    while not scene.step(np.zeros((1, 4)))[2][0]:
+        pass
+    assert seen["travel"] == 0.0
+    assert np.abs(data.qpos[wheel] - start).max() * tracks.WHEEL_RADIUS < 1e-3
+    assert seen["iterations"] < model.opt.iterations

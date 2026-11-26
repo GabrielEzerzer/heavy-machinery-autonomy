@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from hma.hydraulics import NOMINAL, RANGES, BaseController
-from hma.machine import load_scene, machine_prefix
+from hma.machine import machine_prefix
 from hma.machine.kinematics import BOOM_PIVOT
 from hma.train import evaluate, footing
 from hma.train.scene import CONTROL_HZ, HISTORY, PropScene, reward
@@ -34,7 +34,7 @@ def finish(scene, index=0):
 class Reference(PropScene):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.feet = footing.front_feet(self.model, 0)
+        self.feet = np.concatenate(footing.front_parts(self.model, 0))
         self.body = self.model.body(machine_prefix(0) + "base").id
         self.touching, self.worst = set(), 0.0
 
@@ -55,14 +55,14 @@ class Reference(PropScene):
                                  velocity, 0)
         rot = self.data.xmat[self.body].reshape(3, 3)
         for g in touching - self.touching:
-            corner = self.model.geom_pos[g] - (0.0, 0.0, self.model.geom_size[g, 0])
+            corner = footing.lowest_points(self.model, [g])[0]
             point = velocity[3:] + np.cross(velocity[:3], rot @ corner)
             self.worst = max(self.worst, -point[2])
         self.touching = touching
         return super()._contacts()
 
 
-def test_landing_is_each_front_corners_speed_just_before_its_own_first_contact():
+def test_landing_is_each_front_parts_speed_just_before_its_own_first_contact():
     scene = Reference(1, "nominal")
     scene.reset(0, DEV_BASE + 4)
     info, _ = finish(scene)
@@ -107,7 +107,6 @@ def test_the_bucket_striking_its_own_machine_ends_the_episode_as_a_strike():
     scene = PropScene(1, "nominal", mode="direct")
     scene.reset(0, SEED)
     scene.layer.reset(0, scene.machines[0], STRIKE_POSE)
-    scene.parking.park(scene.model, scene.data, 0)
     mujoco.mj_forward(scene.model, scene.data)
     _, reward, done, info = scene.step(np.zeros((1, 4)))
     assert done[0] and info[0]["cause"] == "strike" and reward[0] == 0.0
@@ -182,14 +181,24 @@ def test_a_solver_failure_while_scoring_reruns_the_other_seeds_to_the_same_resul
     assert all(r["scene_size"] == 3 for r in failed)
 
 
-def test_every_drawn_task_reaches_the_drawn_ground_at_its_press_point():
-    pivot = footing.rear_pivot(load_scene(1))
-    for seed in dev_seeds():
-        ground = footing.draw_ground(seed)
-        task = draw_task(seed, Settings(), pivot,
-                         lambda x, y, g=ground: footing.surface(g, x, y), 0.1)
-        height = footing.surface(ground, task.prop_x, float(BOOM_PIVOT[1]))
-        assert reachable(PropPath(task, pivot, height), 0.1), seed
+def test_every_ground_task_stands_evenly_presses_on_one_flat_surface_and_is_in_reach():
+    scene = PropScene(1, "ground")
+    side = float(BOOM_PIVOT[1])
+    body = scene.model.body(machine_prefix(0) + "base").id
+    for seed in dev_seeds(4):
+        scene.reset(0, seed)
+        task, height = scene.tasks[0], scene.heights[0]
+        origin, rot = scene.data.xpos[body], scene.data.xmat[body].reshape(3, 3)
+        stance = footing.height_under(scene.model, 0, origin, rot, footing.FOOTPRINT)
+        press = footing.height_under(scene.model, 0, origin, rot,
+                                     footing.PRESS + [task.prop_x, side])
+        assert footing.slope_deg(scene.grounds[0]) <= 10.0, seed
+        assert np.abs(stance).max() <= footing.EVEN, seed
+        assert np.ptp(press) <= footing.EVEN, seed
+        assert (scene._front_load()[0] > 0.0).all(), seed
+        assert height == scene.height_under(0, task.prop_x, side)
+        assert reachable(PropPath(task, scene.pivot, height), scene.period), seed
+        assert reachable(PropPath(task, scene.pivot), scene.period), seed
 
 
 def test_the_score_does_not_depend_on_the_number_of_processes():
@@ -200,17 +209,18 @@ def test_the_score_does_not_depend_on_the_number_of_processes():
     assert alone == spread
 
 
-def test_the_hold_counts_exactly_the_physics_steps_inside_the_hold_span():
+def test_the_hold_and_its_band_count_only_the_physics_steps_inside_the_hold_span():
     scene = PropScene(1, "nominal")
-    scene.reset(0, SEED)
+    scene.reset(0, DEV_BASE)
     info, _ = finish(scene)
     start, end = scene.tasks[0].hold_span
     times = np.arange(1, info["decisions"] * scene.steps + 1) * scene.dt
     assert scene.hold_steps[0] == np.count_nonzero((times >= start) & (times < end))
     assert 0 < scene.hold_steps[0] < len(times)
+    assert 0 < scene.in_band[0] <= scene.hold_steps[0]
 
 
-def test_one_front_corner_left_unloaded_at_the_end_fails_the_set_down():
+def test_one_tracks_front_left_unloaded_at_the_end_fails_the_set_down():
     class Unloaded(PropScene):
         def _front_load(self):
             load = super()._front_load()
@@ -279,7 +289,7 @@ def test_skipping_the_lift_at_the_end_earns_less_and_fails_the_set_down():
 
 
 def test_the_baseline_lifts_the_tip_back_along_the_path_it_put_it_down_on():
-    pivot = footing.rear_pivot(load_scene(1))
+    pivot = footing.rear_pivot()
     task = draw_task(SEED, Settings(), pivot, lambda x, y: 0.0, 0.1)
     path = PropPath(task, pivot)
     down = task.length - task.final
@@ -295,9 +305,8 @@ def test_a_full_scale_action_opens_a_valve_past_the_widest_drawn_dead_zone():
     assert Settings().scale > widest
 
     class Widest(PropScene):
-        def draw(self, index, seed):
-            _, ground, task = super().draw(index, seed)
-            return replace(NOMINAL, deadband=np.full(4, widest)), ground, task
+        def machine_for(self, index, seed):
+            return replace(NOMINAL, deadband=np.full(4, widest))
 
         def baseline(self):
             return np.zeros((self.n, 4))

@@ -18,10 +18,10 @@ import numpy as np
 from hma.train.scene import CAUSES, PropScene
 from hma.train.task import DEV_BASE, HELD_OUT_BASE, Settings, training_seed
 
-DRAWN = ("target", "ramp_up", "hold", "ramp_down", "prop_x", "pitch", "friction", "step", "grade",
-         "cross", "delay", "lag", "deadband", "sensor_latency", "counterweight", "link_mass",
-         "seal_friction")
-DEGREES = {"target", "pitch"}
+DRAWN = ("target", "ramp_up", "hold", "ramp_down", "prop_x", "pitch", "friction", "slope",
+         "grade_along", "grade_across", "features", "press_height", "delay", "lag", "deadband",
+         "sensor_latency", "counterweight", "link_mass", "seal_friction")
+DEGREES = {"target", "pitch", "slope"}
 FILLER = DEV_BASE - 1
 ROUNDS = 4
 
@@ -33,8 +33,10 @@ def episode_row(scene, slot: int, info: dict, controller: str) -> dict:
         **{k: v for k, v in info.items() if k not in ("truncated", "cut_short")},
         "target": task.target, "ramp_up": task.ramp_up, "hold": task.hold,
         "ramp_down": task.ramp_down, "prop_x": task.prop_x, "pitch": task.pitch,
-        "friction": ground.friction, "step": ground.step, "grade": ground.grade,
-        "cross": ground.cross, "delay": float(np.mean(machine.delay)),
+        "friction": scene.frictions[slot], "slope": math.atan(math.hypot(*ground.grade)),
+        "grade_along": ground.grade[0], "grade_across": ground.grade[1],
+        "features": len(ground.boxes) + len(ground.bumps), "press_height": scene.heights[slot],
+        "delay": float(np.mean(machine.delay)),
         "lag": float(np.mean(machine.lag)), "deadband": float(np.mean(machine.deadband)),
         "sensor_latency": machine.sensor_latency, "counterweight": machine.counterweight,
         "link_mass": float(np.mean(machine.link_mass)), "seal_friction": machine.seal_friction,

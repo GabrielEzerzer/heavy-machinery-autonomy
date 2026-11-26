@@ -12,15 +12,27 @@ import numpy as np
 
 from hma.hydraulics import circuit as c
 from hma.hydraulics.params import CURVE_SEGMENTS, NOMINAL, RANGES, Machine
-from hma.machine import BODY_NAMES, HOME_KEY, JOINT_NAMES, WELD, load_scene, machine_prefix
+from hma.machine import (
+    BODY_NAMES,
+    HOME_KEY,
+    JOINT_NAMES,
+    TRAVEL_NAMES,
+    WELD,
+    load_scene,
+    machine_prefix,
+)
 from hma.machine.cylinders import MAIN_RELIEF, seal_friction
-from hma.machine.model import COUNTERWEIGHT_MASS
+from hma.machine.ground import settle, stand
+from hma.machine.model import COUNTERWEIGHT_MASS, set_const
+from hma.machine.tracks import SIDES, coupled_names
+from hma.machine.tracks import step as track_step
 
 CONTROL_HZ = 10.0
 JOINTS = len(JOINT_NAMES)
 NODES = c.PUMPS + 2 * JOINTS
 SWING = JOINT_NAMES.index("swing")
 COUNTERWEIGHT = "counterweight"
+BASE = BODY_NAMES.index("base")
 UPPER = BODY_NAMES.index("upper")
 JOINT_SIZES = {int(mujoco.mjtJoint.mjJNT_FREE): (7, 6), int(mujoco.mjtJoint.mjJNT_BALL): (4, 3)}
 BRAKE_PILOT = 0.02
@@ -181,6 +193,21 @@ class Hydraulics:
             for b in nominal_ids
         ]
         self._counterweight = _counterweight_solid(reference)
+
+        def wheels(m, i):
+            return np.array([m.body(machine_prefix(i) + name).id
+                             for s in SIDES for name in coupled_names(s)])
+
+        self._wheels = np.array([wheels(model, i) for i in range(self.n)])
+        self._wheel_dofs = model.body_dofadr[self._wheels]
+        self._travel = np.array([[model.actuator(machine_prefix(i) + name).id
+                                  for name in TRAVEL_NAMES] for i in range(self.n)])
+        nominal_wheels = wheels(reference, 0)
+        self._wheel_mass = reference.body_mass[nominal_wheels].copy()
+        self._wheel_inertia = reference.body_inertia[nominal_wheels].copy()
+        self._belt_armature = reference.dof_armature[reference.body_dofadr[nominal_wheels]].copy()
+        self._lower_ratio = (self._nominal_bodies[BASE].mass
+                             + self._wheel_mass.sum()) / self._nominal_bodies[BASE].mass
         self._scratch = mujoco.MjData(model)
         reference_dofs = [reference.joint(machine_prefix(0) + j).dofadr[0] for j in JOINT_NAMES]
         self._base_armature = np.tile(reference.dof_armature[reference_dofs], (self.n, 1))
@@ -263,6 +290,7 @@ class Hydraulics:
         self._state = np.zeros(mujoco.mj_stateSize(model, STATE))
         self.redos = 0
         self.capped = 0
+        self.scores: list[np.ndarray] = []
         self.check_bound = 0
         self.pump_energy = np.zeros(n)
         self.lost_energy = np.zeros(n)
@@ -271,7 +299,13 @@ class Hydraulics:
         for i, machine in enumerate(machines):
             self.reset(i, machine)
 
-    def reset(self, index: int, machine: Machine, pose: Sequence[float] | None = None) -> None:
+    def reset(self, index: int, machine: Machine, pose: Sequence[float] | None = None,
+              at: Sequence[float] = (0.0, 0.0, 0.0), ground: int | None = None) -> None:
+        at = tuple(float(v) for v in np.asarray(at, float).ravel())
+        if len(at) != 3 or not all(np.isfinite(at)):
+            raise ValueError("at must be a finite x, y and heading")
+        if ground is not None and (int(ground) != ground or ground < 0):
+            raise ValueError("ground must be a non-negative integer seed")
         if pose is not None:
             pose = np.asarray(pose, float)
             if pose.shape != (JOINTS,) or not np.all(np.isfinite(pose)):
@@ -354,14 +388,18 @@ class Hydraulics:
         self._noise_cursor[index] = 0
 
         self._apply_mass(index, machine)
-        mujoco.mj_setConst(self.model, self._scratch)
-        self._reset_state(index, pose)
+        set_const(self.model, self._scratch)
+        self._reset_state(index, pose, at, ground)
 
     def _draw_noise(self, index: int) -> None:
         shape = (self.steps_per_decision, 4, JOINTS)
         self._noise_draws[index] = self._rngs[index].uniform(-1.0, 1.0, shape)
 
     def _apply_mass(self, index: int, machine: Machine) -> None:
+        lower = machine.link_mass[BASE]
+        self.model.body_mass[self._wheels[index]] = self._wheel_mass * lower
+        self.model.body_inertia[self._wheels[index]] = self._wheel_inertia * lower
+        self.model.dof_armature[self._wheel_dofs[index]] = self._belt_armature * lower
         for k, body in enumerate(self._bodies[index]):
             body = int(body)
             nominal = self._nominal_bodies[k]
@@ -378,7 +416,7 @@ class Hydraulics:
                 cw = self._counterweight
                 rest = _combine(nominal, _scaled(cw, -1.0))
                 solid = _combine(_scaled(rest, machine.link_mass[k]), _scaled(cw, cw_factor))
-            com = solid.com + machine.com_shift[k]
+            com = solid.com + machine.com_shift[k] * (self._lower_ratio if k == BASE else 1.0)
             values, axes = np.linalg.eigh(solid.inertia)
             if np.linalg.det(axes) < 0:
                 axes[:, 0] = -axes[:, 0]
@@ -389,7 +427,8 @@ class Hydraulics:
             self.model.body_inertia[body] = values
             self.model.body_iquat[body] = quat
 
-    def _reset_state(self, index: int, pose: Sequence[float] | None) -> None:
+    def _reset_state(self, index: int, pose: Sequence[float] | None,
+                     at: tuple[float, float, float], ground: int | None) -> None:
         model, data = self.model, self.data
         key = model.key(HOME_KEY).id
         for joint in self._own_joints[index]:
@@ -406,6 +445,11 @@ class Hydraulics:
         if pose is not None:
             data.qpos[self._qpos[index]] = pose
         data.ctrl[self._actuators[index]] = 0.0
+        data.ctrl[self._travel[index]] = 0.0
+        if ground is not None:
+            stand(model, data, index, int(ground), *at)
+        elif not settle(model, data, index, *at):
+            raise RuntimeError("the machine does not come to rest on this ground at this place")
         self._commands[:, index] = 0.0
         self._held[index] = 0.0
         self._piloted[index] = False
@@ -538,6 +582,7 @@ class Hydraulics:
         best = (np.full(n, np.inf), redo.copy(), redo_held.copy(), redo_speed.copy(),
                 np.zeros(n, int), redo_cond.copy())
         cavity = self._cavity
+        self.scores = []
         for attempt in range(REDO_PASSES + 2):
             cond = np.where(redo[:, None], redo_cond, cond_start)
             shift = np.zeros_like(relief_start)
@@ -577,7 +622,7 @@ class Hydraulics:
             friction = self._base_frictionloss + np.where(contact, seal, 0.0)
             friction[:, SWING] = brake
             model.dof_frictionloss[qvel] = friction
-            mujoco.mj_step(model, data)
+            track_step(model, data)
             model.dof_armature[qvel] = self._base_armature
             model.dof_frictionloss[qvel] = self._base_frictionloss
 
@@ -634,6 +679,7 @@ class Hydraulics:
             if not changed.any() or attempt > REDO_PASSES:
                 break
             score = (miss / REDO_FORCE).max(1)
+            self.scores.append(score)
             better = score < best[0]
             for kept, now in zip(best, (score, redo, redo_held, redo_speed, attempt, redo_cond),
                                  strict=True):

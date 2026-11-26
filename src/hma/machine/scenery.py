@@ -21,6 +21,7 @@ GRID_TILE = 2.0 * GRID_SQUARE
 GRID_PIXELS = 256
 MACHINE_GREY = (0.80, 0.81, 0.83, 1.0)
 PAINT = "paint"
+GROUND_SHAPE = "ground_shape"
 PLAIN_LINKS = ("base", "upper")
 PLAIN_CELL = 0.05
 PLAIN = "_plain"
@@ -83,8 +84,12 @@ def _add_grid(scene: mujoco.MjSpec, ground_repeat: tuple[float, float]) -> None:
     scene.add_texture(name="grid", type=mujoco.mjtTexture.mjTEXTURE_2D,
                       builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER, width=GRID_PIXELS,
                       height=GRID_PIXELS, rgb1=list(GRID_LIGHT), rgb2=list(GRID_DARK))
-    for name, repeat in (("ground", ground_repeat), ("site_ground", (1.0, 1.0))):
-        mat = scene.add_material(name=name, texrepeat=list(repeat), specular=0.05, shininess=0.1)
+    per_metre = (1.0 / GRID_TILE, 1.0 / GRID_TILE)
+    for name, repeat, uniform in (("ground", ground_repeat, False),
+                                  ("site_ground", (1.0, 1.0), False),
+                                  (GROUND_SHAPE, per_metre, True)):
+        mat = scene.add_material(name=name, texrepeat=list(repeat), texuniform=uniform,
+                                 specular=0.05, shininess=0.1)
         mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "grid"
 
 

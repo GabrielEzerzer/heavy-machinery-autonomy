@@ -1,5 +1,6 @@
 """The 12 t class excavator: MuJoCo scene loader and bucket-tip kinematics."""
 
+from hma.machine.ground import Ground, draw_ground, off_features, settle, stand
 from hma.machine.kinematics import JOINT_LIMITS, forward_kinematics, inverse_kinematics
 from hma.machine.model import (
     BODY_NAMES,
@@ -9,14 +10,15 @@ from hma.machine.model import (
     JOINT_NAMES,
     LINK_MASSES,
     TIP_SITE,
+    TRAVEL_NAMES,
+    VALVE,
     WELD,
-    ground_axes,
-    ground_shape,
     load_scene,
     machine_prefix,
     set_weld,
-    write_ground,
+    write_friction,
 )
+from hma.machine.tracks import step, tendon_friction
 
 __all__ = [
     "BODY_NAMES",
@@ -27,13 +29,20 @@ __all__ = [
     "JOINT_NAMES",
     "LINK_MASSES",
     "TIP_SITE",
+    "TRAVEL_NAMES",
+    "VALVE",
     "WELD",
+    "Ground",
+    "draw_ground",
     "forward_kinematics",
-    "ground_axes",
-    "ground_shape",
     "inverse_kinematics",
     "load_scene",
     "machine_prefix",
+    "off_features",
     "set_weld",
-    "write_ground",
+    "settle",
+    "stand",
+    "step",
+    "tendon_friction",
+    "write_friction",
 ]

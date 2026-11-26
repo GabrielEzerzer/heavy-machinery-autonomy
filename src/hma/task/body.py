@@ -11,7 +11,7 @@ import mujoco
 import numpy as np
 
 from hma.machine import JOINT_NAMES, inverse_kinematics, load_scene, machine_prefix, statics
-from hma.machine.model import TRACK_FEET
+from hma.machine.tracks import OUTLINE
 from hma.task.capacity_table import TABLE
 
 PITCHES_DEG = tuple(range(-180, 180, 15))
@@ -92,7 +92,6 @@ class MachineBody:
     _model: mujoco.MjModel | None = field(default=None, repr=False)
     _data: mujoco.MjData | None = field(default=None, repr=False)
     _radius: float | None = field(default=None, repr=False)
-    _footprint: tuple[float, float, float, float] | None = field(default=None, repr=False)
     _reach: dict[float, float] = field(default_factory=dict, repr=False)
 
     def _load(self) -> tuple[mujoco.MjModel, mujoco.MjData]:
@@ -125,21 +124,7 @@ class MachineBody:
         return model_capacity(radius_m, height_m)
 
     def footprint(self) -> tuple[float, float, float, float]:
-        if self._footprint is None:
-            model, data, prefix = self._home()
-            points = []
-            for g in range(model.ngeom):
-                if not model.geom(g).name.startswith(prefix + TRACK_FEET):
-                    continue
-                if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_SPHERE:
-                    r = float(model.geom_size[g][0])
-                    x, y = (float(v) for v in data.geom_xpos[g][:2])
-                    points += [(x - r, y - r), (x + r, y + r)]
-                else:
-                    points += [(float(c[0]), float(c[1])) for c in self._corners(g)]
-            xs, ys = [p[0] for p in points], [p[1] for p in points]
-            self._footprint = (min(xs), max(xs), min(ys), max(ys))
-        return self._footprint
+        return OUTLINE
 
     def travel_reach(self, height_m: float) -> float:
         if height_m not in self._reach:
