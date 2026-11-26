@@ -14,7 +14,7 @@ SNAPSHOT = Path(__file__).resolve().parents[1] / "mock" / "physics" / "excavator
 SCENES = {"free_two_machines": {"n_machines": 2}, "welded": {"n_machines": 1, "weld": True}}
 FIELDS = [
     "body_parentid", "body_mass", "body_ipos", "body_iquat", "body_inertia", "body_pos",
-    "body_quat", "body_contype", "body_conaffinity", "body_gravcomp",
+    "body_quat", "body_contype", "body_conaffinity", "body_gravcomp", "body_invweight0",
     "jnt_type", "jnt_bodyid", "jnt_pos", "jnt_axis", "jnt_range", "jnt_limited", "qpos0",
     "jnt_stiffness", "jnt_solref", "jnt_solimp", "jnt_margin",
     "dof_armature", "dof_damping", "dof_frictionloss",

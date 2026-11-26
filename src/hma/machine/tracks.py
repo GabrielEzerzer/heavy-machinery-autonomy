@@ -1,6 +1,6 @@
-"""Tracks as rows of road wheels on MuJoCo's own contact, a travel drive per track. step() caps the
-positive drive power at the engine's share by a force on each drive wheel while its belt runs the
-way its valve turns, split by shares and last-step powers kept in data.userdata for exact replay."""
+"""Tracks as rows of road wheels and belt rollers on MuJoCo's own contact, a travel drive per track.
+step() caps the positive drive power at the engine's share by a force on each drive wheel while its
+belt runs the way its valve turns, split by shares and last-step powers kept in data.userdata."""
 
 from __future__ import annotations
 
@@ -27,6 +27,8 @@ RAIL = 0.07
 WHEEL_RADIUS = 0.35
 WHEELS = ROLLERS + 2
 WHEEL_MASSES = (TRAVEL_MOTOR, *[ROLLER] * ROLLERS, IDLER)
+BELT_ROLLERS = WHEELS - 1
+BELT_MASS = 0.1
 SIDES = ("left", "right")
 TRACK = "track_"
 TRAVEL = "travel_"
@@ -37,6 +39,7 @@ ENGINE_POWER = 65.0e3
 DRIVE_EFFICIENCY = 0.7
 TRAVEL_POWER = ENGINE_POWER * DRIVE_EFFICIENCY
 BELT_ARMATURE = TRACK_CHAINS / 2 * WHEEL_RADIUS**2
+COUPLED = WHEELS + BELT_ROLLERS
 WHEEL_INERTIA = 1e-3
 BRAKE_SOLIMP = (0.9999, 0.9999, 0.001)
 SHARE_TIME = 0.1
@@ -54,10 +57,10 @@ OUTLINE = (-TUMBLER - WHEEL_RADIUS, TUMBLER + WHEEL_RADIUS,
            -(GAUGE + SHOE_WIDTH) / 2, (GAUGE + SHOE_WIDTH) / 2)
 SHELL_LIFT = LINK_BAND
 SHELL_TOP = TRACK_HEIGHT
-SUPPORT_GAP = 2e-4
-SUPPORT_HALF_HEIGHT = 0.01
+BELT_GAP = 2e-4
 FRICTION_TENDON = int(mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON)
 WHEEL_X = tuple(float(x) for x in np.linspace(REAR_LINE, FRONT_LINE, WHEELS))
+BELT_X = tuple((a + b) / 2 for a, b in zip(WHEEL_X[:-1], WHEEL_X[1:], strict=True))
 
 
 def side_sign(side: str) -> float:
@@ -68,13 +71,21 @@ def wheel_name(side: str, k: int) -> str:
     return f"{TRACK}{side}_{k}"
 
 
+def belt_name(side: str, k: int) -> str:
+    return f"{TRACK}{side}_belt_{k}"
+
+
+def coupled_names(side: str) -> tuple[str, ...]:
+    return (*(wheel_name(side, k) for k in range(WHEELS)),
+            *(belt_name(side, k) for k in range(BELT_ROLLERS)))
+
+
 def shell_names(side: str) -> tuple[str, ...]:
-    return (f"{TRACK}{side}_frame", f"{TRACK}{side}_rear", f"{TRACK}{side}_front",
-            f"{TRACK}{side}_support")
+    return f"{TRACK}{side}_frame", f"{TRACK}{side}_rear", f"{TRACK}{side}_front"
 
 
 def contact_names(side: str) -> tuple[str, ...]:
-    return (*(wheel_name(side, k) for k in range(WHEELS)), *shell_names(side))
+    return (*coupled_names(side), *shell_names(side))
 
 
 class Drives(NamedTuple):

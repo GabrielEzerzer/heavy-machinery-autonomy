@@ -491,9 +491,13 @@ def test_random_combined_commands_at_the_corners_keep_floor_relief_and_torque_co
     assert flips[2].max() <= 0.003
 
 
-def capped_run(attempts):
+CAP = 2
+REPLAYED = (3, 9, 14)
+
+
+def capped_run(attempts, seed):
     machines, layer = corner_scene()
-    rng = np.random.default_rng(11)
+    rng = np.random.default_rng(seed)
     capped, mismatch = [], []
     for _ in range(50):
         layer.act(rng.choice([-1.0, 0.0, 1.0], size=(len(machines), 4)))
@@ -502,14 +506,16 @@ def capped_run(attempts):
             before, redos = layer.capped, layer.redos
             mismatch.append(stepped_force_mismatch(layer))
             final = layer.data.qpos[layer._qpos]
-            kept = [[np.array_equal(q[layer._qpos[i]], final[i]) for q in attempts]
+            kept = [[k for k, q in enumerate(attempts[:CAP + 1])
+                     if np.array_equal(q[layer._qpos[i]], final[i])]
                     for i in range(len(machines))]
-            capped.append((layer.capped - before, layer.redos - redos, len(attempts), kept))
+            capped.append((layer.capped - before, layer.redos - redos, len(attempts), kept,
+                           np.array(layer.scores)))
     return layer, capped, np.array(mismatch)
 
 
 def test_a_capped_step_keeps_the_attempt_whose_forces_matched_best(monkeypatch):
-    monkeypatch.setattr(oil_layer, "REDO_PASSES", 1)
+    monkeypatch.setattr(oil_layer, "REDO_PASSES", CAP)
     attempts = []
     step = oil_layer.track_step
 
@@ -518,23 +524,29 @@ def test_a_capped_step_keeps_the_attempt_whose_forces_matched_best(monkeypatch):
         attempts.append(data.qpos.copy())
 
     monkeypatch.setattr(oil_layer, "track_step", recorded)
-    runs = []
-    for _ in range(2):
-        layer, capped, mismatch = capped_run(attempts)
+    runs, chosen = [], []
+    for seed in (*REPLAYED, REPLAYED[0]):
+        layer, capped, mismatch = capped_run(attempts, seed)
         runs.append((layer.data.qpos.copy(), layer.data.qvel.copy(), layer.capped, layer.redos))
-        assert all(redos == tries - 1 for _, redos, tries, _ in capped)
-        assert all(count == 0 or tries >= 2 for count, _, tries, _ in capped)
-        assert all(count == 1 for count, _, tries, _ in capped if tries == 3)
+        assert all(redos == tries - 1 for _, redos, tries, *_ in capped)
+        assert all(tries > CAP for count, _, tries, *_ in capped if count)
+        assert all(count == 1 for count, _, tries, *_ in capped if tries == CAP + 2)
         assert layer.capped == sum(count for count, *_ in capped)
-        replayed = [kept for count, _, tries, kept in capped if tries == 3]
-        assert replayed
-        for kept in replayed:
-            assert all(any(machine[:-1]) for machine in kept)
-            assert any(not machine[-2] for machine in kept)
+        for count, _, tries, kept, scores in capped:
+            if not count:
+                continue
+            assert len(scores) == CAP + 1
+            for machine, taken in enumerate(kept):
+                assert taken
+                if scores[CAP, machine] > 1.0:
+                    best = scores[:, machine].min()
+                    assert all(scores[k, machine] == best for k in taken)
+                    chosen += [k for k in taken if tries == CAP + 2]
         assert np.isfinite(runs[-1][0]).all() and np.isfinite(runs[-1][1]).all()
         assert mismatch[..., SWING].max() < 0.5e3
-    assert np.array_equal(runs[0][0], runs[1][0]) and np.array_equal(runs[0][1], runs[1][1])
-    assert runs[0][2:] == runs[1][2:]
+    assert len(chosen) > len(REPLAYED) and any(0 < k < CAP for k in chosen)
+    assert np.array_equal(runs[0][0], runs[-1][0]) and np.array_equal(runs[0][1], runs[-1][1])
+    assert runs[0][2:] == runs[-1][2:]
 
 
 def check_drops(layer):

@@ -84,9 +84,11 @@ def machine_prefix(index: int) -> str:
 
 
 def wheel_points() -> list[tuple[float, tuple[float, float, float]]]:
-    return [(m, (x, tracks.side_sign(side) * mass.GAUGE / 2, tracks.WHEEL_RADIUS))
-            for side in tracks.SIDES
-            for m, x in zip(tracks.WHEEL_MASSES, tracks.WHEEL_X, strict=True)]
+    wheels = [(m, x, tracks.WHEEL_RADIUS)
+              for m, x in zip(tracks.WHEEL_MASSES, tracks.WHEEL_X, strict=True)]
+    belts = [(tracks.BELT_MASS, x, tracks.WHEEL_RADIUS + tracks.BELT_GAP) for x in tracks.BELT_X]
+    return [(m, (x, tracks.side_sign(side) * mass.GAUGE / 2, z))
+            for side in tracks.SIDES for m, x, z in wheels + belts]
 
 
 def link_solids() -> dict[str, mass.Solid]:
@@ -129,24 +131,27 @@ def _add_track(spec: mujoco.MjSpec, side: str) -> None:
     y = tracks.side_sign(side) * mass.GAUGE / 2
     across = [np.cos(np.pi / 4), np.sin(np.pi / 4), 0.0, 0.0]
     drive = tracks.wheel_name(side, 0)
-    for k, x in enumerate(tracks.WHEEL_X):
-        name = tracks.wheel_name(side, k)
-        wheel = spec.body("base").add_body(name=name, pos=[x, y, tracks.WHEEL_RADIUS],
-                                           mass=tracks.WHEEL_MASSES[k], ipos=[0.0, 0.0, 0.0],
+    parts = [(tracks.wheel_name(side, k), x, tracks.WHEEL_RADIUS, m)
+             for k, (x, m) in enumerate(zip(tracks.WHEEL_X, tracks.WHEEL_MASSES, strict=True))]
+    parts += [(tracks.belt_name(side, k), x, tracks.WHEEL_RADIUS + tracks.BELT_GAP,
+               tracks.BELT_MASS) for k, x in enumerate(tracks.BELT_X)]
+    for name, x, z, part_mass in parts:
+        wheel = spec.body("base").add_body(name=name, pos=[x, y, z], mass=part_mass,
+                                           ipos=[0.0, 0.0, 0.0],
                                            inertia=[tracks.WHEEL_INERTIA] * 3,
                                            explicitinertial=True)
         wheel.add_joint(name=name, axis=[0.0, 1.0, 0.0],
-                        armature=tracks.BELT_ARMATURE / tracks.WHEELS)
+                        armature=tracks.BELT_ARMATURE / tracks.COUPLED)
         wheel.add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_CYLINDER, quat=across,
                        size=[tracks.WHEEL_RADIUS, tracks.RAIL], contype=0, conaffinity=0,
                        group=3, rgba=[0.2, 0.6, 0.9, 0.4])
-        if k:
+        if name != drive:
             spec.add_equality(type=mujoco.mjtEq.mjEQ_JOINT, objtype=mujoco.mjtObj.mjOBJ_JOINT,
                               name1=name, name2=drive, data=[0.0, 1.0] + [0.0] * 10,
                               solref=list(tracks.COUPLING_SOLREF),
                               solimp=list(tracks.COUPLING_SOLIMP))
     base = spec.body("base")
-    frame, rear, front, support = tracks.shell_names(side)
+    frame, rear, front = tracks.shell_names(side)
     lift, top, half_shoe = tracks.SHELL_LIFT, tracks.SHELL_TOP, mass.SHOE_WIDTH / 2
     shell = dict(contype=0, conaffinity=0, group=3, mass=0.0, rgba=[0.9, 0.6, 0.2, 0.3])
     base.add_geom(name=frame, type=mujoco.mjtGeom.mjGEOM_BOX, pos=[0.0, y, (lift + top) / 2],
@@ -155,9 +160,6 @@ def _add_track(spec: mujoco.MjSpec, side: str) -> None:
         base.add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_CYLINDER, quat=across,
                       pos=[x, y, tracks.WHEEL_RADIUS + lift],
                       size=[tracks.WHEEL_RADIUS, half_shoe], **shell)
-    base.add_geom(name=support, type=mujoco.mjtGeom.mjGEOM_BOX,
-                  pos=[0.0, y, tracks.SUPPORT_GAP + tracks.SUPPORT_HALF_HEIGHT],
-                  size=[mass.TUMBLER, tracks.RAIL, tracks.SUPPORT_HALF_HEIGHT], **shell)
     wheels = tuple(tracks.wheel_name(side, k) for k in range(tracks.WHEELS))
     _valve(spec, tracks.TRAVEL + side, wheels, tracks.TRACTION, tracks.TRAVEL_SPEED,
            tracks.BRAKE_SOLIMP, coef=tracks.WHEEL_RADIUS / tracks.WHEELS)
@@ -333,9 +335,24 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
     dress_after_heightfields(scene, footprints, [(0.0, y) for y in offsets])
     scene.add_key(name=HOME_KEY)
     model = scene.compile()
+    even_track_stiffness(model)
     for i in range(n_machines):
         rest_home(model, i)
     return model
+
+
+def even_track_stiffness(model: mujoco.MjModel) -> None:
+    i = 0
+    while mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, machine_prefix(i) + "base") >= 0:
+        parts = [model.body(machine_prefix(i) + name).id
+                 for side in tracks.SIDES for name in tracks.coupled_names(side)]
+        model.body_invweight0[parts] = model.body_invweight0[parts].mean(axis=0)
+        i += 1
+
+
+def set_const(model: mujoco.MjModel, data: mujoco.MjData) -> None:
+    mujoco.mj_setConst(model, data)
+    even_track_stiffness(model)
 
 
 def write_friction(model: mujoco.MjModel, index: int, mu: float) -> None:
@@ -343,8 +360,7 @@ def write_friction(model: mujoco.MjModel, index: int, mu: float) -> None:
         raise ValueError("the friction coefficient must be finite and positive")
     prefix = machine_prefix(index)
     model.geom_friction[ground_geoms(model, index), 0] = mu
-    names = [tracks.wheel_name(s, k) for s in tracks.SIDES for k in range(tracks.WHEELS)]
-    names += [n for s in tracks.SIDES for n in tracks.shell_names(s)]
+    names = [n for s in tracks.SIDES for n in tracks.contact_names(s)]
     parts = [model.geom(prefix + n).id for n in names]
     pairs = np.isin(model.pair_geom1, parts) | np.isin(model.pair_geom2, parts)
     model.pair_friction[pairs, :2] = mu

@@ -18,6 +18,7 @@ from hma.machine.cylinders import MAIN_RELIEF
 from hma.machine.ground import (
     RANGES,
     Box,
+    Bump,
     Ground,
     apply_ground,
     draw_ground,
@@ -43,8 +44,17 @@ from hma.machine.measure import (
 from hma.machine.measure import (
     released as machine,
 )
-from hma.machine.model import GROUND, HOME_POSE, JOINT_NAMES, TRAVEL_NAMES, VALVE, ground_parts
+from hma.machine.model import (
+    CONTACT_MARGIN,
+    GROUND,
+    HOME_POSE,
+    JOINT_NAMES,
+    TRAVEL_NAMES,
+    VALVE,
+    ground_parts,
+)
 from hma.machine.tracks import (
+    BELT_ROLLERS,
     FRICTION,
     FRICTION_RANGE,
     GAUGE,
@@ -57,9 +67,11 @@ from hma.machine.tracks import (
     WHEEL_RADIUS,
     WHEEL_X,
     WHEELS,
+    belt_name,
     contact_names,
     drive_forces,
     drives,
+    shell_names,
     step,
     wheel_name,
 )
@@ -94,6 +106,25 @@ def pitch(model, data):
 def deepest(data, geom=None):
     return max([-c.dist for c in data.contact[:data.ncon] if geom in (None, c.geom1, c.geom2)],
                default=0.0)
+
+
+def own_geoms(model, index=0):
+    root = model.body(machine_prefix(index) + "base").id
+    return set(np.flatnonzero(model.body_rootid[model.geom_bodyid] == root).tolist())
+
+
+def contact_forces(model, data, mine):
+    force = np.zeros(6)
+    for i, c in enumerate(data.contact[:data.ncon]):
+        if c.geom1 in mine:
+            part, other, sign = c.geom1, c.geom2, -1.0
+        elif c.geom2 in mine:
+            part, other, sign = c.geom2, c.geom1, 1.0
+        else:
+            continue
+        mujoco.mj_contactForce(model, data, i, force)
+        yield part, other, sign * force[:3] @ c.frame.reshape(3, 3), force[0], math.hypot(
+            *force[1:3])
 
 
 BESIDE = OUTLINE[3] + 0.03
@@ -242,20 +273,26 @@ def wall_push(edit=None):
     start = data.qpos[0]
     for _ in range(round(3.0 / model.opt.timestep)):
         layer.step()
-    weight = model.body_subtreemass[model.body(P + "base").id] * G
-    pushes = []
+    plane, boxes, _ = ground_parts(model, 0)
+    mine = own_geoms(model)
+    friction = normal = ahead = push = 0.0
     for _ in range(round(8.0 / model.opt.timestep)):
         layer.step()
-        pushes.append(drive_forces(model, data)[0].sum())
-    return data.qpos[0] - start, data.qpos[0] + OUTLINE[1] - wall.x + wall.half_length, (
-        np.mean(pushes) / (FRICTION * weight))
+        for _, other, world, n, t in contact_forces(model, data, mine):
+            if other == plane:
+                friction, normal, ahead = friction + t, normal + n, ahead + world[0]
+            elif other == boxes[0]:
+                push += n
+    return (data.qpos[0] - start, data.qpos[0] + OUTLINE[1] - wall.x + wall.half_length,
+            friction / (FRICTION * normal), push / ahead)
 
 
 def test_full_speed_into_a_wall_stalls_at_the_wall():
-    moved, gap, push = wall_push()
+    moved, gap, slip, balance = wall_push()
     assert abs(moved) < 1e-2
     assert gap < SINK
-    assert push == pytest.approx(1.0, rel=0.03)
+    assert slip == pytest.approx(1.0, rel=0.03)
+    assert balance == pytest.approx(1.0, rel=0.01)
 
 
 def test_a_parked_machine_pushed_with_120_kn_does_not_pass_through_a_wall():
@@ -272,9 +309,11 @@ def test_a_parked_machine_pushed_with_120_kn_does_not_pass_through_a_wall():
     assert sink < SINK
 
 
-def drive_onto_step(height, speed, depth):
+def drive_onto_step(height, speed, depth, edit=None):
     model, data = machine(Ground(boxes=(Box(2.5 + depth, 0.0, 0.0, depth, 6.0, height),)),
                           pose=None)
+    if edit is not None:
+        edit(model, data)
     data.ctrl[travel(model)] = speed
     steepest = 0.0
     for _ in range(round((5.0 / speed + 4.0) / model.opt.timestep)):
@@ -302,10 +341,13 @@ def test_driving_onto_a_0_1_m_step_climbs_it_at_any_speed_and_pitches_with_the_g
         assert steepest == pytest.approx(math.degrees(math.asin(height / lever)), rel=0.05)
 
 
-def test_a_0_2_m_step_stops_a_crawling_machine_on_its_edge():
+def test_a_crawling_machine_climbs_a_0_2_m_step_on_its_belt_friction():
     model, data, _ = drive_onto_step(0.2, 0.25, 5.0)
-    assert data.qpos[0] < 2.5 + OUTLINE[1]
-    assert -pitch(model, data) > 3.0
+    assert data.qpos[0] > 2.5 + OUTLINE[1]
+    assert data.qpos[2] == pytest.approx(0.2, abs=1e-3)
+    assert abs(pitch(model, data)) < 0.05
+    stalled = drive_onto_step(0.2, 0.25, 5.0, frictionless_belt)[1]
+    assert stalled.qpos[0] < 2.5 + OUTLINE[1]
 
 
 SLOPE = math.radians(20.0)
@@ -326,8 +368,10 @@ def power_speed():
     return TRAVEL_POWER / (weight * math.sin(SLOPE))
 
 
-def turning(commands, seconds=3.0):
+def turning(commands, seconds=3.0, edit=None):
     model, data = machine()
+    if edit is not None:
+        edit(model, data)
     parts = {model.geom(P + name).id for side in SIDES for name in contact_names(side)}
     data.ctrl[travel(model)] = commands
     run(model, data, 1.5)
@@ -469,6 +513,78 @@ def test_brakes_hold_on_a_slope_below_the_friction_angle():
     assert np.linalg.norm(data.qpos[:3] - start) < 1e-3
 
 
+MID = (WHEEL_X[4] + WHEEL_X[5]) / 2
+FEATURES = {
+    "bump": {"bumps": tuple(Bump(MID, side * GAUGE / 2, 0.4, 0.12) for side in (1, -1))},
+    "kerb": {"boxes": (Box(MID, 0.0, 0.0, 0.1, 3.0, 0.15),)},
+}
+FRICTION_ANGLE = math.atan(FRICTION)
+SET_DOWN = math.radians(10.0)
+
+
+def tilted(feature, across, angle, edit=None):
+    grade = (0.0, math.tan(SET_DOWN)) if across else (math.tan(SET_DOWN), 0.0)
+    model = load_scene(1)
+    apply_ground(model, 0, Ground(grade=grade, **FEATURES[feature]))
+    hold_arm(model)
+    if edit is not None:
+        edit(model, None)
+    data = mujoco.MjData(model)
+    mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
+    for name, value in zip(JOINT_NAMES, TRAVEL_POSE, strict=True):
+        data.qpos[model.joint(P + name).qposadr[0]] = value
+    place_load(model, data, 0, *LOAD_AWAY)
+    settle(model, data, 0)
+    start = data.qpos[:3].copy()
+    ramp = round(6.0 / model.opt.timestep)
+    for k in range(1, ramp + 1):
+        turn = (angle - SET_DOWN) * k / ramp
+        down = [0.0, -G * math.sin(turn)] if across else [-G * math.sin(turn), 0.0]
+        model.opt.gravity[:] = [*down, -G * math.cos(turn)]
+        step(model, data)
+    tilted_at = data.qpos[:3].copy()
+    run(model, data, 2.0)
+    shells = {model.geom(P + name).id for side in SIDES for name in shell_names(side)}
+    bare = total = 0.0
+    for part, _, _, n, _ in contact_forces(model, data, own_geoms(model)):
+        total += n
+        bare += n * (part in shells)
+    return (np.linalg.norm(tilted_at - start), np.linalg.norm(data.qpos[:3] - tilted_at),
+            bare / total if total else 0.0)
+
+
+@pytest.mark.parametrize("across", [False, True], ids=["along", "across"])
+@pytest.mark.parametrize("feature", list(FEATURES))
+def test_over_a_bump_or_kerb_the_brakes_hold_below_the_friction_angle_and_slide_above(
+        feature, across):
+    _, held, bare = tilted(feature, across, 0.97 * FRICTION_ANGLE)
+    assert held < 1e-3
+    assert bare == 0.0
+    _, slid, _ = tilted(feature, across, 1.03 * FRICTION_ANGLE)
+    assert slid > 0.1
+
+
+def frictionless_belt(model, data):
+    belts = [model.geom(P + belt_name(side, k)).id for side in SIDES for k in range(BELT_ROLLERS)]
+    model.pair_dim[np.isin(model.pair_geom1, belts) | np.isin(model.pair_geom2, belts)] = 1
+
+
+def test_a_welded_machine_that_would_be_buried_is_refused():
+    model = load_scene(1, weld=True)
+    data = mujoco.MjData(model)
+    mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
+    assert settle(model, data, 0)
+    layer = Hydraulics(model, data, [NOMINAL])
+    apply_ground(model, 0, draw_ground(12))
+    assert not settle(model, data, 0)
+    mine = own_geoms(model)
+    for seed in (12, 7, 11):
+        layer.reset(0, NOMINAL, ground=seed)
+        mujoco.mj_forward(model, data)
+        assert all(-c.dist <= CONTACT_MARGIN for c in data.contact[:data.ncon]
+                   if {c.geom1, c.geom2} & mine), seed
+
+
 def test_a_machine_high_centred_on_a_pad_sits_still():
     model, data = machine(Ground(boxes=(Box(0.0, 0.0, 0.0, 0.4, 3.0, 0.3),)))
     start = data.qpos[:7].copy()
@@ -547,15 +663,19 @@ def test_a_refused_draw_leaves_no_drift_for_the_next_draw_to_start_from():
     data = mujoco.MjData(model)
     joints = [model.joint(P + name).qposadr[0] for name in JOINT_NAMES]
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
-    apply_ground(model, 0, draw_ground(75, 0))
+    apply_ground(model, 0, draw_ground(425, 0))
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
     assert not settle(model, data, 0)
     assert np.isfinite(data.qpos).all()
-    assert np.linalg.norm(data.qpos[:2]) > 1.0
+    assert np.linalg.norm(data.qpos[:2]) > 0.25
     assert np.abs(data.qpos[joints] - HOME_POSE).max() < 1e-3
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
-    stand(model, data, 0, 75)
-    assert np.linalg.norm(data.qpos[:2]) < 1e-2
+    stand(model, data, 0, 425)
+    clean = load_scene(1)
+    fresh = mujoco.MjData(clean)
+    mujoco.mj_resetDataKeyframe(clean, fresh, clean.key(HOME_KEY).id)
+    stand(clean, fresh, 0, 425)
+    np.testing.assert_allclose(data.qpos, fresh.qpos, rtol=0.0, atol=1e-12)
     assert np.abs(data.qpos[joints] - HOME_POSE).max() < 1e-2
 
 
@@ -734,11 +854,7 @@ def test_each_broken_piece_of_physics_fails_its_check(monkeypatch):
 
     assert brake_drift(no_brake) > 1e-2
 
-    def no_support(model, data):
-        boxes = [model.geom(P + tracks.shell_names(side)[3]).id for side in SIDES]
-        model.pair_margin[np.isin(model.pair_geom1, boxes) | np.isin(model.pair_geom2, boxes)] = -1
-
-    assert between_wheels(0.93, no_support) > TIPPED
+    assert sum(tilted("kerb", False, 0.97 * FRICTION_ANGLE, frictionless_belt)[:2]) > 0.1
 
     def friction_damping(b):
         def edit(model, data):
@@ -746,7 +862,8 @@ def test_each_broken_piece_of_physics_fails_its_check(monkeypatch):
         return edit
 
     assert wall_push(friction_damping(20.0))[2] < 0.97
-    assert wall_push(friction_damping(100.0))[2] > 1.03
+    height, free, rise = turning([TRAVEL_SPEED, 0.0], edit=friction_damping(100.0))[3]
+    assert not (height < 2e-3 and free < 0.4 and rise < 10.0)
 
     def capped_brakes(model, data):
         belts = data.qvel[drives(model).dofs] * WHEEL_RADIUS

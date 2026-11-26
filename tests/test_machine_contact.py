@@ -531,6 +531,7 @@ def ground_contacts(model, data, link):
 ])
 def test_each_front_link_lowered_onto_raised_ground_rests_on_it(link, start, edges):
     model, data = home(weld=True)
+    held(model, data)
     raised = Box((edges[0] + edges[1]) / 2, 0.0, 0.0, (edges[1] - edges[0]) / 2, GROUND_HALF,
                  edges[2] + 5.0)
     apply_ground(model, 0, Ground(level=-5.0, boxes=(raised,)))

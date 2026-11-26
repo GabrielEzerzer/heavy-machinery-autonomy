@@ -1,6 +1,6 @@
 """Rigid ground for one machine from MuJoCo primitives: a tilted, levelled plane with boxes and
 buried spheres, the load resting on it. settle() steps a machine to rest, arm held, or refuses,
-and puts a welded machine at home height; stand() redraws a seed until the machine stands."""
+and puts a welded machine at home height unless it would be buried; stand() redraws a seed."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from hma.machine import tracks
 from hma.machine.model import (
     ANCHOR,
     BASE_JOINT,
+    CONTACT_MARGIN,
     GROUND_BOXES,
     GROUND_BUMPS,
     GROUND_X,
@@ -385,7 +386,8 @@ def settle(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float = 0.
         mocap = model.body_mocapid[model.body(prefix + ANCHOR).id]
         data.mocap_pos[mocap] = data.qpos[q0:q0 + 3]
         data.mocap_quat[mocap] = data.qpos[q0 + 3:q0 + 7]
-        return True
+        mujoco.mj_forward(model, data)
+        return _deepest(model, data, model.body(prefix + "base").id) <= CONTACT_MARGIN
     _put(model, data, index, x, y, heading, joints)
     data.qpos[q0 + 2] += DROP
     scratch = mujoco.MjData(model)

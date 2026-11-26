@@ -31,7 +31,7 @@ from hma.machine.model import (
     ground_geoms,
     ground_height,
 )
-from hma.machine.tracks import WHEEL_MASSES, WHEELS, step
+from hma.machine.tracks import BELT_MASS, BELT_ROLLERS, WHEEL_MASSES, WHEELS, step
 from scenes import held, lock_joints
 
 LIFT_POSE = (0.0, -0.65, 1.0, 2.4)
@@ -93,7 +93,8 @@ def test_total_mass_in_operating_weight_band():
         masses = {b: model.body(machine_prefix(i) + b).mass[0] for b in BODY_NAMES}
         assert masses == pytest.approx(LINK_MASSES)
         total = model.body_subtreemass[model.body(machine_prefix(i) + "base").id]
-        assert total == pytest.approx(sum(masses.values()) + 2 * sum(WHEEL_MASSES))
+        lower = 2 * (sum(WHEEL_MASSES) + BELT_ROLLERS * BELT_MASS)
+        assert total == pytest.approx(sum(masses.values()) + lower)
         assert 12_000.0 <= total <= 12_600.0
 
 
@@ -373,8 +374,9 @@ def test_two_data_on_one_model_weld_independently():
 
 def test_bucket_lowered_onto_raised_ground_stops_on_its_surface():
     model = load_scene(1, weld=True)
-    apply_ground(model, 0, Ground(boxes=(Box(9.0, 0.0, 0.0, 6.0, 6.0, 1.5),)))
     data = home_data(model)
+    held(model, data)
+    apply_ground(model, 0, Ground(boxes=(Box(9.0, 0.0, 0.0, 6.0, 6.0, 1.5),)))
     pose = dict(zip(JOINT_NAMES, inverse_kinematics(np.array([5.5, 0.0, 2.3]), 1.0), strict=True))
     set_pose(model, data, 0, pose)
     held(model, data).act(np.array([[0.0, LOWER, 0.0, 0.0]]))

@@ -23,8 +23,8 @@ from hma.machine import (
 )
 from hma.machine.cylinders import MAIN_RELIEF, seal_friction
 from hma.machine.ground import settle, stand
-from hma.machine.model import COUNTERWEIGHT_MASS
-from hma.machine.tracks import SIDES, WHEELS, wheel_name
+from hma.machine.model import COUNTERWEIGHT_MASS, set_const
+from hma.machine.tracks import SIDES, coupled_names
 from hma.machine.tracks import step as track_step
 
 CONTROL_HZ = 10.0
@@ -195,8 +195,8 @@ class Hydraulics:
         self._counterweight = _counterweight_solid(reference)
 
         def wheels(m, i):
-            return np.array([m.body(machine_prefix(i) + wheel_name(s, k)).id
-                             for s in SIDES for k in range(WHEELS)])
+            return np.array([m.body(machine_prefix(i) + name).id
+                             for s in SIDES for name in coupled_names(s)])
 
         self._wheels = np.array([wheels(model, i) for i in range(self.n)])
         self._wheel_dofs = model.body_dofadr[self._wheels]
@@ -285,6 +285,7 @@ class Hydraulics:
         self._state = np.zeros(mujoco.mj_stateSize(model, STATE))
         self.redos = 0
         self.capped = 0
+        self.scores: list[np.ndarray] = []
         self.check_bound = 0
         self.pump_energy = np.zeros(n)
         self.lost_energy = np.zeros(n)
@@ -380,7 +381,7 @@ class Hydraulics:
         self._noise_cursor[index] = 0
 
         self._apply_mass(index, machine)
-        mujoco.mj_setConst(self.model, self._scratch)
+        set_const(self.model, self._scratch)
         self._reset_state(index, pose, at, ground)
 
     def _draw_noise(self, index: int) -> None:
@@ -573,6 +574,7 @@ class Hydraulics:
         best = (np.full(n, np.inf), redo.copy(), redo_held.copy(), redo_speed.copy(),
                 np.zeros(n, int), redo_cond.copy())
         cavity = self._cavity
+        self.scores = []
         for attempt in range(REDO_PASSES + 2):
             cond = np.where(redo[:, None], redo_cond, cond_start)
             shift = np.zeros_like(relief_start)
@@ -669,6 +671,7 @@ class Hydraulics:
             if not changed.any() or attempt > REDO_PASSES:
                 break
             score = (miss / REDO_FORCE).max(1)
+            self.scores.append(score)
             better = score < best[0]
             for kept, now in zip(best, (score, redo, redo_held, redo_speed, attempt, redo_cond),
                                  strict=True):

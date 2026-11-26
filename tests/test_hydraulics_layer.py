@@ -31,10 +31,9 @@ from hma.machine.tracks import (
     TRAVEL_POWER,
     TRAVEL_SPEED,
     WHEEL_RADIUS,
-    WHEELS,
+    coupled_names,
     drive_forces,
     drives,
-    wheel_name,
 )
 from scenes import dig_pit
 
@@ -258,8 +257,8 @@ def test_changed_masses_shift_the_links_and_the_home_pose_still_rests():
                                            nominal.body_ipos[body] + machine.com_shift[k],
                                            atol=1e-12)
             assert model.body_mass[body] == pytest.approx(expected, rel=1e-12)
-        lower = [bodies[0], *(model.body(machine_prefix(0) + wheel_name(s, k)).id
-                              for s in SIDES for k in range(WHEELS))]
+        lower = [bodies[0], *(model.body(machine_prefix(0) + name).id
+                              for s in SIDES for name in coupled_names(s))]
         mass, com = undercarriage(model, lower)
         nominal_mass, nominal_com = undercarriage(nominal, lower)
         assert mass == pytest.approx(nominal_mass * machine.link_mass[0], rel=1e-12)

@@ -284,11 +284,11 @@ def test_load_placed_on_a_slope_rests_tilted_with_it():
 
 def test_reset_puts_the_load_on_newly_written_ground():
     model, data = scene(3000.0)
-    apply_ground(model, 0, Ground(level=1.0))
+    apply_ground(model, 0, Ground(level=-1.0))
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
     mujoco.mj_forward(model, data)
     half = model.geom_size[model.geom(P + LOAD).id]
-    assert data.xpos[model.body(P + LOAD).id][2] == pytest.approx(1.0 + half[2] + CONTACT_MARGIN,
+    assert data.xpos[model.body(P + LOAD).id][2] == pytest.approx(-1.0 + half[2] + CONTACT_MARGIN,
                                                                   abs=1e-6)
     moved, fastest = resting_still(model, data)
     assert moved < SAG and fastest < STILL
