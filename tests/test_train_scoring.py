@@ -9,7 +9,7 @@ from hma.hydraulics import NOMINAL, RANGES, BaseController
 from hma.machine import load_scene, machine_prefix
 from hma.machine.kinematics import BOOM_PIVOT
 from hma.train import evaluate, footing
-from hma.train.scene import CONTROL_HZ, PropScene, reward
+from hma.train.scene import CONTROL_HZ, HISTORY, PropScene, reward
 from hma.train.task import (
     DEV_BASE,
     HELD_OUT_BASE,
@@ -120,14 +120,16 @@ def test_the_pass_mark_at_each_of_its_boundaries():
     scene.hold_steps[0] = 1000
     tiny = 1e-9
 
-    def passes(share=s.hold_share, landing=0.0, carried=1.0, speed=0.0, cause=None):
+    def passes(share=s.hold_share, landing=0.0, carried=1.0, speed=0.0, cause=None,
+               bucket=False, front=True):
         scene.in_band[0], scene.landing[0] = round(share * 1000), landing
-        return scene.outcome(0, cause, 0.0, carried, speed)["passed"]
+        return scene.outcome(0, cause, 0.0, carried, speed, bucket, front)["passed"]
 
     assert passes() and not passes(share=s.hold_share - 0.001)
     assert passes(landing=s.landing - tiny) and not passes(landing=s.landing)
     assert passes(carried=s.carry) and not passes(carried=s.carry - tiny)
     assert passes(speed=s.still - tiny) and not passes(speed=s.still)
+    assert not passes(bucket=True) and not passes(front=False)
     assert not passes(cause="tilt")
 
 
@@ -212,7 +214,7 @@ def test_one_front_corner_left_unloaded_at_the_end_fails_the_set_down():
     class Unloaded(PropScene):
         def _front_load(self):
             load = super()._front_load()
-            if (self.k[0] + 1) * self.period >= self.tasks[0].length - 1e-9:
+            if self.k[0] * self.period >= self.tasks[0].length - self.settings.window - 1e-9:
                 load[0, 0] = 0.0
             return load
 
@@ -245,17 +247,18 @@ def test_the_reward_stays_in_its_bounds_and_each_end_term_only_lowers_it():
         assert np.all(cleared[terms[name] > 0.0] > earned[terms[name] > 0.0])
 
 
+class Held(PropPath):
+    def __call__(self, t):
+        return super().__call__(min(t, self.task.length - self.task.final))
+
+
+class Pressing(PropScene):
+    def _write(self, index, seed):
+        super()._write(index, seed)
+        self.controllers[index] = BaseController(Held(self.tasks[index], self.pivot), CONTROL_HZ)
+
+
 def test_skipping_the_lift_at_the_end_earns_less_and_fails_the_set_down():
-    class Held(PropPath):
-        def __call__(self, t):
-            return super().__call__(min(t, self.task.length - self.task.final))
-
-    class Pressing(PropScene):
-        def _write(self, index, seed):
-            super()._write(index, seed)
-            self.controllers[index] = BaseController(Held(self.tasks[index], self.pivot),
-                                                     CONTROL_HZ)
-
     results = []
     for kind in (PropScene, Pressing):
         scene = kind(1, "nominal")
@@ -305,3 +308,52 @@ def test_a_full_scale_action_opens_a_valve_past_the_widest_drawn_dead_zone():
         scene.step(np.ones((1, 4)))
     assert np.allclose(scene.sent, Settings().scale)
     assert np.all(np.abs(scene.layer._spool[0]) > widest)
+
+
+def test_a_front_bouncing_with_the_bucket_clear_passes_and_a_pressing_bucket_fails():
+    class Bouncing(PropScene):
+        def _front_load(self):
+            left = np.ceil((self.tasks[0].length - self.k[0] * self.period) / self.period - 1e-9)
+            self.factor = 0.3 if left % 2 else 1.7
+            return super()._front_load() * self.factor
+
+    class Propped(Pressing):
+        def _front_load(self):
+            rest = self.rest_load / np.maximum(self.rest_count, 1)[:, None]
+            return rest if self.touched[0] else super()._front_load()
+
+    def bouncing_share(scene):
+        rest = scene.rest_load[0] / scene.rest_count[0]
+        return np.min(PropScene._front_load(scene)[0] / rest)
+
+    s = Settings()
+    outcomes = []
+    for kind in (Bouncing, Propped):
+        scene = kind(1, "nominal")
+        scene.reset(0, DEV_BASE)
+        outcomes.append(finish(scene)[0])
+        if kind is Bouncing:
+            assert scene.factor * bouncing_share(scene) < s.carry
+    bouncing, propped = outcomes
+    assert bouncing["passed"] and not bouncing["bucket_down"]
+    assert bouncing["front_carried"] >= s.carry
+    assert propped["bucket_down"] and propped["front_carried"] >= s.carry
+    assert not propped["passed"]
+
+
+def test_a_landing_is_charged_only_while_it_is_inside_the_observation_history():
+    scene = PropScene(1, "nominal")
+    scene.reset(0, DEV_BASE + 4)
+    fresh, charged = [], []
+    while True:
+        _, _, done, info = scene.step(np.zeros((1, 4)))
+        fresh.append(scene.recent[0, -1])
+        charged.append(scene.recent[0].max())
+        if done[0]:
+            break
+    fresh, charged = np.array(fresh), np.array(charged)
+    assert fresh.max() == pytest.approx(info[0]["landing"]) and fresh.max() > 0.1
+    for k in range(len(fresh)):
+        assert charged[k] == fresh[max(0, k - HISTORY + 1):k + 1].max()
+    last = np.flatnonzero(fresh)[-1]
+    assert np.all(charged[last + HISTORY:] == 0.0)

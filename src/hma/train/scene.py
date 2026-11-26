@@ -49,8 +49,9 @@ OBS_HIGH = np.tile(FRAME_HIGH, HISTORY)
 SCALE = np.concatenate([np.full(f[1], f[2]) for f in FIELDS])
 EPISODE_ARRAYS = ("k", "steps_total", "pitch0", "roll0", "est0", "sent", "history", "up", "v_prev",
                   "gyro_bias", "accel_bias", "imu_on", "tip_prev", "bucket_prev", "front_prev",
-                  "corner_prev", "touched", "rest_load", "rest_count", "landing", "in_band",
-                  "hold_steps", "err_total", "done", "active")
+                  "corner_prev", "touched", "rest_load", "rest_count", "landing", "recent",
+                  "end_load", "end_steps", "in_band", "hold_steps", "err_total", "done",
+                  "active")
 
 
 def _matrices(quat: np.ndarray) -> np.ndarray:
@@ -186,6 +187,10 @@ class PropScene:
         self.rest_load = np.zeros((n, len(self._corners)))
         self.rest_count = np.zeros(n, np.intp)
         self.landing = np.zeros(n)
+        self.recent = np.zeros((n, HISTORY))
+        window = max(1, round(self.settings.window / self.period))
+        self.end_load = np.zeros((n, window, len(self._corners)))
+        self.end_steps = np.zeros((n, window), np.intp)
         self.in_band = np.zeros(n, np.intp)
         self.hold_steps = np.zeros(n, np.intp)
         self.err_total = np.zeros(n)
@@ -246,6 +251,9 @@ class PropScene:
         self.rest_load[index] = 0.0
         self.rest_count[index] = 0
         self.landing[index] = 0.0
+        self.recent[index] = 0.0
+        self.end_load[index] = 0.0
+        self.end_steps[index] = 0
         self.in_band[index] = 0
         self.hold_steps[index] = 0
         self.err_total[index] = 0.0
@@ -328,6 +336,9 @@ class PropScene:
                               for task, row in zip(self.tasks, times, strict=True)])
         holds = np.array([task.hold_span for task in self.tasks])
         in_hold = (times >= holds[:, :1]) & (times < holds[:, 1:])
+        resting = times > np.array([[task.length - task.final] for task in self.tasks])
+        load_sum = np.zeros((n, len(self._corners)))
+        fresh = np.zeros(n)
         err_sum = np.zeros(n)
         roll_sum = np.zeros(n)
         worst_tilt = np.zeros(n)
@@ -386,22 +397,35 @@ class PropScene:
             touched |= bucket
             landed = front & ~self.front_prev
             if landed.any():
-                self.landing = np.maximum(self.landing,
-                                          np.where(landed, self.corner_prev, 0.0).max(1))
+                fresh = np.maximum(fresh, np.where(landed, self.corner_prev, 0.0).max(1))
             self.front_prev = front
+            if resting[:, step].any():
+                load_sum += np.where(resting[:, step, None], self._front_load(), 0.0)
             offsets = rot @ self._corners.T
             corner_v = v[base_v[:, None] + np.arange(3)][..., None] + np.cross(omega, offsets,
                                                                                axis=1)
             self.corner_prev = -corner_v[:, 2]
-        load = self._front_load()
+        self.landing = np.maximum(self.landing, fresh)
+        self.recent[:, :-1] = self.recent[:, 1:]
+        self.recent[:, -1] = fresh
         aloft = ~touched
-        self.rest_load[aloft] += load[aloft]
+        if aloft.any():
+            load = self._front_load()
+            self.rest_load[aloft] += load[aloft]
         self.rest_count += aloft
         self.touched = touched
+        counted = resting.sum(1)
+        settling = counted > 0
+        self.end_load[settling, :-1] = self.end_load[settling, 1:]
+        self.end_steps[settling, :-1] = self.end_steps[settling, 1:]
+        self.end_load[settling, -1] = load_sum[settling]
+        self.end_steps[settling, -1] = counted[settling]
         rest = self.rest_load / np.maximum(self.rest_count, 1)[:, None]
-        carried = np.min(np.divide(load, rest, out=np.zeros_like(rest), where=rest > 0.0), axis=1)
-        settling = times[:, -1] > np.array([task.length - task.final for task in self.tasks])
-        shortfall = np.where(settling, 1.0 - np.minimum(carried / s.carry, 1.0), 0.0)
+        held = self.end_load.sum(1) / np.maximum(self.end_steps.sum(1), 1)[:, None]
+        carried = np.min(np.divide(held, rest, out=np.zeros_like(rest), where=rest > 0.0), axis=1)
+        clear = ~bucket & front.all(1)
+        shortfall = np.where(settling, np.where(clear, 1.0 - np.minimum(carried / s.carry, 1.0),
+                                                1.0), 0.0)
         self.k += 1
         self.steps_total += self.steps
         self.err_total += err_sum
@@ -409,7 +433,8 @@ class PropScene:
         mean_err = err_sum / self.steps
         change = np.abs(commands - self.sent).mean(1) / 2.0
         self.sent = commands
-        earned = reward(s, mean_err, change, roll_sum / self.steps, slide, self.landing, shortfall)
+        earned = reward(s, mean_err, change, roll_sum / self.steps, slide, self.recent.max(1),
+                        shortfall)
         for i in range(n):
             failed[i] |= not (np.all(np.isfinite(data.qpos[self._own_q[i]]))
                               and np.all(np.isfinite(self.layer._pressure[i])))
@@ -442,20 +467,22 @@ class PropScene:
                 self.active[i] = False
                 speed = float(np.linalg.norm(motion[i], axis=0).max())
                 infos[i] = self.outcome(i, causes[i], pitch[i] - self.pitch0[i],
-                                        float(carried[i]), speed)
+                                        float(carried[i]), speed, bool(bucket[i]),
+                                        bool(front[i].all()))
                 infos[i]["passed"] &= not cut[i]
                 infos[i]["truncated"] = causes[i] is None
                 infos[i]["cut_short"] = bool(cut[i])
         return obs, earned, terminated, infos
 
     def outcome(self, index: int, cause: str | None, final_tilt: float, carried: float,
-                speed: float) -> dict:
+                speed: float, bucket_down: bool, front_down: bool) -> dict:
         s = self.settings
         share = self.in_band[index] / max(int(self.hold_steps[index]), 1)
         passed = (cause is None and share >= s.hold_share and self.landing[index] < s.landing
-                  and carried >= s.carry and speed < s.still)
+                  and not bucket_down and front_down and carried >= s.carry and speed < s.still)
         return {"seed": self.seeds[index], "cause": cause, "passed": bool(passed),
                 "hold_share": float(share), "landing": float(self.landing[index]),
+                "bucket_down": bucket_down, "front_down": front_down,
                 "final_tilt": float(final_tilt), "front_carried": carried, "front_speed": speed,
                 "tilt_error": float(self.err_total[index] / max(int(self.steps_total[index]), 1)),
                 "decisions": int(self.k[index])}

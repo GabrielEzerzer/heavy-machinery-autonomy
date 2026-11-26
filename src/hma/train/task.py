@@ -56,6 +56,7 @@ class Settings:
     hold_share: float = 0.8
     landing: float = 0.3
     carry: float = 0.5
+    window: float = 0.5
     still: float = 0.02
     scale: float = 0.3
 

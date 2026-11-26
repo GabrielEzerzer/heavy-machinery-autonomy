@@ -186,8 +186,7 @@ def train(args) -> None:
         trim_curve(out / "curve.csv", config["timesteps"])
     if args.spread is None:
         args.spread = COMMAND_NOISE / args.scale if args.mode == "residual" else SPREAD[args.mode]
-    envs = ProcVecEnv(args.procs, args.machines, args.rung, args.mode,
-                      resume_seed(args.seed, config["timesteps"]) if resume else args.seed,
+    envs = ProcVecEnv(args.procs, args.machines, args.rung, args.mode, args.seed,
                       Settings(scale=args.scale))
     print(f"workers: {envs.pids}", flush=True)
     try:
