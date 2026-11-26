@@ -54,6 +54,21 @@ def test_a_restored_checkpoint_continues_the_same_episodes(tmp_path):
 
 
 @pytest.mark.train_extra
+def test_restoring_twice_from_one_snapshot_gives_the_same_seeds_both_times():
+    from hma.train.task import DEV_BASE
+    from hma.train.vec import SceneVecEnv
+
+    env = SceneVecEnv(1, "nominal", "residual", 0, seeds=[DEV_BASE + k for k in range(4)])
+    env.reset()
+    saved = env.snapshot()
+    env.restore(saved)
+    first = [env.next_seed() for _ in range(3)]
+    env.restore(saved)
+    assert [env.next_seed() for _ in range(3)] == first == [DEV_BASE + 1, DEV_BASE + 2,
+                                                             DEV_BASE + 3]
+
+
+@pytest.mark.train_extra
 def test_steps_is_the_total_across_a_resume():
     from stable_baselines3.common.callbacks import BaseCallback
 

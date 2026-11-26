@@ -442,9 +442,16 @@ class PropScene:
         gain = self.filter_gain
         base_q, base_v = self._base_q, self._base_v
         touched = self.touched.copy()
+        rot = _matrices(data.qpos[base_q[:, None] + np.arange(3, 7)])
+        pitch = _tilts(np.einsum("nk,nkj->nj", self.stance, rot))[0]
+        bucket, front = self.apart == 0, self.front_prev.copy()
+        done_steps = self.steps
         for step in range(self.steps):
             self.layer.step()
             reset_seen = self._failure(failed, reset_seen)
+            if reset_seen:
+                done_steps = step
+                break
             q, v = data.qpos, data.qvel
             rot = _matrices(q[base_q[:, None] + np.arange(3, 7)])
             pitch, roll = _tilts(np.einsum("nk,nkj->nj", self.stance, rot))
@@ -492,13 +499,13 @@ class PropScene:
         self.landing = np.maximum(self.landing, fresh)
         self.recent[:, :-1] = self.recent[:, 1:]
         self.recent[:, -1] = fresh
-        aloft = ~touched
+        aloft = ~touched & (not reset_seen)
         if aloft.any():
             load = self._front_load()
             self.rest_load[aloft] += load[aloft]
         self.rest_count += aloft
         self.touched = touched
-        counted = resting.sum(1)
+        counted = resting[:, :done_steps].sum(1)
         settling = counted > 0
         self.end_load[settling, :-1] = self.end_load[settling, 1:]
         self.end_steps[settling, :-1] = self.end_steps[settling, 1:]
@@ -512,13 +519,14 @@ class PropScene:
         shortfall = np.where(settling, np.where(clear, 1.0 - np.minimum(carried / s.carry, 1.0),
                                                 1.0), 0.0)
         self.k += 1
-        self.steps_total += self.steps
+        self.steps_total += done_steps
         self.err_total += err_sum
         sensed = self.layer.observe_mean()
-        mean_err = err_sum / self.steps
+        mean_err = err_sum / max(done_steps, 1)
         change = np.abs(commands - self.sent).mean(1) / 2.0
         self.sent = commands
-        earned = reward(s, mean_err, change, roll_sum / self.steps, slide, self.recent.max(1),
+        earned = reward(s, mean_err, change, roll_sum / max(done_steps, 1), slide,
+                        self.recent.max(1),
                         shortfall)
         for i in range(n):
             failed[i] |= not (np.all(np.isfinite(data.qpos[self._own_q[i]]))
@@ -539,7 +547,7 @@ class PropScene:
             gyro = gyro_sum[i] / self.steps + rng.uniform(-1.0, 1.0, 3) * GYRO_NOISE * on
             accel = accel_sum[i] / self.steps + rng.uniform(-1.0, 1.0, 3) * ACCEL_NOISE * on
             tilt = self._sensed_tilt(i, sensed.positions[i, SWING], rng)
-            if not cut[i]:
+            if not (cut[i] or failed[i]):
                 self.history[i, :-1] = self.history[i, 1:]
                 self.history[i, -1] = self._frame(i, sensed, gyro, accel, tilt)
             obs[i] = self.history[i].ravel()

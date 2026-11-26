@@ -6,8 +6,9 @@ import numpy as np
 import pytest
 
 from hma.hydraulics import NOMINAL, RANGES, BaseController
-from hma.machine import machine_prefix
+from hma.machine import machine_prefix, tracks
 from hma.machine.kinematics import BOOM_PIVOT
+from hma.machine.model import ground_geoms
 from hma.train import evaluate, footing
 from hma.train.scene import CONTROL_HZ, HISTORY, PropScene, reward
 from hma.train.task import (
@@ -84,23 +85,55 @@ def test_restoring_never_ends_an_episode_over_a_stale_warning_count():
     assert not done[0]
 
 
-@pytest.mark.parametrize("kind", ["acceleration", "velocity"])
-def test_a_solver_failure_ends_only_its_own_machine_and_cuts_the_rest_short(kind):
-    scene = PropScene(3, "nominal")
+@pytest.mark.parametrize("kind, rung, before", [("acceleration", "nominal", 2),
+                                                ("velocity", "nominal", 2),
+                                                ("acceleration", "ground", 5)])
+def test_a_solver_failure_ends_only_its_own_machine_and_cuts_the_rest_short(kind, rung, before):
+    scene = PropScene(3, rung)
     for i in range(3):
         scene.reset(i, SEED + i)
-    for _ in range(2):
-        scene.step(np.zeros((3, 4)))
+    for _ in range(before):
+        obs = scene.step(np.zeros((3, 4)))[0]
+    error = scene.err_total / scene.steps_total
     if kind == "acceleration":
         scene.data.xfrc_applied[scene.model.body(machine_prefix(1) + "bucket").id, 2] = 1e30
     else:
         scene.data.qvel[scene._base_v[1]] = np.nan
-    _, reward, done, info = scene.step(np.zeros((3, 4)))
+    after, reward, done, info = scene.step(np.zeros((3, 4)))
     assert done.all() and np.all(reward == 0.0)
+    assert np.all(np.isfinite(after)) and np.array_equal(after, obs)
     assert info[1]["cause"] == "unstable" and not info[1]["truncated"]
     for i in (0, 2):
         assert info[i]["cause"] is None and info[i]["truncated"] and info[i]["cut_short"]
         assert not info[i]["passed"]
+        assert info[i]["tilt_error"] == error[i]
+
+
+def test_a_machine_that_goes_non_finite_without_a_warning_ends_alone_and_keeps_a_finite_view():
+    scenes = [PropScene(3, "nominal") for _ in range(2)]
+    for scene in scenes:
+        for i in range(3):
+            scene.reset(i, SEED + i)
+        for _ in range(3):
+            obs = scene.step(np.zeros((3, 4)))[0]
+    broken, plain = scenes
+    calls = []
+    step = broken.layer.step
+
+    def poisoned():
+        step()
+        calls.append(None)
+        if len(calls) == broken.steps:
+            broken.layer._pressure[1] = np.nan
+            broken.layer._clean[broken.layer._clean_head, :, 1] = np.nan
+
+    broken.layer.step = poisoned
+    after, reward, done, info = broken.step(np.zeros((3, 4)))
+    expected, _, _, _ = plain.step(np.zeros((3, 4)))
+    assert np.all(np.isfinite(after)) and np.array_equal(after[1], obs[1])
+    assert done[1] and info[1]["cause"] == "unstable" and reward[1] == 0.0
+    assert not done[0] and not done[2]
+    assert np.array_equal(after[[0, 2]], expected[[0, 2]])
 
 
 def test_the_bucket_striking_its_own_machine_ends_the_episode_as_a_strike():
@@ -195,10 +228,11 @@ def test_every_ground_task_stands_evenly_presses_on_one_flat_surface_and_is_in_r
         assert footing.slope_deg(scene.grounds[0]) <= 10.0, seed
         assert np.abs(stance).max() <= footing.EVEN, seed
         assert np.ptp(press) <= footing.EVEN, seed
-        assert (scene._front_load()[0] > 0.0).all(), seed
         assert height == scene.height_under(0, task.prop_x, side)
         assert reachable(PropPath(task, scene.pivot, height), scene.period), seed
         assert reachable(PropPath(task, scene.pivot), scene.period), seed
+        scene.step(np.zeros((1, 4)))
+        assert scene.rest_count[0] == 1 and (scene.rest_load[0] > 0.0).all(), seed
 
 
 def test_the_score_does_not_depend_on_the_number_of_processes():
@@ -218,6 +252,37 @@ def test_the_hold_and_its_band_count_only_the_physics_steps_inside_the_hold_span
     assert scene.hold_steps[0] == np.count_nonzero((times >= start) & (times < end))
     assert 0 < scene.hold_steps[0] < len(times)
     assert 0 < scene.in_band[0] <= scene.hold_steps[0]
+
+
+def test_each_front_load_column_is_the_ground_force_on_that_tracks_own_front_parts():
+    scene = PropScene(2, "nominal")
+    for i in range(2):
+        scene.reset(i, SEED + i)
+    scene.step(np.zeros((2, 4)))
+    model, data = scene.model, scene.data
+    wheels = {str(k) for k, x in enumerate(tracks.WHEEL_X) if x > 0.0}
+    belts = {f"belt_{k}" for k, x in enumerate(tracks.BELT_X) if x > 0.0}
+    expected = np.zeros((2, 2))
+    force = np.zeros(6)
+    for i in range(2):
+        for k, side in enumerate(tracks.SIDES):
+            names = [model.geom(g).name for g in footing.front_parts(model, i)[k]]
+            stem = machine_prefix(i) + tracks.TRACK + side + "_"
+            assert all(name.startswith(stem) for name in names)
+        ground = set(ground_geoms(model, i).tolist())
+        for c in range(data.ncon):
+            a, b = (int(g) for g in data.contact.geom[c])
+            if (a in ground) == (b in ground):
+                continue
+            name = model.geom(b if a in ground else a).name
+            for k, side in enumerate(tracks.SIDES):
+                stem = machine_prefix(i) + tracks.TRACK + side + "_"
+                part = name[len(stem):] if name.startswith(stem) else None
+                if part in wheels or part in belts or part == "front":
+                    mujoco.mj_contactForce(model, data, c, force)
+                    expected[i, k] += force[0]
+    assert np.all(expected > 0.0)
+    assert np.array_equal(scene._front_load(), expected)
 
 
 def test_one_tracks_front_left_unloaded_at_the_end_fails_the_set_down():

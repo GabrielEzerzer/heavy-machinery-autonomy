@@ -66,7 +66,7 @@ class SceneVecEnv(VecEnv):
     def restore(self, snapshot: dict) -> np.ndarray:
         self.scene.restore(snapshot["scene"])
         self.stream.bit_generator.state = snapshot["stream"]
-        self.queue = snapshot["queue"]
+        self.queue = None if snapshot["queue"] is None else list(snapshot["queue"])
         self.returns, self.lengths = snapshot["returns"].copy(), snapshot["lengths"].copy()
         return self.observations()
 
