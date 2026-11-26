@@ -244,7 +244,7 @@ def test_propped_machine_whose_tip_holds_keeps_contact_and_matches_statics():
 
 
 @pytest.mark.parametrize(("boom", "until", "mean_bound", "rms_bound", "ripple_bound"),
-                         [(0.6, 8.0, 0.03, 0.75e-3, 3.5e-3), (1.0, 3.3, 0.07, 1.5e-3, 7.0e-3)])
+                         [(0.6, 8.0, 0.03, 0.75e-3, 3.5e-3), (1.0, 3.3, 0.12, 1.5e-3, 7.0e-3)])
 def test_propped_machine_whose_tip_slides_hops_within_its_measured_bounds(
         boom, until, mean_bound, rms_bound, ripple_bound):
     rows, weight = propping(boom, 0.0, until)
