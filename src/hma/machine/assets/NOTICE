@@ -28,22 +28,23 @@ Changes made to the source:
 - The URDF was converted to MuJoCo MJCF. Joint origins, axes and the boom, arm and bucket
   limits are taken unchanged from zx120.urdf; the bucket tip site comes from bucket_end_joint.
 - Not used: the URDF collision meshes and the Gazebo, ROS control and MoveIt files.
-- Added: a free-floating base with twenty-four sphere-shaped track contact geoms, six along the
-  inner and outer edge of each track at the bottom of the track mesh, a box geom carrying the
-  counterweight mass in the lower 1 m of the rear of the upper structure, a site at the
-  bucket tip, and two sites at the ends of the cutting edge, placed at the bucket mesh's
-  widest points within 5 cm of the tip's distance from the bucket joint.
-- Added at scene load, in hma/machine/model.py: convex collision shapes cut with planes from the
-  track, body, boom, arm and bucket meshes (hma/machine/collision.py), with no mass and in a
-  geom group that is not rendered by default, and a lifting point on the back of the bucket
+- Added: a free-floating base, a box geom marking the counterweight in the lower 1 m of the rear
+  of the upper structure, a site at the bucket tip, and two sites at the ends of the cutting
+  edge, placed at the bucket mesh's widest points within 5 cm of the tip's distance from the
+  bucket joint.
+- Added at scene load, in hma/machine/model.py: two tracks, each with nine road wheels on one
+  travel drive and contact shells for the track frame and idler ends; a rigid ground of MuJoCo
+  primitives (a plane, boxes and buried spheres); convex collision shapes cut with planes from
+  the track, body, boom, arm and bucket meshes (hma/machine/collision.py), with no mass and in a
+  geom group that is not rendered by default; and a lifting point on the back of the bucket
   from which a block hangs by a four-leg sling joined at a master link. The cylinder and
   linkage meshes have no collision shape.
-- Masses: the source gives a placeholder mass of 0.03 kg per link. The link masses used here are
-  set in hma/machine/model.py. Boom (1,220 kg, with arm cylinder), arm (600 kg, with bucket
-  cylinder), bucket (400 kg) and counterweight (2,450 kg) follow the manufacturer's published
-  component weights; the split of the rest between undercarriage and upper structure is an
-  estimate. Inertias are computed by MuJoCo from the convex hull of each mesh at uniform
-  density, so centres of mass and inertias are estimates too.
+- Masses: the source gives a placeholder mass of 0.03 kg per link. Each body's mass, centre of
+  mass and inertia are set explicitly in hma/machine/mass.py, summed from component parts:
+  boom (1,220 kg, with arm cylinder), arm (600 kg, with bucket cylinder), bucket (400 kg) and
+  counterweight (2,450 kg) follow the manufacturer's published component weights, the track
+  chains, boom cylinders and the split of the rest follow a published sibling machine, and the
+  positions of the parts within each body are estimates.
 - Joint force caps standing in for hydraulic relief limits are added in hma/machine/model.py;
   they are estimates derived from published digging forces and swing torque.
 

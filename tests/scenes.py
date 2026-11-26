@@ -3,40 +3,41 @@ bucket reaches only near full depth; held() puts a running scene's joints on the
 where they stand; lock_joints() pins them rigidly."""
 
 import mujoco
-import numpy as np
 
 from hma.hydraulics import NOMINAL, Hydraulics
-from hma.machine import JOINT_NAMES, ground_axes, machine_prefix, write_ground
-from hma.machine.model import GROUND_DEPTH
+from hma.machine import JOINT_NAMES, machine_prefix
+from hma.machine.ground import Box, Ground, apply_ground
 
+PIT_DEPTH = 6.0
 STRIP_X = 1.7
 STRIP_Y = (0.6, 1.5)
+PIT = Ground(level=-PIT_DEPTH, boxes=tuple(
+    Box(0.0, side * (STRIP_Y[0] + STRIP_Y[1]) / 2, 0.0, STRIP_X, (STRIP_Y[1] - STRIP_Y[0]) / 2,
+        PIT_DEPTH) for side in (-1, 1)))
 
 
 def dig_pit(model, n_machines=1):
-    xs, ys = ground_axes()
-    strips = ((np.abs(ys)[:, None] >= STRIP_Y[0]) & (np.abs(ys)[:, None] <= STRIP_Y[1])
-              & (np.abs(xs)[None, :] <= STRIP_X))
-    heights = np.where(strips, 0.0, -GROUND_DEPTH)
     for i in range(n_machines):
-        write_ground(model, i, heights)
+        apply_ground(model, i, PIT)
     return model
 
 
 LAYERS = {}
+FIELDS = ("qpos", "qvel", "eq_active", "xfrc_applied", "mocap_pos", "mocap_quat", "userdata")
 
 
 def held(model, data):
     layer = LAYERS.get(id(data))
     if layer is None or layer.data is not data:
         count = sum(model.body(i).name.endswith("/base") for i in range(model.nbody))
-        kept = [getattr(data, k).copy() for k in ("qpos", "qvel", "eq_active", "xfrc_applied")]
+        kept = [getattr(data, k).copy() for k in FIELDS]
         poses = [[data.qpos[model.joint(machine_prefix(i) + j).qposadr[0]] for j in JOINT_NAMES]
                  for i in range(count)]
         layer = Hydraulics(model, data, [NOMINAL] * count)
         for index, pose in enumerate(poses):
             layer.reset(index, NOMINAL, pose)
-        data.qpos[:], data.qvel[:], data.eq_active[:], data.xfrc_applied[:] = kept
+        for name, value in zip(FIELDS, kept, strict=True):
+            getattr(data, name)[:] = value
         mujoco.mj_forward(model, data)
         LAYERS[id(data)] = layer
     return layer

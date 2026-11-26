@@ -1,6 +1,7 @@
-"""Scenes of 12 t class excavators, each on its own ground of (y, x) heights; names start with
+"""Scenes of 12 t class excavators, each on its own ground of primitive geoms; names start with
 machine_prefix(i). ctrl is the torque on each driven joint in N m, which hma.hydraulics computes
-from the oil pressures; set_weld(off) leaves track contacts on."""
+from the oil pressures, or a track speed in m/s sent through a "_valve" joint. Step with
+hma.machine.tracks.step, which limits travel power."""
 
 from __future__ import annotations
 
@@ -10,8 +11,10 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+from hma.machine import mass, tracks
 from hma.machine.collision import add_collision_geoms
-from hma.machine.scenery import dress_after_heightfields, plain_look
+from hma.machine.mass import body_solids, combine, full_inertia, point
+from hma.machine.scenery import GROUND_SHAPE, dress_after_heightfields, plain_look
 
 ASSETS = Path(__file__).parent / "assets"
 MACHINE_XML = ASSETS / "excavator.xml"
@@ -20,24 +23,27 @@ JOINT_NAMES = ("swing", "boom", "arm", "bucket")
 BODY_NAMES = ("base", "upper", "boom", "arm", "bucket")
 BASE_JOINT = "base_free"
 TIP_SITE = "bucket_tip"
-TRACK_FEET = "track_"
+TRAVEL_NAMES = tuple(tracks.TRAVEL + side for side in tracks.SIDES)
 ANCHOR = "anchor"
 WELD = "base_weld"
 GROUND = "ground"
 HOME_KEY = "home"
 HOME_POSE = (0.0, -0.6, 1.9, 0.6)
 
-LINK_MASSES = {"base": 4500.0, "upper": 5580.0, "boom": 1220.0, "arm": 600.0, "bucket": 400.0}
-COUNTERWEIGHT_MASS = 2450.0
+COUNTERWEIGHT_MASS = mass.COUNTERWEIGHT_MASS
 END_STOP_SOLIMP = (0.999, 0.9999, 0.001)
+VALVE = "_valve"
+VALVE_INERTIA = 1.0e8
+VALVE_GAIN = 5.0e9
 
-GROUND_CELL = 0.1
 GROUND_HALF = 13.5
-GROUND_X = (-GROUND_HALF - GROUND_CELL, GROUND_HALF + GROUND_CELL)
+GROUND_X = (-GROUND_HALF, GROUND_HALF)
 GROUND_Y = (-GROUND_HALF, GROUND_HALF)
-GROUND_DEPTH = 6.0
-GROUND_TOP = 2.0
-GROUND_BASE = 0.5
+GROUND_BOXES = 8
+GROUND_BUMPS = 6
+GROUND_BOX = "ground_box_"
+GROUND_BUMP = "ground_bump_"
+PARKED = -50.0
 MACHINE_SPACING = 2 * GROUND_HALF
 MAX_MACHINES = 31
 
@@ -70,16 +76,28 @@ NOMINAL_LEG_ANGLE = 0.5236
 LOAD_HOME = (7.0, 0.0)
 LOAD_POINTS = "load_point_"
 LOAD_POINT_RADIUS = 0.05
+FOOTPRINT_STEP = 0.05
 
 
 def machine_prefix(index: int) -> str:
     return f"m{index}/"
 
 
-def ground_shape() -> tuple[int, int]:
-    nrow = round((GROUND_Y[1] - GROUND_Y[0]) / GROUND_CELL) + 1
-    ncol = round((GROUND_X[1] - GROUND_X[0]) / GROUND_CELL) + 1
-    return nrow, ncol
+def wheel_points() -> list[tuple[float, tuple[float, float, float]]]:
+    wheels = [(m, x, tracks.WHEEL_RADIUS)
+              for m, x in zip(tracks.WHEEL_MASSES, tracks.WHEEL_X, strict=True)]
+    belts = [(tracks.BELT_MASS, x, tracks.WHEEL_RADIUS + tracks.BELT_GAP) for x in tracks.BELT_X]
+    return [(m, (x, tracks.side_sign(side) * mass.GAUGE / 2, z))
+            for side in tracks.SIDES for m, x, z in wheels + belts]
+
+
+def link_solids() -> dict[str, mass.Solid]:
+    solids = dict(body_solids())
+    solids["base"] = combine([solids["base"], *(point(-m, pos) for m, pos in wheel_points())])
+    return solids
+
+
+LINK_MASSES = {name: solid.mass for name, solid in link_solids().items()}
 
 
 def _turn_reference_to_home(joint: mujoco.MjsJoint, angle: float) -> None:
@@ -92,16 +110,69 @@ def _turn_reference_to_home(joint: mujoco.MjsJoint, angle: float) -> None:
     joint.ref = angle
 
 
+def _valve(spec: mujoco.MjSpec, name: str, joints: tuple[str, ...], cap: float, limit: float,
+           solimp: tuple[float, float, float], coef: float) -> None:
+    valve = spec.worldbody.add_body(name=name + VALVE, mass=1.0, inertia=[1.0, 1.0, 1.0],
+                                    explicitinertial=True)
+    valve.add_joint(name=name + VALVE, axis=[0.0, 0.0, 1.0], armature=VALVE_INERTIA)
+    tendon = spec.add_tendon(name=name + VALVE, frictionloss=cap,
+                             solref_friction=[2 * TIMESTEP, 1.0],
+                             solimp_friction=[*solimp, 0.5, 2.0])
+    for joint in joints:
+        tendon.wrap_joint(joint, coef)
+    tendon.wrap_joint(name + VALVE, -1.0)
+    act = spec.add_actuator(name=name, target=name + VALVE, trntype=mujoco.mjtTrn.mjTRN_JOINT)
+    act.set_to_velocity(kv=VALVE_GAIN)
+    act.ctrllimited = mujoco.mjtLimited.mjLIMITED_TRUE
+    act.ctrlrange = [-limit, limit]
+
+
+def _add_track(spec: mujoco.MjSpec, side: str) -> None:
+    y = tracks.side_sign(side) * mass.GAUGE / 2
+    across = [np.cos(np.pi / 4), np.sin(np.pi / 4), 0.0, 0.0]
+    drive = tracks.wheel_name(side, 0)
+    parts = [(tracks.wheel_name(side, k), x, tracks.WHEEL_RADIUS, m)
+             for k, (x, m) in enumerate(zip(tracks.WHEEL_X, tracks.WHEEL_MASSES, strict=True))]
+    parts += [(tracks.belt_name(side, k), x, tracks.WHEEL_RADIUS + tracks.BELT_GAP,
+               tracks.BELT_MASS) for k, x in enumerate(tracks.BELT_X)]
+    for name, x, z, part_mass in parts:
+        wheel = spec.body("base").add_body(name=name, pos=[x, y, z], mass=part_mass,
+                                           ipos=[0.0, 0.0, 0.0],
+                                           inertia=[tracks.WHEEL_INERTIA] * 3,
+                                           explicitinertial=True)
+        wheel.add_joint(name=name, axis=[0.0, 1.0, 0.0],
+                        armature=tracks.BELT_ARMATURE / tracks.COUPLED)
+        wheel.add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_CYLINDER, quat=across,
+                       size=[tracks.WHEEL_RADIUS, tracks.RAIL], contype=0, conaffinity=0,
+                       group=3, rgba=[0.2, 0.6, 0.9, 0.4])
+        if name != drive:
+            spec.add_equality(type=mujoco.mjtEq.mjEQ_JOINT, objtype=mujoco.mjtObj.mjOBJ_JOINT,
+                              name1=name, name2=drive, data=[0.0, 1.0] + [0.0] * 10,
+                              solref=list(tracks.COUPLING_SOLREF),
+                              solimp=list(tracks.COUPLING_SOLIMP))
+    base = spec.body("base")
+    frame, rear, front = tracks.shell_names(side)
+    lift, top, half_shoe = tracks.SHELL_LIFT, tracks.SHELL_TOP, mass.SHOE_WIDTH / 2
+    shell = dict(contype=0, conaffinity=0, group=3, mass=0.0, rgba=[0.9, 0.6, 0.2, 0.3])
+    base.add_geom(name=frame, type=mujoco.mjtGeom.mjGEOM_BOX, pos=[0.0, y, (lift + top) / 2],
+                  size=[mass.TUMBLER, half_shoe, (top - lift) / 2], **shell)
+    for name, x in ((rear, -mass.TUMBLER), (front, mass.TUMBLER)):
+        base.add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_CYLINDER, quat=across,
+                      pos=[x, y, tracks.WHEEL_RADIUS + lift],
+                      size=[tracks.WHEEL_RADIUS, half_shoe], **shell)
+    wheels = tuple(tracks.wheel_name(side, k) for k in range(tracks.WHEELS))
+    _valve(spec, tracks.TRAVEL + side, wheels, tracks.TRACTION, tracks.TRAVEL_SPEED,
+           tracks.BRAKE_SOLIMP, coef=tracks.WHEEL_RADIUS / tracks.WHEELS)
+
+
 def _machine_spec(index: int) -> mujoco.MjSpec:
     spec = mujoco.MjSpec.from_file(str(MACHINE_XML))
-    for body, mass in LINK_MASSES.items():
-        mesh_geom = next(g for g in spec.body(body).geoms if g.type == mujoco.mjtGeom.mjGEOM_MESH)
-        mesh_geom.mass = mass - (COUNTERWEIGHT_MASS if body == "upper" else 0.0)
-    spec.geom("counterweight").mass = COUNTERWEIGHT_MASS
-    for geom in spec.body("base").geoms:
-        if geom.name.startswith(TRACK_FEET):
-            geom.contype = 1 << index
-            geom.conaffinity = 0
+    for name, solid in link_solids().items():
+        body = spec.body(name)
+        body.explicitinertial = True
+        body.mass = solid.mass
+        body.ipos = solid.com
+        body.fullinertia = full_inertia(solid)
     for name, home in zip(JOINT_NAMES, HOME_POSE, strict=True):
         joint = spec.joint(name)
         _turn_reference_to_home(joint, home)
@@ -111,6 +182,8 @@ def _machine_spec(index: int) -> mujoco.MjSpec:
         joint.solimp_friction = [*END_STOP_SOLIMP, 0.5, 2.0]
         act = spec.add_actuator(name=name, target=name, trntype=mujoco.mjtTrn.mjTRN_JOINT)
         act.set_to_motor()
+    for side in tracks.SIDES:
+        _add_track(spec, side)
     add_collision_geoms(spec, 1 << index, CONTACT_SOLREF, CONTACT_SOLIMP, STEEL_FRICTION,
                         CONTACT_MARGIN)
     spec.body("bucket").add_site(name=HOOK, pos=list(HOOK_POS), size=[0.04],
@@ -181,17 +254,35 @@ def _add_load(scene: mujoco.MjSpec, index: int, prefix: str, offset: np.ndarray)
 
 
 def _add_ground(scene: mujoco.MjSpec, index: int, prefix: str, offset: np.ndarray) -> None:
-    nrow, ncol = ground_shape()
-    half_x = (GROUND_X[1] - GROUND_X[0]) / 2
-    half_y = (GROUND_Y[1] - GROUND_Y[0]) / 2
-    scene.add_hfield(name=prefix + GROUND, nrow=nrow, ncol=ncol,
-                     size=[half_x, half_y, GROUND_DEPTH + GROUND_TOP, GROUND_BASE],
-                     userdata=[0.0] * (nrow * ncol))
-    centre = offset + [(GROUND_X[0] + GROUND_X[1]) / 2, (GROUND_Y[0] + GROUND_Y[1]) / 2,
-                       -GROUND_DEPTH]
-    scene.worldbody.add_geom(name=prefix + GROUND, type=mujoco.mjtGeom.mjGEOM_HFIELD,
-                             hfieldname=prefix + GROUND, pos=centre, contype=0,
-                             conaffinity=1 << index, material=GROUND, friction=[0.8, 0.005, 1e-4])
+    half = [(GROUND_X[1] - GROUND_X[0]) / 2, (GROUND_Y[1] - GROUND_Y[0]) / 2]
+    centre = offset + [(GROUND_X[0] + GROUND_X[1]) / 2, (GROUND_Y[0] + GROUND_Y[1]) / 2, 0.0]
+    friction = [tracks.FRICTION, 0.005, 1e-4]
+    scene.worldbody.add_geom(name=prefix + GROUND, type=mujoco.mjtGeom.mjGEOM_PLANE,
+                             pos=centre, size=[*half, 1.0], contype=0, conaffinity=1 << index,
+                             material=GROUND, friction=friction)
+    parked = offset + [0.0, 0.0, PARKED]
+    shapes = [(GROUND_BOX, GROUND_BOXES, mujoco.mjtGeom.mjGEOM_BOX, [0.1] * 3),
+              (GROUND_BUMP, GROUND_BUMPS, mujoco.mjtGeom.mjGEOM_SPHERE, [0.1, 0.0, 0.0])]
+    for name, count, kind, size in shapes:
+        for k in range(count):
+            scene.worldbody.add_geom(name=f"{prefix}{name}{k}", type=kind, pos=parked, size=size,
+                                     contype=0, conaffinity=1 << index,
+                                     material=GROUND_SHAPE, friction=friction)
+
+
+def _add_track_pairs(scene: mujoco.MjSpec, prefix: str) -> None:
+    grounds = [GROUND] + [f"{GROUND_BOX}{k}" for k in range(GROUND_BOXES)]
+    grounds += [f"{GROUND_BUMP}{k}" for k in range(GROUND_BUMPS)]
+    mu = tracks.FRICTION
+    for side in tracks.SIDES:
+        shells = tracks.shell_names(side)
+        for part in tracks.contact_names(side):
+            for ground in grounds:
+                scene.add_pair(geomname1=prefix + part,
+                               geomname2=prefix + ground, condim=1 if part in shells else 3,
+                               friction=[mu, mu, 0.005, 1e-4, 1e-4],
+                               solreffriction=[-0.0, -tracks.FRICTION_REFERENCE],
+                               solimp=list(tracks.CONTACT_SOLIMP))
 
 
 def _share_look(scene: mujoco.MjSpec) -> None:
@@ -217,16 +308,20 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
     scene.modelname = "excavator_scene"
     scene.meshdir = str(ASSETS)
     scene.option.timestep = TIMESTEP
-    scene.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+    scene.option.integrator = mujoco.mjtIntegrator.mjINT_EULER
     scene.option.tolerance = SOLVER_TOLERANCE
     scene.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
     scene.option.impratio = IMPRATIO
+    scene.option.jacobian = mujoco.mjtJacobian.mjJAC_SPARSE
+    scene.nuserdata = 3 * n_machines
     for i in range(n_machines):
         prefix = machine_prefix(i)
         offset = np.array([0.0, i * MACHINE_SPACING, 0.0])
         frame = scene.worldbody.add_frame(pos=offset)
         scene.attach(_machine_spec(i), prefix=prefix, frame=frame)
         _add_ground(scene, i, prefix, offset)
+        if not weld:
+            _add_track_pairs(scene, prefix)
         _add_load(scene, i, prefix, offset)
         scene.worldbody.add_body(name=prefix + ANCHOR, pos=offset, mocap=True)
         scene.add_equality(name=prefix + WELD, type=mujoco.mjtEq.mjEQ_WELD,
@@ -240,55 +335,79 @@ def load_scene(n_machines: int = 1, weld: bool = False) -> mujoco.MjModel:
     dress_after_heightfields(scene, footprints, [(0.0, y) for y in offsets])
     scene.add_key(name=HOME_KEY)
     model = scene.compile()
-    flat = np.zeros(ground_shape())
+    even_track_stiffness(model)
     for i in range(n_machines):
-        write_ground(model, i, flat)
-        if weld:
-            tracks = [g for g in range(model.ngeom)
-                      if model.geom(g).name.startswith(machine_prefix(i) + TRACK_FEET)]
-            model.geom_contype[tracks] = 0
+        rest_home(model, i)
     return model
 
 
-def write_ground(model: mujoco.MjModel, index: int, heights: np.ndarray) -> None:
-    heights = np.asarray(heights, float)
-    if heights.shape != ground_shape():
-        raise ValueError(f"heights must have shape {ground_shape()} (y, x), got {heights.shape}")
-    if not np.all(np.isfinite(heights) & (heights >= -GROUND_DEPTH) & (heights <= GROUND_TOP)):
-        raise ValueError(f"heights must lie within [{-GROUND_DEPTH}, {GROUND_TOP}] m")
-    hf = model.hfield(machine_prefix(index) + GROUND)
-    cells = slice(int(hf.adr[0]), int(hf.adr[0]) + heights.size)
-    before = model.hfield_data[cells].copy()
-    model.hfield_data[cells] = ((heights + GROUND_DEPTH) / (GROUND_DEPTH + GROUND_TOP)).ravel()
-    try:
-        rest_home(model, index)
-    except ValueError:
-        model.hfield_data[cells] = before
-        raise
+def even_track_stiffness(model: mujoco.MjModel) -> None:
+    i = 0
+    while mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, machine_prefix(i) + "base") >= 0:
+        parts = [model.body(machine_prefix(i) + name).id
+                 for side in tracks.SIDES for name in tracks.coupled_names(side)]
+        model.body_invweight0[parts] = model.body_invweight0[parts].mean(axis=0)
+        i += 1
+
+
+def set_const(model: mujoco.MjModel, data: mujoco.MjData) -> None:
+    mujoco.mj_setConst(model, data)
+    even_track_stiffness(model)
+
+
+def write_friction(model: mujoco.MjModel, index: int, mu: float) -> None:
+    if not (np.isfinite(mu) and mu > 0):
+        raise ValueError("the friction coefficient must be finite and positive")
+    prefix = machine_prefix(index)
+    model.geom_friction[ground_geoms(model, index), 0] = mu
+    names = [n for s in tracks.SIDES for n in tracks.contact_names(s)]
+    parts = [model.geom(prefix + n).id for n in names]
+    pairs = np.isin(model.pair_geom1, parts) | np.isin(model.pair_geom2, parts)
+    model.pair_friction[pairs, :2] = mu
+
+
+def ground_parts(model: mujoco.MjModel, index: int) -> tuple[int, np.ndarray, np.ndarray]:
+    prefix = machine_prefix(index)
+    plane = model.geom(prefix + GROUND).id
+    boxes = np.array([model.geom(f"{prefix}{GROUND_BOX}{k}").id for k in range(GROUND_BOXES)])
+    bumps = np.array([model.geom(f"{prefix}{GROUND_BUMP}{k}").id for k in range(GROUND_BUMPS)])
+    return plane, boxes, bumps
 
 
 def ground_geoms(model: mujoco.MjModel, index: int) -> np.ndarray:
-    bit = 1 << index
-    return np.flatnonzero((model.geom_bodyid == 0) & (model.geom_contype == 0)
-                          & (model.geom_conaffinity & bit != 0))
+    plane, boxes, bumps = ground_parts(model, index)
+    return np.array([plane, *boxes, *bumps])
 
 
-def ground_height(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float,
-                  y: float) -> float | None:
-    top = np.array([x, y + index * MACHINE_SPACING, RAY_TOP])
-    best = np.inf
-    for geom in ground_geoms(model, index):
-        kind = model.geom_type[geom]
-        if kind == mujoco.mjtGeom.mjGEOM_HFIELD:
-            dist = mujoco.mj_rayHfield(model, data, geom, top, DOWN)
-        elif kind == mujoco.mjtGeom.mjGEOM_MESH:
-            dist = mujoco.mj_rayMesh(model, data, geom, top, DOWN)
-        else:
-            dist = mujoco.mju_rayGeom(data.geom_xpos[geom], data.geom_xmat[geom],
-                                      model.geom_size[geom], top, DOWN, kind)
-        if dist >= 0:
-            best = min(best, dist)
-    return None if best == np.inf else float(RAY_TOP - best)
+def ground_height(model: mujoco.MjModel, index: int, points: np.ndarray) -> np.ndarray:
+    plane, boxes, bumps = ground_parts(model, index)
+    offset = model.body_pos[model.body(machine_prefix(index) + ANCHOR).id]
+    points = np.atleast_2d(np.asarray(points, float))
+    rel = points[:, :2] - offset[:2]
+    normal = np.zeros(3)
+    mujoco.mju_rotVecQuat(normal, [0.0, 0.0, 1.0], model.geom_quat[plane])
+    height = model.geom_pos[plane][2] - (
+        normal[0] * (points[:, 0] - model.geom_pos[plane][0])
+        + normal[1] * (points[:, 1] - model.geom_pos[plane][1])) / normal[2]
+    for geom in (*boxes, *bumps):
+        pos = model.geom_pos[geom]
+        if pos[2] < offset[2] + PARKED / 2:
+            continue
+        mat = np.zeros(9)
+        mujoco.mju_quat2Mat(mat, model.geom_quat[geom])
+        for k, (x, y) in enumerate(points[:, :2]):
+            d = mujoco.mju_rayGeom(pos, mat, model.geom_size[geom], np.array([x, y, RAY_TOP]),
+                                   DOWN, int(model.geom_type[geom]))
+            if d >= 0:
+                height[k] = max(height[k], RAY_TOP - d)
+    off = ((rel[:, 0] < GROUND_X[0]) | (rel[:, 0] > GROUND_X[1])
+           | (rel[:, 1] < GROUND_Y[0]) | (rel[:, 1] > GROUND_Y[1]))
+    height[off] = np.nan
+    return height
+
+
+def _height(model: mujoco.MjModel, index: int, x: float, y: float) -> float:
+    return float(ground_height(model, index, [[x, y + index * MACHINE_SPACING]])[0])
 
 
 def load_geoms(model: mujoco.MjModel, index: int) -> np.ndarray:
@@ -297,7 +416,7 @@ def load_geoms(model: mujoco.MjModel, index: int) -> np.ndarray:
     return np.flatnonzero(np.isin(model.geom_bodyid, bodies))
 
 
-def footprint(half: np.ndarray, step: float = GROUND_CELL / 2) -> np.ndarray:
+def footprint(half: np.ndarray, step: float = FOOTPRINT_STEP) -> np.ndarray:
     u, v = (np.linspace(-h, h, max(2, int(np.ceil(2 * h / step)) + 1)) for h in half[:2])
     return np.array([(a, b, -half[2]) for a in u for b in v])
 
@@ -306,12 +425,9 @@ def ground_overlap(model: mujoco.MjModel, data: mujoco.MjData, index: int) -> fl
     prefix = machine_prefix(index)
     geom = model.geom(prefix + LOAD).id
     rot, centre = data.geom_xmat[geom].reshape(3, 3), data.geom_xpos[geom]
-    worst = -np.inf
-    for point in footprint(model.geom_size[geom]) @ rot.T + centre:
-        height = ground_height(model, data, index, point[0], point[1] - index * MACHINE_SPACING)
-        if height is not None:
-            worst = max(worst, height - point[2])
-    return float(worst)
+    points = footprint(model.geom_size[geom]) @ rot.T + centre
+    gaps = ground_height(model, index, points) - points[:, 2]
+    return float(np.nanmax(gaps, initial=-np.inf))
 
 
 def placement_fault(model: mujoco.MjModel, data: mujoco.MjData, index: int) -> str | None:
@@ -349,11 +465,11 @@ def rest_pose(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float, 
     feet = load_points(half)
     feet = feet[np.isclose(feet[:, 2], feet[:, 2].min())]
     xy = np.array([x, y]) + feet[:, :2] @ np.array([[c, s], [-s, c]])
-    heights = np.array([ground_height(model, data, index, a, b) for a, b in xy])
-    if None in heights:
+    heights = np.array([_height(model, index, a, b) for a, b in xy])
+    if np.isnan(heights).any():
         raise ValueError("the load must be placed on this machine's ground")
     com = model.body_ipos[model.body(prefix + LOAD).id][:2] @ np.array([[c, s], [-s, c]])
-    slope = support_plane(xy - [x, y] - com, heights.astype(float))
+    slope = support_plane(xy - [x, y] - com, heights)
     normal = np.array([-slope[1], -slope[2], 1.0]) / np.hypot(np.hypot(*slope[1:]), 1.0)
     level, tilt, quat = np.zeros(4), np.array([1.0, 0.0, 0.0, 0.0]), np.zeros(4)
     mujoco.mju_axisAngle2Quat(level, [0.0, 0.0, 1.0], yaw)
@@ -364,8 +480,8 @@ def rest_pose(model: mujoco.MjModel, data: mujoco.MjData, index: int, x: float, 
     rot = np.zeros(9)
     mujoco.mju_quat2Mat(rot, quat)
     offsets = feet @ rot.reshape(3, 3).T
-    under = [ground_height(model, data, index, x + o[0], y + o[1]) for o in offsets]
-    if None in under:
+    under = [_height(model, index, x + o[0], y + o[1]) for o in offsets]
+    if np.isnan(under).any():
         raise ValueError("the load must be placed on this machine's ground")
     gap = CONTACT_MARGIN - REST_DEPTH
     lift = (LOAD_POINT_RADIUS + gap) / normal[2]
@@ -410,13 +526,11 @@ def rest_home(model: mujoco.MjModel, index: int) -> None:
         qpos[r0:r0 + 3] = 0.0
 
 
-def ground_axes() -> tuple[np.ndarray, np.ndarray]:
-    nrow, ncol = ground_shape()
-    return np.linspace(*GROUND_X, ncol), np.linspace(*GROUND_Y, nrow)
-
-
 def set_weld(model: mujoco.MjModel, data: mujoco.MjData, index: int, on: bool) -> None:
     prefix = machine_prefix(index)
+    wheel = model.geom(prefix + tracks.wheel_name(tracks.SIDES[0], 0)).id
+    if not on and not np.isin(wheel, [model.pair_geom1, model.pair_geom2]).any():
+        raise ValueError("a scene loaded welded has no ground contact; load it released")
     base = model.body(prefix + "base").id
     if on:
         mocap = model.body_mocapid[model.body(prefix + ANCHOR).id]
@@ -424,11 +538,6 @@ def set_weld(model: mujoco.MjModel, data: mujoco.MjData, index: int, on: bool) -
         data.mocap_pos[mocap] = data.xpos[base]
         data.mocap_quat[mocap] = data.xquat[base]
         data.qvel[_base_dofs(model, index)] = 0.0
-    else:
-        for geom in range(model.ngeom):
-            if model.geom(geom).name.startswith(prefix + TRACK_FEET):
-                model.geom_contype[geom] = 1 << index
-        model.body_contype[base] |= 1 << index
     data.eq_active[model.equality(prefix + WELD).id] = int(on)
 
 

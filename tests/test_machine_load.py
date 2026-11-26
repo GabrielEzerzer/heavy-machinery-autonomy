@@ -5,8 +5,9 @@ import numpy as np
 import pytest
 
 from hma.hydraulics.params import NOMINAL
-from hma.machine import HOME_KEY, JOINT_NAMES, ground_axes, ground_shape, load_scene, write_ground
+from hma.machine import HOME_KEY, JOINT_NAMES, load_scene
 from hma.machine.contact import steel_geoms
+from hma.machine.ground import GEOM_STATE, Box, Bump, Ground, apply_ground
 from hma.machine.kinematics import (
     ARM_LENGTH,
     BOOM_LENGTH,
@@ -38,12 +39,12 @@ from hma.machine.model import (
     LOAD_HOME,
     LOAD_POINT_RADIUS,
     LOAD_POINTS,
-    TRACK_FEET,
     ground_geoms,
     ground_overlap,
     machine_prefix,
 )
 from hma.machine.statics import CHART
+from hma.machine.tracks import TRACK
 from scenes import held, lock_joints
 
 P = machine_prefix(0)
@@ -175,10 +176,8 @@ def test_refused_hangs_leave_model_and_data_unchanged():
     assert_refused(model, data, hang_load, "inside the machine or the ground")
     pose(model, data, CROSSING_POSE)
     assert_refused(model, data, hang_load, "pass through the machine")
-    xs, _ = ground_axes()
-    heights = np.zeros(ground_shape())
-    heights[:, xs > 3.0] = 2.0
-    write_ground(model, 0, heights)
+    raised = Box((3.0 + GROUND_HALF) / 2, 0.0, 0.0, (GROUND_HALF - 3.0) / 2, GROUND_HALF, 2.0)
+    apply_ground(model, 0, Ground(boxes=(raised,)))
     pose(model, data, (0.0, -0.8, 1.6, 2.3))
     assert_refused(model, data, hang_load, "inside the machine or the ground")
 
@@ -232,11 +231,8 @@ def test_refused_placements_leave_model_and_data_unchanged():
                    "against the machine")
     assert_refused(model, data, lambda m, d, i: place_load(m, d, i, GROUND_HALF + 5.0, 0.0),
                    "this machine's ground")
-    xs, _ = ground_axes()
     inset = model.geom_size[model.geom(P + LOAD).id][0] - LOAD_POINT_RADIUS
-    heights = np.zeros(ground_shape())
-    heights[:, np.abs(xs - (5.0 + inset / 2)) < 0.06] = 0.3
-    write_ground(model, 0, heights)
+    apply_ground(model, 0, ridge(5.0 + inset / 2))
     assert_refused(model, data, lambda m, d, i: place_load(m, d, i, 5.0, 4.0),
                    "between the load's contact spheres")
     model, data = scene()
@@ -277,8 +273,8 @@ def test_reset_and_placement_start_the_load_at_rest():
 def test_load_placed_on_a_slope_rests_tilted_with_it():
     model, data = scene(3000.0)
     slope = math.radians(10.0)
-    xs, _ = ground_axes()
-    write_ground(model, 0, np.zeros(ground_shape()) + math.tan(slope) * (xs[None, :] - 5.0))
+    rise = math.tan(slope)
+    apply_ground(model, 0, Ground(grade=(rise, 0.0), level=-5.0 * rise))
     place_load(model, data, 0, 7.0, 2.0)
     up = data.xmat[model.body(P + LOAD).id].reshape(3, 3)[:, 2]
     assert math.degrees(math.acos(up[2])) == pytest.approx(10.0, abs=0.01)
@@ -288,11 +284,11 @@ def test_load_placed_on_a_slope_rests_tilted_with_it():
 
 def test_reset_puts_the_load_on_newly_written_ground():
     model, data = scene(3000.0)
-    write_ground(model, 0, np.full(ground_shape(), 1.0))
+    apply_ground(model, 0, Ground(level=-1.0))
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
     mujoco.mj_forward(model, data)
     half = model.geom_size[model.geom(P + LOAD).id]
-    assert data.xpos[model.body(P + LOAD).id][2] == pytest.approx(1.0 + half[2] + CONTACT_MARGIN,
+    assert data.xpos[model.body(P + LOAD).id][2] == pytest.approx(-1.0 + half[2] + CONTACT_MARGIN,
                                                                   abs=1e-6)
     moved, fastest = resting_still(model, data)
     assert moved < SAG and fastest < STILL
@@ -300,21 +296,20 @@ def test_reset_puts_the_load_on_newly_written_ground():
 
 
 def ridge(x):
-    xs, _ = ground_axes()
-    heights = np.zeros(ground_shape())
-    heights[:, int(np.argmin(np.abs(xs - x)))] = 0.3
-    return heights
+    return Ground(boxes=(Box(x, 0.0, 0.0, 0.05, GROUND_HALF, 0.3),))
 
 
 def test_ground_or_load_with_no_rest_at_home_is_refused_and_changes_nothing():
     model, data = scene(2000.0)
     small = model.geom_size[model.geom(P + LOAD).id].copy()
-    ground, key = model.hfield_data.copy(), model.key_qpos.copy()
+    ground = {name: getattr(model, name).copy() for name in GEOM_STATE}
+    key = model.key_qpos.copy()
     with pytest.raises(ValueError, match="home position"):
-        write_ground(model, 0, ridge(LOAD_HOME[0] + small[0] / 2))
-    np.testing.assert_array_equal(model.hfield_data, ground)
+        apply_ground(model, 0, ridge(LOAD_HOME[0] + small[0] / 2))
+    for name, value in ground.items():
+        np.testing.assert_array_equal(getattr(model, name), value, err_msg=name)
     np.testing.assert_array_equal(model.key_qpos, key)
-    write_ground(model, 0, ridge(LOAD_HOME[0] + small[0] + 0.2))
+    apply_ground(model, 0, ridge(LOAD_HOME[0] + small[0] + 0.2))
     fields = {name: getattr(model, name).copy() for name in LOAD_FIELDS}
     with pytest.raises(ValueError, match="home position"):
         apply_load(model, 0, block(5000.0, length_ratio=2.0), mujoco.MjData(model))
@@ -324,8 +319,8 @@ def test_ground_or_load_with_no_rest_at_home_is_refused_and_changes_nothing():
 
 def test_reset_rests_the_load_on_uneven_ground():
     model, data = scene(3000.0)
-    xs, ys = ground_axes()
-    write_ground(model, 0, 0.06 * np.abs(xs[None, :] - 7.2) + 0.03 * ys[:, None])
+    valley = (Bump(5.4, 0.0, 2.0, 0.1), Bump(8.8, 0.0, 2.0, 0.1))
+    apply_ground(model, 0, Ground(grade=(0.0, 0.03), bumps=valley))
     mujoco.mj_resetDataKeyframe(model, data, model.key(HOME_KEY).id)
     mujoco.mj_forward(model, data)
     assert ground_overlap(model, data, 0) < 0
@@ -347,7 +342,7 @@ def test_the_load_meets_each_other_shape_through_one_kind_of_its_own():
     model, _ = scene()
     box = model.geom(P + LOAD).id
     spheres = [g for g in range(model.ngeom) if model.geom(g).name.startswith(P + LOAD_POINTS)]
-    feet = [g for g in range(model.ngeom) if model.geom(g).name.startswith(P + TRACK_FEET)]
+    feet = [g for g in range(model.ngeom) if model.geom(g).name.startswith(P + TRACK)]
     pieces = steel_geoms(model, 0)
     for piece in pieces:
         assert collides(model, piece, box) and not any(collides(model, piece, s) for s in spheres)
@@ -412,7 +407,7 @@ def test_heaviest_and_tallest_draws_are_hooked_and_lifted_clear_over_the_side():
         anchor = data.xanchor[model.joint(P + "bucket").id]
         assert anchor[2] <= height and math.hypot(anchor[0], anchor[1]) <= radius[height]
         layer.act(np.zeros((1, 4)))
-        run(model, data, 1.0)
+        run(model, data, 4.0)
         tension = []
         for _ in range(round(1.0 / model.opt.timestep)):
             layer.step()

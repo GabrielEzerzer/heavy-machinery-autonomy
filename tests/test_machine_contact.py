@@ -12,15 +12,13 @@ from hma.machine import (
     JOINT_LIMITS,
     JOINT_NAMES,
     TIP_SITE,
-    ground_axes,
-    ground_shape,
     load_scene,
     machine_prefix,
-    write_ground,
 )
 from hma.machine.collision import LINK_MESH, PIECES, link_triangles
 from hma.machine.contact import STEEL_FRICTION_RANGE, draw_friction, set_friction
 from hma.machine.cylinders import seal_friction
+from hma.machine.ground import Box, Ground, apply_ground
 from hma.machine.load import (
     LEG_WLL,
     RANGES,
@@ -40,22 +38,24 @@ from hma.machine.model import (
     CONTACT_MARGIN,
     CONTACT_SOLIMP,
     CONTACT_SOLREF,
+    GROUND_HALF,
     LOAD,
     LOAD_DENSITY,
     MACHINE_SPACING,
     RING,
     RING_MASS,
-    TRACK_FEET,
     ground_geoms,
     ring_at_load,
 )
 from hma.machine.render import PARTS
+from hma.machine.tracks import SIDES, WHEELS, wheel_name
 from scenes import held, lock_joints
 
 P = machine_prefix(0)
 G = 9.81
 GRAVITY_BODIES = ("boom", "arm", "bucket")
 F6 = np.zeros(6)
+UNDERCARRIAGE = ("base", *(wheel_name(s, k) for s in SIDES for k in range(WHEELS)))
 LOWER = 0.3
 SERVO_GAIN = 1e8
 
@@ -180,7 +180,7 @@ def test_propped_machine_bucket_reaction_matches_statics():
     up = data.xmat[base].reshape(3, 3)[:, 2]
     assert math.degrees(math.acos(up[2])) > 3.0
     bucket, xb = resultant(body_contacts(model, data, "bucket"))
-    tracks, xr = resultant(body_contacts(model, data, "base"))
+    tracks, xr = resultant([c for b in UNDERCARRIAGE for c in body_contacts(model, data, b)])
     weight = data.subtree_com[base], model.body_subtreemass[base] * G
     hand = weight[1] * (weight[0][0] - xr[0]) / (xb[0] - xr[0])
     assert bucket[2] == pytest.approx(hand, rel=0.01)
@@ -198,8 +198,8 @@ def propping(boom, arm, seconds):
     weight = model.body_subtreemass[base] * G
     rows = []
 
-    def moments(body):
-        contacts = body_contacts(model, data, body)
+    def moments(*bodies):
+        contacts = [c for body in bodies for c in body_contacts(model, data, body)]
         if not contacts:
             return np.zeros(3), np.zeros(3)
         force = np.array([c[1] for c in contacts])
@@ -208,12 +208,12 @@ def propping(boom, arm, seconds):
                                    weights.sum()]
 
     def record():
-        (fb, mb), (_, mr) = moments("bucket"), moments("base")
+        (fb, mb), (_, mr) = moments("bucket"), moments(*UNDERCARRIAGE)
         pressure = max(layer.pump_pressures()[0].max() - NOMINAL.main_relief,
                        (layer.chamber_pressures()[0] - NOMINAL.port_relief).max())
         up = data.xmat[base].reshape(3, 3)[:, 2]
         rows.append((data.time, fb[0], fb[2], *mb, *mr, data.subtree_com[base][0],
-                     data.site_xpos[tip][2], pressure, math.degrees(math.acos(up[2])),
+                     data.site_xpos[tip][2], pressure, math.degrees(math.acos(min(up[2], 1.0))),
                      *data.site_xpos[tip][:2]))
 
     run(model, data, seconds, record)
@@ -270,11 +270,13 @@ def rigid(model, data, seconds, each=None):
 
 
 def servo(model, data, name, speed):
-    act = model.actuator(P + name).id
-    model.actuator_gainprm[act, 0] = SERVO_GAIN
-    model.actuator_biastype[act] = mujoco.mjtBias.mjBIAS_AFFINE
-    model.actuator_biasprm[act, :3] = [0.0, 0.0, -SERVO_GAIN]
-    data.ctrl[act] = speed
+    model.dof_damping[model.joint(P + name).dofadr[0]] = SERVO_GAIN
+    data.ctrl[model.actuator(P + name).id] = SERVO_GAIN * speed
+
+
+def servo_torque(model, data, name):
+    dof = model.joint(P + name).dofadr[0]
+    return data.actuator_force[model.actuator(P + name).id] + data.qfrc_damper[dof]
 
 
 def press(model, data, newtons, lever):
@@ -301,12 +303,11 @@ def pressed_by_torque(model, data, newtons, mu):
 
 def drag(model, data, joint, speed, seconds):
     servo(model, data, joint, speed)
-    act = model.actuator(P + joint).id
     samples = []
 
     def sample():
         f, c = resultant(body_contacts(model, data, "bucket"))
-        samples.append((f[2], math.hypot(f[0], f[1]), abs(data.actuator_force[act]),
+        samples.append((f[2], math.hypot(f[0], f[1]), abs(servo_torque(model, data, joint)),
                         math.hypot(*c[:2])))
 
     rigid(model, data, seconds, sample)
@@ -374,7 +375,7 @@ def test_joint_loads_with_a_hanging_load_match_statics():
     for joint, bodies in chain.items():
         x = pivot_x(model, data, joint)
         hand = gravity_moment(model, data, bodies, x) + weight * (hook[0] - x)
-        sim = data.actuator_force[model.actuator(P + joint).id]
+        sim = servo_torque(model, data, joint)
         assert abs(sim) == pytest.approx(abs(hand), rel=0.01)
 
 
@@ -406,18 +407,20 @@ def bounce(model, data, layer, seconds):
     start, end = 1.0, 3.3
     kept = (t > start) & (t < end) & (swing[peaks] > 0.01)
     window = slice(round(start / model.opt.timestep), round(end / model.opt.timestep))
-    return np.polyfit(t[kept], swing[peaks][kept], 1)[0], np.median(np.diff(t[kept])), np.mean(
-        boom_seals[window])
+    return t[kept], swing[peaks][kept], np.median(np.diff(t[kept])), np.mean(boom_seals[window])
 
 
 def test_hung_load_bounce_dies_at_the_rate_the_boom_seals_give_by_hand(monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(oil_layer, "seal_friction", lambda head, rod, speed: np.zeros(np.shape(head)))
         model, data = hung(3000.0)
-        oil_only, half_period, _ = bounce(model, data, held(model, data), 3.5)
+        t, peaks, half_period, _ = bounce(model, data, held(model, data), 3.5)
+    oil_only = np.polyfit(t, np.log(peaks), 1)[0]
     model, data = hung(3000.0)
     layer = held(model, data)
-    with_seals, _, seals = bounce(model, data, layer, 3.5)
+    t, peaks, _, seals = bounce(model, data, layer, 3.5)
+    fade = np.exp(oil_only * (t - t[0]))
+    _, by_seals = np.linalg.lstsq(np.c_[fade, (1.0 - fade) / oil_only], peaks, rcond=None)[0]
     mass = np.zeros((model.nv, model.nv))
     mujoco.mj_fullM(model, data, mass)
     boom = layer._qvel[0, 1]
@@ -425,7 +428,7 @@ def test_hung_load_bounce_dies_at_the_rate_the_boom_seals_give_by_hand(monkeypat
     inertia = mass[boom, boom] + 3000.0 * reach ** 2
     hand = 4.0 * abs(reach) * seals / (inertia * G) / (2.0 * half_period)
     assert oil_only < 0.0
-    assert hand <= oil_only - with_seals <= 1.25 * hand
+    assert hand <= by_seals <= 1.25 * hand
 
 
 def test_sling_readings_match_statics_and_a_snatch_reads_over_the_rating():
@@ -481,7 +484,7 @@ def deepest(model, data):
 
 def test_bucket_swung_over_the_track_corner_stops_on_it():
     model, data = home(weld=True)
-    write_ground(model, 0, np.full(ground_shape(), -5.0))
+    apply_ground(model, 0, Ground(level=-5.0))
     pose(model, data, np.radians((45.0, -3.5, 100.0, 40.3)))
     command(model, data, "arm", 1.0)
     worst = [0.0]
@@ -528,11 +531,10 @@ def ground_contacts(model, data, link):
 ])
 def test_each_front_link_lowered_onto_raised_ground_rests_on_it(link, start, edges):
     model, data = home(weld=True)
-    xs, _ = ground_axes()
-    heights = np.full(ground_shape(), -5.0)
-    heights[:, xs > edges[0]] = edges[2]
-    heights[:, xs >= edges[1]] = -5.0
-    write_ground(model, 0, heights)
+    held(model, data)
+    raised = Box((edges[0] + edges[1]) / 2, 0.0, 0.0, (edges[1] - edges[0]) / 2, GROUND_HALF,
+                 edges[2] + 5.0)
+    apply_ground(model, 0, Ground(level=-5.0, boxes=(raised,)))
     pose(model, data, start)
     lower_onto_ground(model, data, LOWER, 8.0)
     touching = []
@@ -544,11 +546,8 @@ def test_each_front_link_lowered_onto_raised_ground_rests_on_it(link, start, edg
 
 def test_ridge_higher_than_the_ground_clearance_high_centres_the_belly():
     model, data = home()
-    xs, ys = ground_axes()
     ridge = 0.6
-    heights = np.zeros(ground_shape())
-    heights[np.ix_(np.abs(ys) < 0.15, np.abs(xs) < 3.0)] = ridge
-    write_ground(model, 0, heights)
+    apply_ground(model, 0, Ground(boxes=(Box(0.0, 0.0, 0.0, 3.0, 0.15, ridge),)))
     data.qpos[model.joint(P + "base_free").qposadr[0] + 2] = ridge - 0.40
     run(model, data, 3.0)
     base = model.body(P + "base").id
@@ -564,10 +563,9 @@ def test_ridge_higher_than_the_ground_clearance_high_centres_the_belly():
 
 def test_swung_counterweight_stops_against_a_mound_beside_the_tracks():
     model, data = home(weld=True)
-    xs, ys = ground_axes()
-    heights = np.zeros(ground_shape())
-    heights[np.ix_(np.abs(ys) > 1.85, np.abs(xs) < 1.0)] = 1.2
-    write_ground(model, 0, heights)
+    half = (GROUND_HALF - 1.85) / 2
+    apply_ground(model, 0, Ground(boxes=tuple(Box(0.0, side * (1.85 + half), 0.0, 1.0, half, 1.2)
+                                              for side in (-1, 1))))
     pose(model, data, (0.0, -0.8, 1.2, 1.0))
     command(model, data, "swing", 1.0)
     run(model, data, 4.0)
@@ -583,9 +581,8 @@ def test_swung_counterweight_stops_against_a_mound_beside_the_tracks():
 
 def surface_drag(slope_deg, speed, mu=0.4):
     model, data = home(weld=True)
-    xs, _ = ground_axes()
     rise = math.tan(math.radians(slope_deg))
-    write_ground(model, 0, np.zeros(ground_shape()) + rise * (xs[None, :] - 5.0))
+    apply_ground(model, 0, Ground(grade=(rise, 0.0), level=-5.0 * rise))
     up = np.array([-rise, 0.0, 1.0]) / math.hypot(rise, 1.0)
     pressed_by_torque(model, data, 8000.0, mu)
     servo(model, data, "swing", speed)
@@ -789,7 +786,7 @@ def test_only_contact_shapes_collide_and_drawn_parts_are_no_geom():
         expected |= {f"{p}{link}_{name}" for link, names in PIECES.items() for name in names}
         expected |= {model.geom(g).name for g in ground_geoms(model, i)}
         expected |= {model.geom(g).name for g in range(model.ngeom)
-                     if model.geom(g).name.startswith((p + TRACK_FEET, p + LOAD))}
+                     if model.geom(g).name.startswith(p + LOAD)}
     colliding = np.flatnonzero((model.geom_contype != 0) | (model.geom_conaffinity != 0))
     assert {model.geom(g).name for g in colliding} == expected
     drawn = [model.mesh(machine_prefix(i) + part[0]).id for i in range(2) for part in PARTS]

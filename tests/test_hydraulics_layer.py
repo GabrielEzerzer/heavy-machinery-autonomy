@@ -4,12 +4,37 @@ import mujoco
 import numpy as np
 import pytest
 
+import hma.hydraulics.layer as layer_module
 from hma.hydraulics import EFFECTS, NOMINAL, RANGES, Hydraulics, draw_machine
 from hma.hydraulics import circuit as c
 from hma.hydraulics.params import PORT_RELIEF_TOLERANCE, RELIEF_TOLERANCE
-from hma.machine import BODY_NAMES, JOINT_NAMES, LINK_MASSES, load_scene, machine_prefix
+from hma.machine import BODY_NAMES, JOINT_NAMES, load_scene, machine_prefix
 from hma.machine.cylinders import MAIN_RELIEF, seal_friction
-from hma.machine.model import COUNTERWEIGHT_MASS, _machine_spec
+from hma.machine.ground import Ground, apply_ground
+from hma.machine.load import LIFT_CLEARANCE, apply_load, block, hook_load, place_load
+from hma.machine.mass import Solid, body_parts, combine, full_inertia, point
+from hma.machine.measure import LOAD_AWAY, TRAVEL_POSE, slope
+from hma.machine.model import (
+    CONTACT_MARGIN,
+    COUNTERWEIGHT_MASS,
+    LOAD,
+    TRAVEL_NAMES,
+    VALVE_GAIN,
+    VALVE_INERTIA,
+    _machine_spec,
+    wheel_points,
+)
+from hma.machine.tracks import (
+    BELT_ARMATURE,
+    FRICTION,
+    SIDES,
+    TRAVEL_POWER,
+    TRAVEL_SPEED,
+    WHEEL_RADIUS,
+    coupled_names,
+    drive_forces,
+    drives,
+)
 from scenes import dig_pit
 
 DT = 0.005
@@ -206,6 +231,13 @@ def test_each_held_cylinder_drags_by_its_seals_at_its_own_head_and_rod_pressures
         assert loss[dof] == pytest.approx(base + drag, rel=1e-9)
 
 
+def undercarriage(model, bodies):
+    masses = model.body_mass[bodies]
+    places = np.array([model.body_ipos[b] + (model.body_pos[b] if b != bodies[0] else 0.0)
+                       for b in bodies])
+    return masses.sum(), masses @ places / masses.sum()
+
+
 def test_changed_masses_shift_the_links_and_the_home_pose_still_rests():
     machine = only("mass")
     for weld in (True, False):
@@ -220,13 +252,23 @@ def test_changed_masses_shift_the_links_and_the_home_pose_still_rests():
                 cw = COUNTERWEIGHT_MASS
                 expected = (nominal.body_mass[body] - cw) * machine.link_mass[k]
                 expected += cw * machine.counterweight
-            else:
+            elif k > 0:
                 np.testing.assert_allclose(model.body_ipos[body],
                                            nominal.body_ipos[body] + machine.com_shift[k],
                                            atol=1e-12)
             assert model.body_mass[body] == pytest.approx(expected, rel=1e-12)
+        lower = [bodies[0], *(model.body(machine_prefix(0) + name).id
+                              for s in SIDES for name in coupled_names(s))]
+        mass, com = undercarriage(model, lower)
+        nominal_mass, nominal_com = undercarriage(nominal, lower)
+        assert mass == pytest.approx(nominal_mass * machine.link_mass[0], rel=1e-12)
+        np.testing.assert_allclose(com, nominal_com + machine.com_shift[0], atol=1e-12)
+        dofs = model.body_dofadr[lower[1:]]
+        assert model.dof_armature[dofs].sum() == pytest.approx(
+            2 * BELT_ARMATURE * machine.link_mass[0], rel=1e-12)
         assert model.body_subtreemass[bodies[0]] == pytest.approx(
-            sum(model.body_mass[b] for b in bodies))
+            sum(model.body_mass[b] for b in bodies)
+            + machine.link_mass[0] * sum(m for m, _ in wheel_points()))
         start = layer.true_state().positions[0].copy()
         for _ in range(400):
             layer.step()
@@ -331,11 +373,19 @@ def test_mass_changes_match_the_compiler_for_the_same_masses():
     machine = replace(only("mass"), com_shift=np.zeros((len(BODY_NAMES), 3)))
     layer = layer_for(machine)
     spec = _machine_spec(0)
+    parts = body_parts()
+    parts["base"] = [*parts["base"], *(point(-m, pos) for m, pos in wheel_points())]
     for k, name in enumerate(BODY_NAMES):
-        mesh = next(g for g in spec.body(name).geoms if g.type == mujoco.mjtGeom.mjGEOM_MESH)
-        own = LINK_MASSES[name] - (COUNTERWEIGHT_MASS if name == "upper" else 0.0)
-        mesh.mass = own * machine.link_mass[k]
-    spec.geom("counterweight").mass = COUNTERWEIGHT_MASS * machine.counterweight
+        scaled = [Solid(p.mass * machine.link_mass[k], p.com, p.inertia * machine.link_mass[k])
+                  for p in parts[name]]
+        if name == "upper":
+            cw = parts[name][-1]
+            assert cw.mass == COUNTERWEIGHT_MASS
+            scaled[-1] = Solid(cw.mass * machine.counterweight, cw.com,
+                               cw.inertia * machine.counterweight)
+        solid = combine(scaled)
+        body = spec.body(name)
+        body.mass, body.ipos, body.fullinertia = solid.mass, solid.com, full_inertia(solid)
     compiled = spec.compile()
 
     def tensor(model, body):
@@ -462,8 +512,9 @@ def test_stepping_leaves_the_model_as_found_and_a_later_layer_matches_a_fresh_on
     fresh = drive(layer_for(machine))
     model = load_scene(1, weld=True)
     data = mujoco.MjData(model)
+    layer = Hydraulics(model, data, [draw_machine(6)])
     loaded = model.dof_armature.copy(), model.dof_frictionloss.copy()
-    drive(Hydraulics(model, data, [draw_machine(6)]))
+    drive(layer)
     np.testing.assert_array_equal(model.dof_armature, loaded[0])
     np.testing.assert_array_equal(model.dof_frictionloss, loaded[1])
     np.testing.assert_allclose(drive(Hydraulics(model, data, [machine])), fresh,
@@ -595,3 +646,211 @@ def test_resetting_one_machine_leaves_the_other_machines_noise_alone():
     _, _, undisturbed = scene(False)
     np.testing.assert_allclose(second, first, rtol=0, atol=1e-12)
     np.testing.assert_allclose(other, undisturbed, rtol=0, atol=1e-9)
+
+
+def uphill_speed():
+    model = load_scene(1)
+    data = mujoco.MjData(model)
+    apply_ground(model, 0, slope(along=np.radians(20.0)))
+    layer = Hydraulics(model, data, [NOMINAL])
+    layer.reset(0, NOMINAL, TRAVEL_POSE)
+    place_load(model, data, 0, *LOAD_AWAY)
+    data.ctrl[[model.actuator(machine_prefix(0) + t).id for t in TRAVEL_NAMES]] = TRAVEL_SPEED
+    for _ in range(round(3.0 / DT)):
+        layer.step()
+    start = data.qpos[:3].copy()
+    for _ in range(round(1.0 / DT)):
+        layer.step()
+    weight = model.body_subtreemass[model.body(machine_prefix(0) + "base").id] * 9.81
+    return float(np.linalg.norm(data.qpos[:3] - start)), TRAVEL_POWER / (weight * np.sin(
+        np.radians(20.0)))
+
+
+def test_the_layer_steps_through_the_track_drive(monkeypatch):
+    speed, powered = uphill_speed()
+    assert speed == pytest.approx(powered, rel=0.03)
+    monkeypatch.setattr(layer_module, "track_step", mujoco.mj_step)
+    assert uphill_speed()[0] > 1.1 * powered
+
+
+BETWEEN_STEPS = int(mujoco.mjtState.mjSTATE_INTEGRATION) & ~int(mujoco.mjtState.mjSTATE_CTRL)
+INTEGRATION = mujoco.mjtState.mjSTATE_INTEGRATION
+
+
+def state(model, data, kind=INTEGRATION):
+    out = np.empty(mujoco.mj_stateSize(model, kind))
+    mujoco.mj_getState(model, data, out, kind)
+    return out
+
+
+def working_and_travelling(seed, seconds, each=None):
+    model = load_scene(1)
+    data = mujoco.MjData(model)
+    layer = Hydraulics(model, data, [draw_machine(seed)])
+    rng = np.random.default_rng(seed)
+    travel = [model.actuator(machine_prefix(0) + t).id for t in TRAVEL_NAMES]
+    for _ in range(round(seconds * layer.control_hz)):
+        layer.act(rng.uniform(-1.0, 1.0, (1, 4)))
+        data.ctrl[travel] = rng.uniform(0.3, 1.0, 2) * TRAVEL_SPEED
+        for _ in range(layer.steps_per_decision):
+            layer.step()
+            if each is not None and each(model, data, layer):
+                return model, data, layer
+    return model, data, layer
+
+
+def test_a_retaken_step_with_the_tracks_driving_matches_one_step_from_the_same_state(monkeypatch):
+    calls = []
+    track_step = layer_module.track_step
+
+    def recording(model, data):
+        calls.append((state(model, data), model.dof_armature.copy(),
+                      model.dof_frictionloss.copy()))
+        track_step(model, data)
+
+    monkeypatch.setattr(layer_module, "track_step", recording)
+    belt = []
+
+    def retaken(model, data, layer):
+        attempts = calls[:]
+        calls.clear()
+        lay = drives(model)
+        moving = np.abs(data.qvel[lay.dofs] * WHEEL_RADIUS).min() > 0.2
+        if len(attempts) > 1 and moving:
+            belt.append(attempts)
+            return True
+        return False
+
+    model, data, layer = working_and_travelling(11, 30.0, retaken)
+    assert belt, "no step was retaken with both tracks moving"
+    attempts = belt[0]
+    starts = [state_without_ctrl(model, a[0]) for a in attempts]
+    for later in starts[1:]:
+        assert np.array_equal(later, starts[0])
+    final, armature, friction = attempts[-1]
+    once = mujoco.MjData(model)
+    mujoco.mj_setState(model, once, final, INTEGRATION)
+    kept = model.dof_armature.copy(), model.dof_frictionloss.copy()
+    model.dof_armature[:], model.dof_frictionloss[:] = armature, friction
+    track_step(model, once)
+    model.dof_armature[:], model.dof_frictionloss[:] = kept
+    assert np.array_equal(state(model, once), state(model, data))
+
+
+def state_without_ctrl(model, full):
+    scratch = mujoco.MjData(model)
+    mujoco.mj_setState(model, scratch, full, INTEGRATION)
+    return state(model, scratch, BETWEEN_STEPS)
+
+
+def test_runs_with_the_tracks_driving_and_the_arm_working_repeat_bit_for_bit():
+    runs = [working_and_travelling(12, 10.0) for _ in range(2)]
+    (model, first, first_layer), (_, second, second_layer) = runs
+    assert np.array_equal(state(model, first), state(model, second))
+    assert np.array_equal(first_layer.chamber_pressures(), second_layer.chamber_pressures())
+    assert first_layer.redos > 0 and first_layer.redos == second_layer.redos
+
+
+def test_scenes_sharing_one_model_stepped_in_turn_match_scenes_on_their_own():
+    def drive(scenes, model, seeds):
+        travel = [model.actuator(machine_prefix(0) + t).id for t in TRAVEL_NAMES]
+        rngs = [np.random.default_rng(k) for k in seeds]
+        for _ in range(40):
+            for (data, layer), rng in zip(scenes, rngs, strict=True):
+                layer.act(rng.uniform(-1.0, 1.0, (1, 4)))
+                data.ctrl[travel] = rng.uniform(-1.0, 1.0, 2) * model.actuator_ctrlrange[travel, 1]
+            for _ in range(20):
+                for _, layer in scenes:
+                    layer.step()
+        return [data.qpos.copy() for data, _ in scenes]
+
+    def scene(model):
+        data = mujoco.MjData(model)
+        return data, Hydraulics(model, data, [draw_machine(1)])
+
+    shared = load_scene(1)
+    together = drive([scene(shared) for _ in range(2)], shared, (0, 1))
+    apart = []
+    for k in range(2):
+        model = load_scene(1)
+        apart += drive([scene(model)], model, (k,))
+    for a, b in zip(together, apart, strict=True):
+        assert np.array_equal(a, b)
+
+
+def free_machine(ground, pose, load=None):
+    model = load_scene(1)
+    apply_ground(model, 0, ground)
+    if load is not None:
+        apply_load(model, 0, load, mujoco.MjData(model))
+    data = mujoco.MjData(model)
+    layer = Hydraulics(model, data, [NOMINAL])
+    layer.reset(0, NOMINAL, pose)
+    if load is None:
+        place_load(model, data, 0, *LOAD_AWAY)
+    else:
+        hook = data.site_xpos[model.site(machine_prefix(0) + "hook").id]
+        place_load(model, data, 0, hook[0], hook[1])
+        hook_load(model, data, 0)
+    return model, data, layer
+
+
+def drive(model, data, speed):
+    data.ctrl[[model.actuator(machine_prefix(0) + t).id for t in TRAVEL_NAMES]] = speed
+
+
+def test_a_free_machine_carries_a_slung_block_straight_at_full_travel_speed():
+    load = block(1000.0)
+    model, data, layer = free_machine(Ground(), (0.0, -0.6, 1.6, 2.3), load)
+    body = model.body(machine_prefix(0) + LOAD).id
+    layer.act(np.array([[0.0, -1.0, 0.0, 0.0]]))
+    for _ in range(round(4.0 / DT)):
+        layer.step()
+        if data.xipos[body][2] - load.half[2] > LIFT_CLEARANCE + CONTACT_MARGIN:
+            break
+    layer.act(np.zeros((1, 4)))
+    run(layer, np.zeros(4), 1.0)
+    drive(model, data, TRAVEL_SPEED)
+    lowest = np.inf
+    for k in range(round(12.0 / DT)):
+        layer.step()
+        lowest = min(lowest, data.xipos[body][2] - load.half[2])
+        if k == round(6.0 / DT):
+            start = data.qpos[0]
+    assert (data.qpos[0] - start) / (6.0 - DT) == pytest.approx(TRAVEL_SPEED, rel=1e-3)
+    assert lowest > CONTACT_MARGIN
+    assert layer.capped == 0
+
+
+def test_a_free_machine_climbs_ten_degrees_at_full_speed_with_the_grade_on_its_drives():
+    grade = np.radians(10.0)
+    model, data, layer = free_machine(slope(along=grade), TRAVEL_POSE)
+    drive(model, data, TRAVEL_SPEED)
+    weight = model.body_subtreemass[model.body(machine_prefix(0) + "base").id] * 9.81
+    assert TRAVEL_POWER / (weight * np.sin(grade)) > TRAVEL_SPEED
+    pulls, start = [], None
+    for k in range(round(12.0 / DT)):
+        if k % round(2.0 / DT) == 0:
+            layer.act(np.array([[0.0, -0.6 if k // round(2.0 / DT) % 2 == 0 else 0.6, 0.0, 0.0]]))
+        layer.step()
+        if k == round(4.0 / DT):
+            start = data.qpos[:3].copy()
+        if start is not None:
+            pulls.append(drive_forces(model, data)[0].sum())
+    assert np.linalg.norm(data.qpos[:3] - start) / (8.0 - DT) == pytest.approx(TRAVEL_SPEED,
+                                                                               rel=1e-3)
+    assert np.mean(pulls) == pytest.approx(weight * np.sin(grade), rel=0.01)
+    assert layer.capped == 0
+
+
+def test_a_free_machine_stopped_from_full_speed_with_the_arm_out_slides_as_far_as_friction_allows():
+    model, data, layer = free_machine(Ground(), (0.0, -0.3, 0.6, 1.0))
+    drive(model, data, TRAVEL_SPEED)
+    run(layer, np.zeros(4), 6.0)
+    speed, start = data.qvel[0], data.qpos[0]
+    drive(model, data, 0.0)
+    run(layer, np.zeros(4), 4.0)
+    coulomb = speed ** 2 / (2 * FRICTION * 9.81)
+    assert coulomb <= data.qpos[0] - start <= coulomb + speed * VALVE_INERTIA / VALVE_GAIN
+    assert abs(data.qvel[0]) < 1e-3
+    assert layer.capped == 0

@@ -11,6 +11,7 @@ import numpy as np
 
 from hma.machine import JOINT_LIMITS, TIP_SITE, load_scene, machine_prefix
 from hma.machine.cylinders import MAIN_RELIEF, PORT_RELIEF, joint_torque_limits
+from hma.machine.tracks import FRONT_LINE, REAR_LINE, SIDE_LINE
 
 CHART = {
     (4.5, 4.5): ("*3350", "*3350"), (4.5, 6.0): ("3040", "2110"),
@@ -22,7 +23,6 @@ CHART = {
     (-3.0, 1.5): ("*8540", "*8540"), (-3.0, 3.0): ("*7340", "5120"), (-3.0, 4.5): ("4240", "2780"),
 }
 OLD_CAPS = {"boom": 330.0e3, "arm": 244.0e3, "bucket": 122.0e3}
-FRONT_LINE, REAR_LINE, SIDE_LINE = 1.58, -1.593, 1.242
 HYDRAULIC_SHARE, TIPPING_SHARE = 0.87, 0.75
 
 
