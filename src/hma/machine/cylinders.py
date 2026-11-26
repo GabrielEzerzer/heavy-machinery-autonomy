@@ -35,6 +35,40 @@ MAIN_RELIEF = 34.3e6
 PORT_RELIEF = {"boom": (37.3e6, 37.3e6), "arm": (37.3e6, 39.2e6), "bucket": (37.3e6, 39.2e6)}
 
 
+SEAL_TEST_ROD = 0.040
+SEAL_PRESSURE = np.array([6.3e6, 11.0e6, 16.0e6])
+SEAL_SPEED = np.array([0.05, 0.15, 0.30, 0.45])
+ROD_SEAL = np.array([[740.0, 1085.0, 1195.0], [630.0, 920.0, 990.0],
+                     [650.0, 905.0, 950.0], [660.0, 890.0, 930.0]])
+PISTON_SEAL = np.array([[120.0, 190.0, 285.0], [145.0, 195.0, 265.0],
+                        [200.0, 245.0, 310.0], [210.0, 255.0, 315.0]])
+SEAL_TABLES = np.stack([ROD_SEAL, PISTON_SEAL])
+SEAL_SHARE = 0.5
+SEAL_SCALES = SEAL_SHARE * np.array([[COUNT[j] * ROD[j] / SEAL_TEST_ROD for j in CYLINDER_JOINTS],
+                                     [COUNT[j] * BORE[j] / SEAL_TEST_ROD for j in CYLINDER_JOINTS]])
+_SPEED_INDEX = np.arange(len(SEAL_SPEED), dtype=float)
+_PRESSURE_INDEX = np.arange(len(SEAL_PRESSURE), dtype=float)
+_FIRST_STEP = SEAL_PRESSURE[1] - SEAL_PRESSURE[0]
+_LAST_STEP = SEAL_PRESSURE[-1] - SEAL_PRESSURE[-2]
+
+
+def seal_friction(head, rod, speed) -> np.ndarray:
+    head, rod = np.asarray(head, float), np.asarray(rod, float)
+    i = np.interp(np.abs(speed), SEAL_SPEED, _SPEED_INDEX)
+    p = np.stack([rod, np.abs(head - rod)])
+    j = (np.interp(p, SEAL_PRESSURE, _PRESSURE_INDEX)
+         + np.minimum(p - SEAL_PRESSURE[0], 0.0) / _FIRST_STEP
+         + np.maximum(p - SEAL_PRESSURE[-1], 0.0) / _LAST_STEP)
+    i0 = np.minimum(i.astype(np.intp), len(SEAL_SPEED) - 2)
+    j0 = np.clip(np.floor(j).astype(np.intp), 0, len(SEAL_PRESSURE) - 2)
+    kind = np.arange(2).reshape((2,) + (1,) * i.ndim)
+    a, b = i - i0, j - j0
+    low = SEAL_TABLES[kind, i0, j0] * (1 - b) + SEAL_TABLES[kind, i0, j0 + 1] * b
+    high = SEAL_TABLES[kind, i0 + 1, j0] * (1 - b) + SEAL_TABLES[kind, i0 + 1, j0 + 1] * b
+    force = np.maximum(low + a * (high - low), 0.0)
+    return (SEAL_SCALES.reshape((2,) + (1,) * (i.ndim - 1) + (-1,)) * force).sum(0)
+
+
 def areas(joint: str) -> tuple[float, float]:
     bore = COUNT[joint] * math.pi / 4 * BORE[joint] ** 2
     return bore, bore - COUNT[joint] * math.pi / 4 * ROD[joint] ** 2

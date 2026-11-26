@@ -15,6 +15,7 @@ from hma.machine.cylinders import (
     cylinder_length,
     joint_torque_limits,
     pin_on_child,
+    seal_friction,
     xz,
 )
 from hma.machine.statics import CHART, Machine, digging, lift, reach_load_point
@@ -116,3 +117,20 @@ def test_every_chart_point_is_reached_at_the_pose_found():
         machine.pose(0.0, *pose, 0.0, False)
         x, _, z = machine.anchor("bucket")
         assert abs(x - radius) < 1e-4 and abs(z - height) < 1e-4
+
+
+@pytest.mark.parametrize(("head", "rod", "speed", "hand"), [
+    ((11e6, 11e6, 11e6), (11e6, 11e6, 11e6), (0.15, -0.15, 0.15),
+     (1.75 * 920.0 + 2.625 * (145.0 - 6.3 * 50.0 / 4.7), None, None)),
+    ((20e6, 20e6, 20e6), (8.65e6, 8.65e6, 8.65e6), (0.30, 0.30, -0.30),
+     (None, None, 0.875 * 777.5 + 1.25 * 249.55)),
+    ((0.3e6, 0.3e6, 0.3e6), (34.3e6, 34.3e6, 34.3e6), (0.01, 0.01, 0.01),
+     (None, 1.0 * (1195.0 + 22.0 * 18.3) + 1.4375 * (285.0 + 19.0 * 18.0), None)),
+    ((22e6, 22e6, 22e6), (11e6, 11e6, 11e6), (0.10, 0.10, 0.10),
+     (1.75 * (1085.0 + 920.0) / 2 + 2.625 * (190.0 + 195.0) / 2, None, None)),
+])
+def test_seal_friction_matches_the_published_table_worked_by_hand(head, rod, speed, hand):
+    force = seal_friction(np.array(head), np.array(rod), np.array(speed))
+    for value, expected in zip(force, hand, strict=True):
+        if expected is not None:
+            assert value == pytest.approx(expected, rel=1e-9)
