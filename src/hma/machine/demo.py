@@ -13,7 +13,8 @@ import mujoco
 import numpy as np
 
 from hma.hydraulics import NOMINAL, Hydraulics
-from hma.hydraulics.circuit import valve_opening
+from hma.hydraulics.circuit import TANK_PRESSURE, valve_opening
+from hma.machine.load import place_load
 from hma.machine.model import HOME_POSE, load_scene
 from hma.machine.render import apply_look, default_camera, draw_hydraulics, view_option
 
@@ -30,16 +31,19 @@ WAYPOINTS = np.array([
 ])
 SPEEDS = np.array([0.6, 0.3, 0.6, 0.8])
 GAIN = 1.0
+SWING_SPEED_GAIN = 2.0
 RAMP = 0.02
 TOLERANCE = 0.01
 CONTROL_PERIOD = 0.1
 WAYPOINT_TIMEOUT = 30.0
+LOAD_PLACE = (-6.0, 0.0)
 
 
 def motion(model: mujoco.MjModel, data: mujoco.MjData, n_machines: int) -> Iterator[int]:
     layer = Hydraulics(model, data, [NOMINAL] * n_machines, control_hz=1.0 / CONTROL_PERIOD)
     for index in range(n_machines):
         layer.reset(index, NOMINAL, HOME_POSE)
+        place_load(model, data, index, *LOAD_PLACE)
     for index, target in enumerate(WAYPOINTS[1:], start=1):
         deadline = data.time + WAYPOINT_TIMEOUT
         while data.time < deadline:
@@ -48,7 +52,10 @@ def motion(model: mujoco.MjModel, data: mujoco.MjData, n_machines: int) -> Itera
             if np.abs(error).max() <= TOLERANCE:
                 break
             speed = np.clip(GAIN * error, -SPEEDS, SPEEDS)
-            rows = zip(seen.positions, speed, seen.pressures, strict=True)
+            speed[:, 0] += SWING_SPEED_GAIN * (speed[:, 0] - seen.velocities[:, 0])
+            pressures = seen.pressures.copy()
+            pressures[:, 0] = TANK_PRESSURE
+            rows = zip(seen.positions, speed, pressures, strict=True)
             layer.act(np.array([np.sign(s) * valve_opening(q, s, p, RAMP) for q, s, p in rows]))
             for _ in range(layer.steps_per_decision):
                 layer.step()

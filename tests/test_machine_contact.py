@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from hma.hydraulics import NOMINAL, circuit
+from hma.hydraulics import layer as oil_layer
 from hma.hydraulics.layer import DISPLACEMENT
 from hma.machine import (
     HOME_KEY,
@@ -19,6 +20,7 @@ from hma.machine import (
 )
 from hma.machine.collision import LINK_MESH, PIECES, link_triangles
 from hma.machine.contact import STEEL_FRICTION_RANGE, draw_friction, set_friction
+from hma.machine.cylinders import seal_friction
 from hma.machine.load import (
     LEG_WLL,
     RANGES,
@@ -94,6 +96,16 @@ def oil_torque(model, data, name, index=0):
     return float((force * lever)[index, JOINT_NAMES.index(name)])
 
 
+def seal_torque(model, data, name, index=0):
+    layer = held(model, data)
+    _, lever = circuit.geometry(data.qpos[layer._qpos])
+    chambers = layer.chamber_pressures()[index]
+    speed = lever[index] * data.qvel[layer._qvel[index]]
+    joint = JOINT_NAMES.index(name)
+    return float(seal_friction(chambers[1:, 0], chambers[1:, 1], speed[1:])[joint - 1]
+                 * abs(lever[index, joint]))
+
+
 def at_relief(model, data, index=0):
     return held(model, data).pump_pressures()[index].max() > NOMINAL.main_relief
 
@@ -151,12 +163,12 @@ def test_pressed_bucket_ground_reaction_matches_statics_at_the_boom_cap():
     run(model, data, 1.0)
     force, centre = resultant(body_contacts(model, data, "bucket"))
     xp = pivot_x(model, data, "boom")
-    tau = abs(oil_torque(model, data, "boom"))
+    tau = abs(oil_torque(model, data, "boom")) - seal_torque(model, data, "boom")
     assert at_relief(model, data)
     for joint in ("arm", "bucket"):
         assert below_port_relief(model, data, joint)
     hand = (tau + gravity_moment(model, data, GRAVITY_BODIES, xp)) / (centre[0] - xp)
-    assert force[2] == pytest.approx(hand, rel=0.01)
+    assert force[2] == pytest.approx(hand, rel=0.005)
 
 
 def test_propped_machine_bucket_reaction_matches_statics():
@@ -173,6 +185,81 @@ def test_propped_machine_bucket_reaction_matches_statics():
     hand = weight[1] * (weight[0][0] - xr[0]) / (xb[0] - xr[0])
     assert bucket[2] == pytest.approx(hand, rel=0.01)
     assert bucket[2] + tracks[2] == pytest.approx(weight[1], rel=0.01)
+
+
+def propping(boom, arm, seconds):
+    model, data = home()
+    pose(model, data, (0.0, -0.5, 1.6, 1.0))
+    command(model, data, "boom", boom)
+    command(model, data, "arm", arm)
+    layer = held(model, data)
+    base = model.body(P + "base").id
+    tip = model.site(P + TIP_SITE).id
+    weight = model.body_subtreemass[base] * G
+    rows = []
+
+    def moments(body):
+        contacts = body_contacts(model, data, body)
+        if not contacts:
+            return np.zeros(3), np.zeros(3)
+        force = np.array([c[1] for c in contacts])
+        weights = np.abs(force[:, 2])
+        return force.sum(0), np.r_[weights @ np.array([c[0] for c in contacts])[:, [0, 2]],
+                                   weights.sum()]
+
+    def record():
+        (fb, mb), (_, mr) = moments("bucket"), moments("base")
+        pressure = max(layer.pump_pressures()[0].max() - NOMINAL.main_relief,
+                       (layer.chamber_pressures()[0] - NOMINAL.port_relief).max())
+        up = data.xmat[base].reshape(3, 3)[:, 2]
+        rows.append((data.time, fb[0], fb[2], *mb, *mr, data.subtree_com[base][0],
+                     data.site_xpos[tip][2], pressure, math.degrees(math.acos(up[2])),
+                     *data.site_xpos[tip][:2]))
+
+    run(model, data, seconds, record)
+    return np.array(rows), weight
+
+
+def periods(rows, start, steps):
+    kept = rows[rows[:, 0] > start]
+    return kept[:len(kept) // steps * steps].reshape(-1, steps, rows.shape[1])
+
+
+def reaction_over_hand(rows, weight, start, steps):
+    w = periods(rows, start, steps).sum(1)
+    assert np.all(w[:, 5] > 0.0) and np.all(w[:, 8] > 0.0)
+    fx, fz, gx = w[:, 1], w[:, 2], w[:, 9] / steps
+    bx, bz, rx, rz = w[:, 3] / w[:, 5], w[:, 4] / w[:, 5], w[:, 6] / w[:, 8], w[:, 7] / w[:, 8]
+    return fz / ((weight * steps * (gx - rx) + fx * (bz - rz)) / (bx - rx))
+
+
+def test_propped_machine_whose_tip_holds_keeps_contact_and_matches_statics():
+    rows, weight = propping(0.6, -0.15, 4.0)
+    landed = rows[rows[:, 0] > 1.0]
+    assert landed[-1, 12] > 10.0
+    assert np.hypot(*(landed[:, 13:15] - landed[0, 13:15]).T).max() < 0.003
+    assert np.all(landed[:, 2] > 0.0)
+    assert np.ptp(landed[:, 10]) < 0.005
+    assert np.abs(reaction_over_hand(rows, weight, 1.5, 20) - 1.0).max() < 0.01
+
+
+@pytest.mark.parametrize(("boom", "until", "mean_bound", "rms_bound", "ripple_bound"),
+                         [(0.6, 8.0, 0.03, 0.75e-3, 3.5e-3), (1.0, 3.3, 0.12, 1.5e-3, 7.0e-3)])
+def test_propped_machine_whose_tip_slides_hops_within_its_measured_bounds(
+        boom, until, mean_bound, rms_bound, ripple_bound):
+    rows, weight = propping(boom, 0.0, until)
+    start = 2.0 if boom < 1.0 else 1.0
+    assert rows[-1, 12] > 15.0
+    sliding = rows[rows[:, 0] > start]
+    assert np.hypot(*(sliding[-1, 13:15] - sliding[0, 13:15])) > 0.3
+    assert np.abs(reaction_over_hand(rows, weight, start, 100) - 1.0).max() < mean_bound
+    tip = periods(rows, start, 20)[..., 10]
+    steps = np.arange(20) - 9.5
+    slope = (tip * steps).sum(1, keepdims=True) / (steps * steps).sum()
+    ripple = tip - tip.mean(1, keepdims=True) - slope * steps
+    assert np.sqrt((ripple ** 2).mean()) < rms_bound
+    assert np.ptp(ripple, 1).max() < ripple_bound
+    assert periods(rows, start, 1)[..., 11].max() < -oil_layer.RELIEF_BAND
 
 
 def rigid(model, data, seconds, each=None):
@@ -290,6 +377,55 @@ def test_joint_loads_with_a_hanging_load_match_statics():
         sim = data.actuator_force[model.actuator(P + joint).id]
         assert abs(sim) == pytest.approx(abs(hand), rel=0.01)
 
+
+
+def test_hung_load_on_the_oil_reads_its_sling_tension_on_the_instant():
+    model, data = hung(3000.0)
+    run(model, data, 6.0)
+    block_weight = model.body_mass[model.body(P + "load").id] * G
+    for _ in range(5):
+        assert sling_tension(model, data, 0) == pytest.approx(
+            block_weight / math.cos(math.radians(30.0)), rel=0.01)
+        run(model, data, 1.0)
+
+
+def bounce(model, data, layer, seconds):
+    static = model.body_mass[model.body(P + "load").id] * G / math.cos(math.radians(30.0))
+    swing, boom_seals = [], []
+    for _ in range(round(seconds / model.opt.timestep)):
+        layer.step()
+        swing.append(sling_tension(model, data, 0) / static - 1.0)
+        _, lever = circuit.geometry(data.qpos[layer._qpos[0]])
+        chambers = layer.chamber_pressures()[0]
+        speed = lever * data.qvel[layer._qvel[0]]
+        boom_seals.append(seal_friction(chambers[1:, 0], chambers[1:, 1], speed[1:])[0]
+                          * abs(lever[1]))
+    swing = np.abs(swing)
+    peaks = np.flatnonzero((swing[1:-1] >= swing[:-2]) & (swing[1:-1] > swing[2:])) + 1
+    t = (peaks + 1) * model.opt.timestep
+    start, end = 1.0, 3.3
+    kept = (t > start) & (t < end) & (swing[peaks] > 0.01)
+    window = slice(round(start / model.opt.timestep), round(end / model.opt.timestep))
+    return np.polyfit(t[kept], swing[peaks][kept], 1)[0], np.median(np.diff(t[kept])), np.mean(
+        boom_seals[window])
+
+
+def test_hung_load_bounce_dies_at_the_rate_the_boom_seals_give_by_hand(monkeypatch):
+    with monkeypatch.context() as patch:
+        patch.setattr(oil_layer, "seal_friction", lambda head, rod, speed: np.zeros(np.shape(head)))
+        model, data = hung(3000.0)
+        oil_only, half_period, _ = bounce(model, data, held(model, data), 3.5)
+    model, data = hung(3000.0)
+    layer = held(model, data)
+    with_seals, _, seals = bounce(model, data, layer, 3.5)
+    mass = np.zeros((model.nv, model.nv))
+    mujoco.mj_fullM(model, data, mass)
+    boom = layer._qvel[0, 1]
+    reach = data.site_xpos[model.site(P + "hook").id][0] - pivot_x(model, data, "boom")
+    inertia = mass[boom, boom] + 3000.0 * reach ** 2
+    hand = 4.0 * abs(reach) * seals / (inertia * G) / (2.0 * half_period)
+    assert oil_only < 0.0
+    assert hand <= oil_only - with_seals <= 1.25 * hand
 
 
 def test_sling_readings_match_statics_and_a_snatch_reads_over_the_rating():

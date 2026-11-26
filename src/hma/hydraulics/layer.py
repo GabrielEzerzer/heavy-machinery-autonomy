@@ -13,7 +13,7 @@ import numpy as np
 from hma.hydraulics import circuit as c
 from hma.hydraulics.params import CURVE_SEGMENTS, NOMINAL, RANGES, Machine
 from hma.machine import BODY_NAMES, HOME_KEY, JOINT_NAMES, WELD, load_scene, machine_prefix
-from hma.machine.cylinders import MAIN_RELIEF
+from hma.machine.cylinders import MAIN_RELIEF, seal_friction
 from hma.machine.model import COUNTERWEIGHT_MASS
 
 CONTROL_HZ = 10.0
@@ -160,7 +160,6 @@ class Hydraulics:
         self._qvel = joint_field("dofadr")
         self._actuators = np.array([[model.actuator(machine_prefix(i) + j).id
                                      for j in JOINT_NAMES] for i in range(self.n)])
-        self._swing_dofs = self._qvel[:, SWING].copy()
         self._bodies = np.array([[model.body(machine_prefix(i) + b).id for b in BODY_NAMES]
                                  for i in range(self.n)])
         self._own_joints = [[j for j in range(model.njnt)
@@ -185,9 +184,10 @@ class Hydraulics:
         self._scratch = mujoco.MjData(model)
         reference_dofs = [reference.joint(machine_prefix(0) + j).dofadr[0] for j in JOINT_NAMES]
         self._base_armature = np.tile(reference.dof_armature[reference_dofs], (self.n, 1))
-        self._base_friction = np.full(self.n, reference.dof_frictionloss[reference_dofs[SWING]])
+        self._base_frictionloss = np.tile(reference.dof_frictionloss[reference_dofs], (self.n, 1))
+        self._base_friction = self._base_frictionloss[:, SWING].copy()
         model.dof_armature[self._qvel] = self._base_armature
-        model.dof_frictionloss[self._swing_dofs] = self._base_friction
+        model.dof_frictionloss[self._qvel] = self._base_frictionloss
 
         delay_cap = max([RANGES["delay"][1], *(float(np.max(m.delay)) for m in machines)])
         latency_cap = max([RANGES["sensor_latency"][1], *(m.sensor_latency for m in machines)])
@@ -238,6 +238,7 @@ class Hydraulics:
         self._edge_slope[:] = 0.0
         self._brake = np.zeros(n)
         self._half_play = np.zeros(shape)
+        self._seal_scale = np.zeros(n)
         self._latency_steps = np.zeros(n, np.intp)
         self._noise = np.zeros((4, n, 1))
         self._offset = np.zeros((n, JOINTS, 2))
@@ -250,6 +251,7 @@ class Hydraulics:
         self._pump = np.zeros((n, c.PUMPS))
         self._gap = np.zeros(shape)
         self._rod_speed = np.zeros(shape)
+        self._piston_speed = np.zeros(shape)
         self._accel = np.zeros(shape)
         self._cavity = np.zeros((n, NODES))
         self._held_nodes = np.zeros((n, NODES), bool)
@@ -304,6 +306,8 @@ class Hydraulics:
             raise ValueError("leakage and brake torque must not be negative")
         if np.any(machine.backlash < 0):
             raise ValueError("backlash must not be negative")
+        if machine.seal_friction < 0:
+            raise ValueError("the seal friction factor must not be negative")
         if np.any(machine.link_mass <= 0) or machine.counterweight <= 0:
             raise ValueError("link mass and counterweight factors must be positive")
         if min(machine.position_noise, machine.velocity_noise, machine.pressure_noise) < 0:
@@ -339,6 +343,7 @@ class Hydraulics:
         self._leakage[index] = machine.leakage.ravel()
         self._brake[index] = machine.brake
         self._half_play[index] = machine.backlash / 2.0
+        self._seal_scale[index] = machine.seal_friction
         self._latency_steps[index] = round(machine.sensor_latency / self.dt)
         self._noise[:, index, 0] = (machine.position_noise, machine.velocity_noise,
                                     machine.pressure_noise, machine.pressure_noise)
@@ -420,6 +425,7 @@ class Hydraulics:
         self._pump[index] = c.STANDBY_FLOW
         self._gap[index] = np.where(force >= 0.0, 1.0, -1.0)
         self._rod_speed[index] = 0.0
+        self._piston_speed[index] = 0.0
         self._accel[index] = 0.0
         self._cavity[index] = 0.0
         self._held_nodes[index] = False
@@ -520,6 +526,11 @@ class Hydraulics:
         mujoco.mj_getState(model, data, self._state, STATE)
         self._neutral = np.where(self._piloted, 0.0, self._neutral + dt)
         brake = self._base_friction + np.where(self._neutral >= c.BRAKE_DELAY, self._brake, 0.0)
+        chambers = pressure[:, c.PUMPS:].reshape(n, JOINTS, 2)
+        drag = np.zeros((n, JOINTS))
+        drag[:, 1:] = seal_friction(chambers[:, 1:, 0], chambers[:, 1:, 1],
+                                    self._piston_speed[:, 1:]) * self._seal_scale[:, None]
+        seal = drag * np.abs(lever)
         redo = np.zeros(n, bool)
         redo_held = np.zeros((n, NODES), bool)
         redo_speed = np.zeros((n, JOINTS))
@@ -535,7 +546,7 @@ class Hydraulics:
                 system[rows] = self._set_checks(rows, cond[rows], check_start[rows])
             ahead = np.where(redo[:, None], redo_speed, lever * (qd + dt * self._accel))
             loose = np.where(redo[:, None], redo_speed, self._rod_speed)
-            motion = (self._gap, rigid, rod, ahead, loose, per_play)
+            motion = (self._gap, rigid, rod, ahead, loose, per_play, drag)
             predicted = self._engage(*self._forces(solved, force_now, scale), *motion)[0]
             predicted = np.where(redo[:, None], redo_speed, predicted)
             rise = solved[..., 0] + (solved[..., 1:] @ predicted[..., None])[..., 0]
@@ -563,10 +574,12 @@ class Hydraulics:
             push = np.where(contact, lever * (held - others), 0.0)
             data.ctrl[self._actuators] = push - stiff * qd
             model.dof_armature[qvel] = self._base_armature + stiff * dt
-            model.dof_frictionloss[self._swing_dofs] = brake
+            friction = self._base_frictionloss + np.where(contact, seal, 0.0)
+            friction[:, SWING] = brake
+            model.dof_frictionloss[qvel] = friction
             mujoco.mj_step(model, data)
             model.dof_armature[qvel] = self._base_armature
-            model.dof_frictionloss[self._swing_dofs] = self._base_friction
+            model.dof_frictionloss[qvel] = self._base_frictionloss
 
             joint_rod = lever * data.qvel[qvel]
             room = play * (1.0 / dt)
@@ -647,6 +660,7 @@ class Hydraulics:
         self.check_bound += int(bounded.any())
         self._accel = (data.qvel[qvel] - qd) * (1.0 / dt)
         self._rod_speed = free_speed
+        self._piston_speed = speed
         self._held_nodes[:] = held_nodes
         missing *= held_nodes | (cavity > 0.0)
         pressure += change
@@ -657,8 +671,9 @@ class Hydraulics:
         hydraulic = speed * (pressure @ DISPLACEMENT)
         hydraulic[:, SWING] *= flow_scale
         mechanical = speed * (pressure @ DISPLACEMENT) * scale
-        self.lost_energy += lost + (mechanical - hydraulic).sum(1) * dt
-        self.work_energy -= mechanical.sum(1) * dt
+        loose_rods = np.where(contact, 0.0, mechanical)
+        self.lost_energy += lost + (mechanical - hydraulic - loose_rods).sum(1) * dt
+        self.work_energy -= np.where(contact, mechanical, 0.0).sum(1) * dt
         gap = self._gap + np.where(contact, 0.0, (free_speed - joint_rod) * per_play)
         self._gap = np.minimum(np.maximum(gap, -1.0, out=gap), 1.0, out=gap)
         self.pump_power = (pressure[:, :c.PUMPS] * self._pump).sum(1)
@@ -743,13 +758,15 @@ class Hydraulics:
     @staticmethod
     def _engage(held: np.ndarray, coupling: np.ndarray, gap: np.ndarray, rigid: np.ndarray,
                 rod: np.ndarray, ahead: np.ndarray, loose: np.ndarray,
-                per_play: np.ndarray) -> tuple[np.ndarray, ...]:
+                per_play: np.ndarray, drag: np.ndarray) -> tuple[np.ndarray, ...]:
         force_next = held - (coupling @ rod[..., None])[..., 0]
         contact = rigid | ((np.abs(gap) >= PLAY_CLOSED) & (gap * force_next >= 0.0))
         guess = np.where(contact, ahead, loose)
         diag = coupling[:, JOINT_INDEX, JOINT_INDEX]
         others = (coupling @ guess[..., None])[..., 0] - diag * guess
-        free = np.divide(held - others, diag, out=rod.copy(), where=diag != 0.0)
+        net = held - others
+        net = np.sign(net) * np.maximum(np.abs(net) - drag, 0.0)
+        free = np.divide(net, diag, out=rod.copy(), where=diag != 0.0)
         reach = gap + (free - rod) * per_play
         closing = ~contact & (np.abs(reach) >= 1.0)
         contact |= closing
