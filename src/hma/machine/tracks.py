@@ -9,6 +9,7 @@ from typing import NamedTuple
 
 import mujoco
 import numpy as np
+from numba import njit
 
 from hma.machine.mass import (
     GAUGE,
@@ -130,48 +131,72 @@ def drive_forces(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
             + data.qfrc_applied[lay.dofs] / WHEEL_RADIUS)
 
 
-def shares(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
-    lead = 0.5 + data.userdata[:len(drives(model).dofs), None]
-    return np.concatenate([lead, 1.0 - lead], axis=1)
-
-
-def split_power(belt_speeds: np.ndarray, used: np.ndarray, share: np.ndarray,
-                rate: float) -> np.ndarray:
-    full = used >= FULL_SHARE * share * TRAVEL_POWER
-    weight = np.abs(belt_speeds) * np.where(full.any(axis=-1, keepdims=True), full, True)
-    open_use = np.where(full, 0.0, used)
-    rest = TRAVEL_POWER - open_use.sum(axis=-1, keepdims=True)
-    total = weight.sum(axis=-1, keepdims=True)
-    even = np.full_like(weight, 1.0 / weight.shape[-1])
-    part = np.divide(weight, total, out=even, where=total > 0.0)
-    target = (open_use + rest * part) / TRAVEL_POWER
-    return share + rate * (target - share)
-
-
-def drive_caps(belt_speeds: np.ndarray, share: np.ndarray) -> np.ndarray:
-    return np.minimum(TRACTION, share * TRAVEL_POWER / np.maximum(np.abs(belt_speeds), 1e-12))
-
-
 def used_power(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
     n = len(drives(model).dofs)
     return data.userdata[n:3 * n].reshape(n, 2)
 
 
+@njit(cache=True, error_model="numpy")
+def _limit(qvel, userdata, qfrc, dofs, valves, rate, power, traction, radius, full_share):
+    n = dofs.shape[0]
+    belt, used, share = np.empty(2), np.empty(2), np.empty(2)
+    weight, open_use = np.empty(2), np.empty(2)
+    full = np.empty(2, np.bool_)
+    for i in range(n):
+        lead = 0.5 + userdata[i]
+        share[0], share[1] = lead, 1.0 - lead
+        for s in range(2):
+            belt[s] = qvel[dofs[i, s]] * radius
+            used[s] = userdata[n + 2 * i + s]
+            full[s] = used[s] >= full_share * share[s] * power
+        for s in range(2):
+            weight[s] = abs(belt[s]) * (1.0 if full[s] or not (full[0] or full[1]) else 0.0)
+            open_use[s] = 0.0 if full[s] else used[s]
+        rest = power - (open_use[0] + open_use[1])
+        total = weight[0] + weight[1]
+        for s in range(2):
+            part = weight[s] / total if total > 0.0 else 0.5
+            target = (open_use[s] + rest * part) / power
+            share[s] = share[s] + rate * (target - share[s])
+        userdata[i] = share[0] - 0.5
+        for s in range(2):
+            speed = abs(belt[s])
+            cap = share[s] * power / (speed if speed >= 1e-12 or speed != speed else 1e-12)
+            excess = 0.0
+            if qvel[valves[i, s]] * belt[s] > 0.0:
+                excess = (traction if traction <= cap else cap) - traction
+            sign = 1.0 if belt[s] > 0.0 else -1.0 if belt[s] < 0.0 else 0.0 * abs(belt[s])
+            qfrc[dofs[i, s]] = excess * sign * radius
+
+
+@njit(cache=True, error_model="numpy")
+def _store_used(efc_type, efc_id, efc_force, kind, tendons, qfrc, dofs, belt, userdata, radius):
+    n = dofs.shape[0]
+    size = 0
+    for i in range(n):
+        for s in range(2):
+            size = max(size, tendons[i, s] + 1)
+    forces = np.zeros(size)
+    for r in range(efc_type.shape[0]):
+        if efc_type[r] == kind and efc_id[r] < size:
+            forces[efc_id[r]] += efc_force[r]
+    for i in range(n):
+        for s in range(2):
+            power = (forces[tendons[i, s]] + qfrc[dofs[i, s]] / radius) * belt[i, s]
+            userdata[n + 2 * i + s] = power if power >= 0.0 or power != power else 0.0
+
+
 def limit_power(model: mujoco.MjModel, data: mujoco.MjData) -> None:
     lay = drives(model)
-    belt = data.qvel[lay.dofs] * WHEEL_RADIUS
-    used = used_power(model, data)
-    share = split_power(belt, used, shares(model, data), model.opt.timestep / SHARE_TIME)
-    data.userdata[:len(lay.dofs)] = share[:, 0] - 0.5
-    ahead = data.qvel[lay.valves] * belt > 0.0
-    excess = np.where(ahead, drive_caps(belt, share) - TRACTION, 0.0)
-    data.qfrc_applied[lay.dofs] = excess * np.sign(belt) * WHEEL_RADIUS
+    _limit(data.qvel, data.userdata, data.qfrc_applied, lay.dofs, lay.valves,
+           model.opt.timestep / SHARE_TIME, TRAVEL_POWER, TRACTION, WHEEL_RADIUS, FULL_SHARE)
 
 
 def step(model: mujoco.MjModel, data: mujoco.MjData, nstep: int = 1) -> None:
+    lay = drives(model)
     for _ in range(nstep):
         limit_power(model, data)
-        lay = drives(model)
         belt = data.qvel[lay.dofs] * WHEEL_RADIUS
         mujoco.mj_step(model, data)
-        used_power(model, data)[:] = np.maximum(drive_forces(model, data) * belt, 0.0)
+        _store_used(data.efc_type, data.efc_id, data.efc_force, FRICTION_TENDON, lay.tendons,
+                    data.qfrc_applied, lay.dofs, belt, data.userdata, WHEEL_RADIUS)
