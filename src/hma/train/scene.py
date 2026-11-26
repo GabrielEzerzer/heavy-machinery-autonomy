@@ -48,7 +48,7 @@ OBS_LOW = np.tile(FRAME_LOW, HISTORY)
 OBS_HIGH = np.tile(FRAME_HIGH, HISTORY)
 SCALE = np.concatenate([np.full(f[1], f[2]) for f in FIELDS])
 EPISODE_ARRAYS = ("k", "steps_total", "pitch0", "roll0", "est0", "sent", "history", "up", "v_prev",
-                  "gyro_bias", "accel_bias", "imu_on", "tip_prev", "bucket_prev", "front_prev",
+                  "gyro_bias", "accel_bias", "imu_on", "tip_prev", "apart", "front_prev",
                   "corner_prev", "touched", "rest_load", "rest_count", "landing", "recent",
                   "end_load", "end_steps", "in_band", "hold_steps", "err_total", "done",
                   "active")
@@ -180,7 +180,8 @@ class PropScene:
         self.accel_bias = np.zeros((n, 3))
         self.imu_on = np.zeros(n)
         self.tip_prev = np.zeros((n, 3))
-        self.bucket_prev = np.zeros(n, bool)
+        self._hop = round(self.settings.hop / self.dt)
+        self.apart = np.full(n, self._hop + 1, np.intp)
         self.front_prev = np.zeros((n, len(self._corners)), bool)
         self.corner_prev = np.zeros((n, len(self._corners)))
         self.touched = np.zeros(n, bool)
@@ -244,7 +245,7 @@ class PropScene:
         self.steps_total[index] = 0
         self.sent[index] = 0.0
         self.tip_prev[index] = self.data.site_xpos[self._tips[index]]
-        self.bucket_prev[index] = False
+        self.apart[index] = self._hop + 1
         self.front_prev[index] = self._contacts()[1][index]
         self.corner_prev[index] = -self._corner_velocity()[index, 2]
         self.touched[index] = False
@@ -391,9 +392,10 @@ class PropScene:
             forbidden |= bad
             struck |= strike
             tip = data.site_xpos[self._tips]
-            both = bucket & self.bucket_prev
-            slide += np.where(both, np.linalg.norm((tip - self.tip_prev)[:, :2], axis=1), 0.0)
-            self.tip_prev, self.bucket_prev = tip.copy(), bucket
+            self.apart = np.where(bucket, 0, self.apart + 1)
+            near = self.apart <= self._hop
+            slide += np.where(near, np.linalg.norm((tip - self.tip_prev)[:, :2], axis=1), 0.0)
+            self.tip_prev = tip.copy()
             touched |= bucket
             landed = front & ~self.front_prev
             if landed.any():

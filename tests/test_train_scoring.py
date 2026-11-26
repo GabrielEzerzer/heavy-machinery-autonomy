@@ -342,18 +342,65 @@ def test_a_front_bouncing_with_the_bucket_clear_passes_and_a_pressing_bucket_fai
 
 
 def test_a_landing_is_charged_only_while_it_is_inside_the_observation_history():
-    scene = PropScene(1, "nominal")
+    s = Settings()
+    free = replace(s, weights={**s.weights, "landing": 0.0})
+    scene, uncharged = PropScene(1, "nominal", settings=s), PropScene(1, "nominal", settings=free)
     scene.reset(0, DEV_BASE + 4)
-    fresh, charged = [], []
+    uncharged.reset(0, DEV_BASE + 4)
+    fresh, gap = [], []
     while True:
-        _, _, done, info = scene.step(np.zeros((1, 4)))
+        _, earned, done, info = scene.step(np.zeros((1, 4)))
+        _, kept, _, _ = uncharged.step(np.zeros((1, 4)))
         fresh.append(scene.recent[0, -1])
-        charged.append(scene.recent[0].max())
+        gap.append(kept[0] - earned[0])
         if done[0]:
             break
-    fresh, charged = np.array(fresh), np.array(charged)
+    fresh, gap = np.array(fresh), np.array(gap)
     assert fresh.max() == pytest.approx(info[0]["landing"]) and fresh.max() > 0.1
-    for k in range(len(fresh)):
-        assert charged[k] == fresh[max(0, k - HISTORY + 1):k + 1].max()
+    charged = np.array([fresh[max(0, k - HISTORY + 1):k + 1].max() for k in range(len(fresh))])
+    expected = s.weights["landing"] * np.minimum(charged / s.landing, 1.0)
+    assert gap == pytest.approx(expected, abs=1e-12)
     last = np.flatnonzero(fresh)[-1]
-    assert np.all(charged[last + HISTORY:] == 0.0)
+    assert last + HISTORY < len(fresh)
+    assert np.all(gap[last + HISTORY:] == pytest.approx(0.0, abs=1e-12))
+
+
+class Traced(PropScene):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tips, self.touching, self.live = [], [], False
+
+    def step(self, actions):
+        self.live = True
+        return super().step(actions)
+
+    def _contacts(self):
+        found = super()._contacts()
+        if self.live:
+            self.tips.append(self.data.site_xpos[self._tips[0], :2].copy())
+            self.touching.append(bool(found[0][0]))
+        return found
+
+
+def test_the_slide_term_charges_the_tips_path_through_the_contact_hop():
+    s = replace(Settings(), slide_scale=10.0)
+    free = replace(s, weights={**s.weights, "slide": 0.0})
+    traced, uncharged = Traced(1, "nominal", settings=s), PropScene(1, "nominal", settings=free)
+    for scene in (traced, uncharged):
+        scene.reset(0, DEV_BASE + 7)
+    start = traced.data.site_xpos[traced._tips[0], :2].copy()
+    gap = []
+    while True:
+        _, earned, done, _ = traced.step(np.zeros((1, 4)))
+        _, kept, _, _ = uncharged.step(np.zeros((1, 4)))
+        gap.append(kept[0] - earned[0])
+        if done[0]:
+            break
+    counted = np.sum(gap) / s.weights["slide"] * s.slide_scale
+    touching = np.array(traced.touching)
+    moved = np.linalg.norm(np.diff(np.vstack([start, traced.tips]), axis=0), axis=1)
+    on = np.flatnonzero(touching)
+    path = moved[on[0]:on[-1] + 1].sum()
+    lost = np.sum(touching[:-1] & ~touching[1:])
+    assert lost > 100 and path > 0.5
+    assert 0.9 * path <= counted <= path + 0.02

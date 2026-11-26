@@ -52,6 +52,7 @@ class Settings:
                                                    "landing": 0.05, "set_down": 0.05})
     roll_scale: float = math.radians(5.0)
     slide_scale: float = 0.05
+    hop: float = 0.025
     band: float = math.radians(3.0)
     hold_share: float = 0.8
     landing: float = 0.3
