@@ -675,7 +675,7 @@ python -m hma.machine.demo
 python -m hma.task "put the pallet of kerbstones down at the near marker"
 ```
 
-The first command opens a viewer and moves the arm through its range, with the hydraulic cylinders and bucket linkage drawn on their pins. The second asks a GPT model for a task specification on the demo scene, checks it and asks you to confirm. It calls the [Codex CLI](https://github.com/openai/codex), which must be installed and signed in with your own ChatGPT account; this repo holds no API key.
+The first command opens a viewer and moves the arm through its range, with the hydraulic cylinders and bucket linkage drawn on their pins, in about 44 s. The block is set down 6 m behind the machine, clear of the arm. The swing's loop also feeds back the swing's measured speed, so the swing stops on each waypoint and does not hunt around it. The second asks a GPT model for a task specification on the demo scene, checks it and asks you to confirm. It calls the [Codex CLI](https://github.com/openai/codex), which must be installed and signed in with your own ChatGPT account; this repo holds no API key.
 
 ## Limits
 
