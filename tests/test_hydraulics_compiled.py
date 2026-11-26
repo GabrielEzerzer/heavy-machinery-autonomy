@@ -125,3 +125,33 @@ def test_compiled_valve_openings_match_the_numpy_openings_bit_for_bit():
         assert np.array_equal(new._openings(), old._openings())
         assert np.array_equal(new._spool, old._spool)
         assert np.array_equal(new._piloted, old._piloted)
+
+
+def test_the_step_reads_nothing_an_earlier_step_left_in_its_workspace():
+    machines = [draw_machine(seed) for seed in (3, 7, 12)]
+    model = load_scene(len(machines))
+    clean = Hydraulics(model, mujoco.MjData(model), machines)
+    scrambled = Hydraulics(model, mujoco.MjData(model), machines)
+    travel = np.array([[model.actuator(machine_prefix(i) + name).id for name in TRAVEL_NAMES]
+                       for i in range(clean.n)])
+    rng = np.random.default_rng(5)
+    for _ in range(20):
+        command = rng.uniform(-1.0, 1.0, (clean.n, 4))
+        drive = rng.uniform(-1.0, 1.0, travel.shape) * model.actuator_ctrlrange[travel, 1]
+        for layer in (clean, scrambled):
+            layer.act(command)
+            layer.data.ctrl[travel] = drive
+        for _ in range(clean.steps_per_decision):
+            for array in scrambled._work:
+                if array.dtype == bool:
+                    np.logical_not(array, out=array)
+                elif array.dtype.kind == "f":
+                    array.fill(np.nan)
+                else:
+                    array.fill(7)
+            clean.step()
+            scrambled.step()
+            assert np.array_equal(clean.data.qpos, scrambled.data.qpos)
+            assert np.array_equal(clean._pressure, scrambled._pressure)
+            assert np.array_equal(clean.data.userdata, scrambled.data.userdata)
+    assert clean.redos > 0 and clean.redos == scrambled.redos
