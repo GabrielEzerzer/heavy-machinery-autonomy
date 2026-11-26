@@ -326,6 +326,64 @@ The friction and load draws are separate functions keyed by seed. A run's reset 
 
 **Checks.** Each check in `tests/test_machine_ground.py` reproduces a hand figure or a stated limit:
 
+| Check | Result |
+|---|---|
+| Energy in passive runs: sideways into a 0.2 m kerb and a 0.38 m step at 1 m/s, sliding along, landing from 5 cm moving sideways at 0.2 m/s, counter-rotating beside a 0.4 m step, sliding down a slope at 0.9 of the friction angle | Never rises over 3 s (test: under 1 J); no velocity reversal on landing |
+| Stop distance from 1.53 m/s against v²/(2μg), sliding | 1.010 along, 0.991 across (test: within 3%) |
+| Braking from full speed on flat | 1.008 of the same distance (test: within 5%) |
+| Tipping load against hand statics, front, rear and side, flat and on 10° slopes | Within 0.2% (test: 0.995 holds, 1.005 tips) |
+| Edge across the tracks under a wheel, and an edge along between the rails | The tipping line moves to the edge (test: 0.98 holds, 1.02 tips) |
+| Edge across the tracks between the last two wheels | Holds 0.93 of the hand load about the edge, tips at 1.0 |
+| Propped on the bucket, tracks pitched 25°, steel friction 0.30 and 0.70 | Brake load at most 3.8 kN of the 51 kN brake cap (test: under a tenth); drift 0.015 mm in 4 s |
+| Full speed into a wall | Moves 0.76 mm over 3 s and pushes at 0.939 of μ times its weight; the test asks for 0.97 to 1.03 and fails |
+| Parked and pushed sideways into a wall with 120 kN | No overlap with the wall |
+| Driving onto a 0.1 m step at 0.25 to 1.53 m/s, 6 and 10 m deep, arm in home pose | Climbs it (with the arm in the travel pose, a 0.25 m/s crawl stops on the edge of the 10 m step, [issue 58](../../issues/58)); at 0.25 and 0.5 m/s peak pitch 3.97° and 4.00° against 3.91° from the geometry (test: within 5%) |
+| Driving onto a 0.2 m step at 0.25 m/s | Stops on its edge, pitched 7° ([issue 58](../../issues/58)) |
+| Full speed up a 20° slope | 1.1299 m/s against 1.1301 m/s from the power limit |
+| Full speed down 15° and 20° slopes, then the brake | Holds 1.528 m/s; stops in 0.41 and 0.64 m |
+| A track in the air, the other loaded at 0.98 of its cap | Both keep their commanded speeds; the loaded track gets its full force |
+| Positive drive power under random commands on drawn ground | Peaks between 0.99 and 1.00 of the 45.5 kW share |
+| Pivot turn, counter-rotation, a gentle curve | Turns, at 16% to 36% of an even-pressure hand figure on flat ground and 7% to 14% on a 10° slope; the hop stays under 2 mm ([issue 57](../../issues/57)) |
+| Parked at 0.9 of the friction angle | 0.10 mm in 4 s |
+| High-centred on a 0.3 m pad | Sits still |
+| A block dragged at 0.23 to 1.38 m/s with the ground's contact settings | Reads μ within 3% |
+| 300 resets on drawn ground at random headings | At rest, no exception, first load readings equal to the steady ones |
+| Integration state saved and restored; rollouts sharing one model, stepped in turn | Repeat bit for bit into the same and a fresh MjData |
+| Two machines in one scene for 20 s, one driven at random | The other moves by 3.5e-18 m |
+
+A further test breaks the physics on purpose and checks that each break fails its check: doubled friction, end wheels removed, wheel coupling removed, brakes released, power limit removed, and the tipping line moved 5 cm. In the tipping checks the joints are held at a friction of 1e9 N·m, so those results do not depend on the joint force limits. The pin sits 1.5 m above the ground, where the bucket clears it. `python -m hma.machine.measure` prints:
+
+| Load at the bucket pin that tips the machine, with bucket | Hand statics, kg | Simulated, kg | Difference |
+|---|---|---|---|
+| Over the front, flat, 6.0 m out | 3,413 | 3,418 | +0.2% |
+| Over the rear, flat, 4.5 m out | 5,356 | 5,364 | +0.2% |
+| Over the side, flat, 4.5 m out | 3,528 | 3,533 | +0.2% |
+| Over the front, 10° nose down, 6.0 m out | 2,640 | 2,644 | +0.2% |
+| Over the side, 10° cross slope, 4.5 m out | 2,494 | 2,498 | +0.2% |
+
+The search stops within 0.5% of the hand figure, so +0.2% is within its resolution.
+
+Against the [spec sheet][zx120]'s lift chart, the table gives 75% of the model's tipping load at every rating the chart marks as limited by tipping. It comes from `python -m hma.machine.statics`: no bucket, load at the bucket pin, kg.
+
+| Height, radius (m) | Front: model / chart | Diff | Side: model / chart | Diff |
+|---|---|---|---|---|
+| 4.5, 6.0 | 3,086 / 3,040 | +1.5% | 2,155 / 2,110 | +2.1% |
+| 3.0, 4.5 | | | 3,247 / 3,200 | +1.5% |
+| 3.0, 6.0 | 3,014 / 2,980 | +1.1% | 2,089 / 2,050 | +1.9% |
+| 1.5, 3.0 | | | 5,322 / 5,380 | −1.1% |
+| 1.5, 4.5 | 4,474 / 4,470 | +0.1% | 2,985 / 2,980 | +0.2% |
+| 1.5, 6.0 | 2,899 / 2,880 | +0.7% | 1,982 / 1,960 | +1.1% |
+| 0.0, 3.0 | | | 4,954 / 5,070 | −2.3% |
+| 0.0, 4.5 | 4,253 / 4,280 | −0.6% | 2,789 / 2,810 | −0.7% |
+| 0.0, 6.0 | 2,799 / 2,790 | +0.3% | 1,891 / 1,880 | +0.6% |
+| −1.5, 3.0 | 8,275 / 8,440 | −2.0% | 4,896 / 5,030 | −2.7% |
+| −1.5, 4.5 | 4,162 / 4,200 | −0.9% | 2,707 / 2,740 | −1.2% |
+| −1.5, 6.0 | 2,759 / 2,760 | 0.0% | 1,853 / 1,850 | +0.2% |
+| −3.0, 3.0 | | | 4,990 / 5,120 | −2.5% |
+| −3.0, 4.5 | 4,199 / 4,240 | −1.0% | 2,741 / 2,780 | −1.4% |
+
+Every entry is within 2.7%. With the earlier mass split and sphere contacts, the model was 16 to 23% above the chart over the front and 24 to 31% over the side. The chart's hydraulically limited ratings, and how hard the boom can press down, do depend on the joint force limits, which are still constant caps.
+
 **Checks against hand calculations** (`tests/test_machine_contact.py`). The drag rows are within 10%, with the swing torque reading 4.1% low. The others are within 1%, and the tests hold them to that, the pressed bucket to 0.5%:
 
 | Check | Simulated | By hand |
