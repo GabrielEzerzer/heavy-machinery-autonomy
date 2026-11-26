@@ -7,6 +7,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+from numba import njit
 
 from hma.machine import kinematics
 
@@ -52,21 +53,62 @@ _FIRST_STEP = SEAL_PRESSURE[1] - SEAL_PRESSURE[0]
 _LAST_STEP = SEAL_PRESSURE[-1] - SEAL_PRESSURE[-2]
 
 
+@njit(cache=True, error_model="numpy")
+def _interp(x, xp):
+    if x != x:
+        return x
+    last = xp.shape[0] - 1
+    if x < xp[0]:
+        return 0.0
+    if x >= xp[last]:
+        return float(last)
+    j = 0
+    while xp[j + 1] <= x:
+        j += 1
+    if xp[j] == x:
+        return float(j)
+    slope = 1.0 / (xp[j + 1] - xp[j])
+    value = slope * (x - xp[j]) + j
+    if value != value:
+        value = slope * (x - xp[j + 1]) + (j + 1)
+    return value
+
+
+@njit(cache=True, error_model="numpy")
+def _seal(head, rod, speed, speeds, pressures, tables, scales, first_step, last_step, out):
+    columns = scales.shape[1]
+    for k in range(out.shape[0]):
+        i = _interp(abs(speed[k]), speeds)
+        i0 = min(max(int(i), 0), speeds.shape[0] - 2)
+        a = i - i0
+        total = 0.0
+        for kind in range(2):
+            p = rod[k] if kind == 0 else abs(head[k] - rod[k])
+            below, above = p - pressures[0], p - pressures[-1]
+            below = below if below <= 0.0 or below != below else 0.0
+            above = above if above >= 0.0 or above != above else 0.0
+            j = _interp(p, pressures) + below / first_step + above / last_step
+            j0 = min(max(int(math.floor(j)), 0), pressures.shape[0] - 2)
+            b = j - j0
+            table = tables[kind]
+            low = table[i0, j0] * (1 - b) + table[i0, j0 + 1] * b
+            high = table[i0 + 1, j0] * (1 - b) + table[i0 + 1, j0 + 1] * b
+            force = low + a * (high - low)
+            force = force if force >= 0.0 or force != force else 0.0
+            term = scales[kind, k % columns] * force
+            total = term if kind == 0 else total + term
+        out[k] = total
+
+
 def seal_friction(head, rod, speed) -> np.ndarray:
-    head, rod = np.asarray(head, float), np.asarray(rod, float)
-    i = np.interp(np.abs(speed), SEAL_SPEED, _SPEED_INDEX)
-    p = np.stack([rod, np.abs(head - rod)])
-    j = (np.interp(p, SEAL_PRESSURE, _PRESSURE_INDEX)
-         + np.minimum(p - SEAL_PRESSURE[0], 0.0) / _FIRST_STEP
-         + np.maximum(p - SEAL_PRESSURE[-1], 0.0) / _LAST_STEP)
-    i0 = np.minimum(i.astype(np.intp), len(SEAL_SPEED) - 2)
-    j0 = np.clip(np.floor(j).astype(np.intp), 0, len(SEAL_PRESSURE) - 2)
-    kind = np.arange(2).reshape((2,) + (1,) * i.ndim)
-    a, b = i - i0, j - j0
-    low = SEAL_TABLES[kind, i0, j0] * (1 - b) + SEAL_TABLES[kind, i0, j0 + 1] * b
-    high = SEAL_TABLES[kind, i0 + 1, j0] * (1 - b) + SEAL_TABLES[kind, i0 + 1, j0 + 1] * b
-    force = np.maximum(low + a * (high - low), 0.0)
-    return (SEAL_SCALES.reshape((2,) + (1,) * (i.ndim - 1) + (-1,)) * force).sum(0)
+    head, rod, speed = np.broadcast_arrays(np.asarray(head, float), np.asarray(rod, float),
+                                           np.asarray(speed, float))
+    if head.shape[-1:] != (SEAL_SCALES.shape[1],):
+        raise ValueError(f"the last axis must hold the {SEAL_SCALES.shape[1]} cylinders")
+    out = np.empty(head.shape)
+    _seal(head.ravel(), rod.ravel(), speed.ravel(), SEAL_SPEED, SEAL_PRESSURE, SEAL_TABLES,
+          SEAL_SCALES, _FIRST_STEP, _LAST_STEP, out.reshape(-1))
+    return out
 
 
 def areas(joint: str) -> tuple[float, float]:
