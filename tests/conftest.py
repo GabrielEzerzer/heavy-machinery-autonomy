@@ -1,3 +1,4 @@
+import importlib.util
 import json
 from pathlib import Path
 
@@ -6,6 +7,16 @@ import pytest
 from hma.task import DEMO_SCENE, Capacity, MachineArm, MachineBody
 
 MOCK = Path(__file__).resolve().parents[1] / "mock" / "model_outputs"
+TRAIN_EXTRA = all(importlib.util.find_spec(name) for name in ("gymnasium", "stable_baselines3"))
+
+
+def pytest_collection_modifyitems(config, items):
+    if TRAIN_EXTRA:
+        return
+    skip = pytest.mark.skip(reason='needs the training extra: pip install -e ".[train]"')
+    for item in items:
+        if item.get_closest_marker("train_extra"):
+            item.add_marker(skip)
 
 BASE_SPEC = {
     "status": "plan",

@@ -506,12 +506,15 @@ A `strike` cannot happen with the swing at zero: a scan of boom, arm and bucket 
 - it has no early end;
 - the true tilt stays within ±3° of the reference for at least 80% of the hold;
 - each of the four front track corners comes down at under 0.3 m/s: its downward speed just before each new contact with the ground, taken from the step before the contact acts;
-- the tilt is back within 1° at the end;
-- at the end, every front corner is within 0.01 m of the ground and moves at under 0.02 m/s.
+- at the end the front of the tracks is set down: every front corner rests on the ground, carrying at least 10% of the load it carried while the bucket was in the air, and moves at under 0.02 m/s.
 
-The 3° band is the reward's scale. It is six times the AHRS's dynamic accuracy above, so a real machine can measure it. The 80% allows for settling as the hold begins. The 0.3 m/s, 0.01 m and 0.02 m/s are assumed bounds, not taken from a source; 0.3 m/s equals a free fall of 4.6 mm. All of these are fields of `Settings`.
+The 3° band is the reward's scale. It is six times the AHRS's dynamic accuracy above, so a real machine can measure it. The 80% allows for settling as the hold begins. The 0.3 m/s, 10% and 0.02 m/s are assumed bounds, not taken from a source; 0.3 m/s equals a free fall of 4.6 mm. All of these are fields of `Settings`.
 
-On the 64 development seeds of the `nominal` rung, the baseline's landing speeds measured this way have a median of 0.04 m/s, a 90th percentile of 0.18 m/s and a highest of 0.297 m/s, so none reaches the bound; the bound sits just above the nominal baseline's worst landing. On the `machines` rung the median is 0 (most drawn machines never lift the front), the 90th percentile 0.33 m/s and the highest 1.19 m/s, and 8 of 64 reach the bound. The speed of the track centreline taken after the contact had braked the machine, with one flag for all four corners, read 2.1 to 2.8 times lower on eight nominal seeds.
+Set down means the front of the tracks rests on the ground and carries load, so lifting the bucket would not drop the machine. Each corner's load is the normal force of its contacts with the ground, from MuJoCo's contact forces. Its reference is the mean of that load over the decisions before the bucket first touches the ground: the same machine on the same ground, with the arm in the air. The task leaves the bucket at its press point on the ground to the end, so the bucket may still carry part of the weight; the condition asks only that the tracks carry the front. 10% keeps clear of a corner that only grazes the ground.
+
+An earlier version asked instead for the tilt back within 1° and every front corner within 0.01 m of the ground. The two disagreed. The front corners sit 3.17 m ahead of the rear edge of the tracks, so 1° is 55 mm there, while 0.01 m could not tell a front held a centimetre up from one resting. In the two nominal baseline episodes that met the 1° and missed the 0.01 m (seeds 10,000,011 and 10,000,039), the bucket pressed with about 35 kN to the end, the front corners carried nothing, against about 20 kN together while the bucket was in the air, and they hung 11.5 and 9.8 mm up, still, at a tilt of 0.21° and 0.18°. The measuring points were right: they are the bottoms of the front contact spheres, and the other track spheres sat in contact, 0.1 mm into the ground. The bucket held the front up, and both episodes fail the set-down condition. A passing episode, seed 10,000,000, ends with the bucket carrying 12 kN and every front corner at least 24% of its load.
+
+On the 64 development seeds of the `nominal` rung, the baseline's landing speeds measured this way have a median of 0.04 m/s, a 90th percentile of 0.16 m/s and a highest of 0.375 m/s; 1 of 64 reaches the bound. On the `machines` rung the median is 0 (most drawn machines never lift the front), the 90th percentile 0.36 m/s and the highest 1.22 m/s, and 8 of 64 reach the bound. These are with seal friction in the cylinders. The speed of the track centreline taken after the contact had braked the machine, with one flag for all four corners, read 2.1 to 2.8 times lower on eight nominal seeds.
 
 **Rungs and draws.**
 
@@ -549,23 +552,40 @@ pip install -e ".[train,dev]"
 python -m hma.train train --out ../runs/prop --rung nominal --procs 4 --machines 8
 python -m hma.train train --out ../runs/prop --resume
 python -m hma.train score --out ../runs/prop/score --rung nominal --checkpoint ../runs/prop/checkpoint
-python -m hma.train throughput --out ../runs/speed --rung machines
+python -m hma.train throughput --out ../runs/speed --rung machines --procs 4 --machines 8
 ```
 
-`--smoke` makes any command run for seconds. `--out` must lie outside the repository.
+`--smoke` makes any command run for seconds. `--out` must lie outside the repository. `throughput` starts `--procs` worker processes with a scene of `--machines` each, steps them with random commands for `--seconds` (30 by default) and reports the control steps per second over all of them, per process and per scene.
+
+**On 32 cores.** First size the run, then train for an hour, then score:
+
+```
+python -m hma.train throughput --out ../runs/speed32 --rung nominal --procs 30 --machines 8 --seconds 60
+python -m hma.train train --out ../runs/prop32 --rung nominal --procs 30 --machines 8 --n-steps 300 --batch 18000 --threads 2 --minutes 60
+python -m hma.train score --out ../runs/prop32/score --rung nominal --checkpoint ../runs/prop32/checkpoint --procs 30
+```
+
+Thirty worker processes of eight machines give 240 machines and leave two cores for the learner, which runs on two maths threads while every worker keeps one. An update takes 300 steps from each machine, 72,000 samples, in four mini-batches of 18,000. The throughput run takes under two minutes and writes `../runs/speed32/throughput.md`. Training prints the processes, samples per update, batch and learner threads, and writes:
+
+- `../runs/prop32/curve.csv`: one row per rollout in which episodes finished, with the control steps so far, seconds, episodes, mean return, pass rate, tilt error, early-end share and the share of time spent collecting rather than updating;
+- `../runs/prop32/checkpoint/`: `model.zip`, `normalize.pkl`, `scenes.pkl`, `starts.pkl` and `config.json` (with the scale and the steps so far), every 10 rollouts and at the end.
+
+Scoring writes `score_nominal.csv` and `score_nominal.md` to `../runs/prop32/score/`, with the baseline and the policy over the 64 development seeds. The workers wait while the learner updates, so if the collecting share in `curve.csv` is low, more learner threads (`--threads`) are the first thing to change.
 
 Training uses PPO from Stable-Baselines3, with these settings:
 
 - two hidden layers of 128 for both the policy and the value function;
 - observation normalisation;
-- a starting action spread (the standard deviation of the policy's sampled actions) of 0.02 in `residual` mode and 1.0 in `direct` mode, set with `--spread`;
-- one maths thread per process and one scene per worker process.
+- in `residual` mode, a command of the baseline's command plus 0.2 times the policy's action, clipped to [-1, 1] (`--scale`, kept in the checkpoint); in `direct` mode the action is the command;
+- a starting action spread (the standard deviation of the policy's sampled actions) of 0.1 in `residual` mode and 1.0 in `direct` mode, set with `--spread`;
+- 300 steps from each machine per update (`--n-steps`), more than the longest episode (290 decisions), so every machine ends at least one episode in every rollout, and mini-batches of a quarter of an update's samples (`--batch`);
+- one scene per worker process, one maths thread in each worker, and `--threads` maths threads for the learner (1 by default).
 
 It checkpoints the model, the normalisation statistics, every scene's snapshot and which machines start a new episode, so a resume carries on in the middle of the same episodes. A checkpoint is taken at the start of a rollout, after the update, so the saved policy is the one that collects next. It is written to `checkpoint.tmp` and renamed into place; the old one is kept as `checkpoint.old` until the rename is done, and a resume falls back to it. `--steps` is the total over the run and its resumes.
 
-An untrained policy in `residual` mode should behave like the baseline it adds to. Its mean action starts within 0.02 of zero. Its sampled actions, though, add noise to every valve command, and the pass mark is sensitive to that noise. Here is an untrained policy sampled as in training, on the 64 development seeds of the nominal rung, measured under the pass mark before it gained the per-corner landing speed and the check that the front tracks end down and still (the baseline passes 62% under the current mark):
+An untrained policy in `residual` mode should behave like the baseline it adds to. Its mean action starts within 0.02 of zero, which moves a command by at most 0.004. Its sampled actions, though, add noise of the scale times the spread to every valve command, and the pass mark is sensitive to that noise. Here is an untrained policy sampled as in training, with the scale at 1, on the 64 development seeds of the nominal rung, measured before the cylinders had seal friction and under the pass mark before it gained the per-corner landing speed and the check that the front tracks end down and still (the baseline passes 34% under the current mark):
 
-| Starting spread | Pass | Mean tilt error | Early ends |
+| Noise on the command (scale × spread) | Pass | Mean tilt error | Early ends |
 |---|---|---|---|
 | baseline alone | 66% | 1.51° | 0 |
 | 1.0 (the Stable-Baselines3 default) | 0% | 5.54° | 0 |
@@ -574,13 +594,13 @@ An untrained policy in `residual` mode should behave like the baseline it adds t
 | 0.05 | 53% | 1.75° | 0 |
 | 0.02 | 62% | 1.58° | 0 |
 
-The default of 0.02 is the largest spread tried that stays within one sampling error (about 6 points on 64 episodes) of the baseline. The suite checks the untrained policy's deterministic episode against the baseline's when Stable-Baselines3 is installed.
+0.02 is the largest noise tried that stays within one sampling error (about 6 points on 64 episodes) of the baseline, so the scale and the spread are chosen together with a product of 0.02. With a scale of 0.2 and a spread of 0.1 the sampled command has the same spread as the 0.02 row, and its mean sits closer to the baseline's than it did at a scale of 1. The scale sets how far the policy can move a command: an action of 1 moves it by 0.2 of a full valve opening, ten times the starting noise. The spread sets how big the policy's moves are against its own noise. A PPO update moves the network's output by roughly the same amount in action units whatever the spread, because the step size follows the learning rate. At a spread of 0.02 a few updates moved the mean action by several spreads, and the policy fell away from the baseline. At 0.1 the same move is a fraction of a spread, and it reaches the command scaled down by 0.2. A smaller scale with a larger spread would condition the updates further but leave the policy less room to correct the baseline. The suite checks that the scale times the spread is 0.02, and the untrained policy's deterministic episode against the baseline's, when the training extra is installed. That comparison allows 0.3° of mean tilt error. With seal friction one episode is sensitive to tiny command changes: on the checked seed (10,000,004) a constant offset of 0.0001 on every command moves the baseline's own mean tilt error by up to 0.12°, and one of 0.004, the most the untrained mean moves a command, by up to 0.25°. The change is not monotone in the offset.
 
-Three settings, γ = 0.97, learning rate 0.001 and 10 optimisation epochs, are from Table III of [Egli and Hutter][eh] (IEEE Robotics and Automation Letters 7(2), 2022, doi:10.1109/LRA.2022.3152865, page 5), which trains a tracking policy for an excavator arm with PPO. Several other settings in that table match a Stable-Baselines3 default or a choice made here: hidden layers of 128 × 128 with tanh for both networks, 4 mini-batches per update, GAE λ 0.95, clip range 0.2, value coefficient 0.5, gradient norm limit 0.5 and no entropy bonus. The paper's batch of 39k samples, 2 s episodes and 6.7 Hz control are not used. The rollout length (128 decisions per machine) and the starting action spread are choices made here.
+Three settings, γ = 0.97, learning rate 0.001 and 10 optimisation epochs, are from Table III of [Egli and Hutter][eh] (IEEE Robotics and Automation Letters 7(2), 2022, doi:10.1109/LRA.2022.3152865, page 5), which trains a tracking policy for an excavator arm with PPO. Several other settings in that table match a Stable-Baselines3 default or a choice made here: hidden layers of 128 × 128 with tanh for both networks, 4 mini-batches per update, GAE λ 0.95, clip range 0.2, value coefficient 0.5, gradient norm limit 0.5 and no entropy bonus. The paper's batch of 39k samples, 2 s episodes and 6.7 Hz control are not used. The rollout length (300 decisions per machine), the residual scale and the starting action spread are choices made here.
 
 Scoring runs the baseline over the development seeds, and the checkpoint too if one is given. It writes one row per episode (`.csv`) and a table (`.md`) with the pass rate, the mean tilt error and the early ends by cause, overall and by thirds of each drawn parameter. The seeds are packed in order into scenes of `--machines` (8 by default), so each seed's scene and slot depend only on the seed list and the scene size; `--procs` only spreads the scenes over processes. The table states the scene size. A repeat is bit-exact for a fixed scene size. Unused slots run filler training seeds that are not scored. A seed cut short by a neighbour's solver failure runs again in the same slot, with fresh filler beside it.
 
-**Throughput.** Measured on a 4-core laptop processor with other work using about 30% of it: one process, random residual commands, drawn machines.
+**Throughput.** Measured on a 4-core laptop processor with other work using about 30% of it: one process, random residual commands, drawn machines. `throughput --procs 1 --machines N` measures one row.
 
 | Machines per scene | Control steps/s per process | Decisions/s per scene |
 |---|---|---|
@@ -591,16 +611,18 @@ Scoring runs the baseline over the development seeds, and the checkpoint too if 
 
 Eight machines per scene is the recommended size. Going to 16 gains 18% but halves the decision rate per scene, and rollouts get longer for the same number of samples. Each process uses one core fully.
 
+The table predates seal friction and the per-decision checks of the pass mark (each front corner's landing speed and its load from the contact forces). With both in, eight machines per scene on the `machines` rung run at 0.91 to 0.93 times the rate of the version before them, in runs of 20 s alternated with that version on one process. Other work used about half of the processor during those runs, so their absolute rates (21 to 24 control steps/s) are not comparable with the table.
+
 **Baseline scores.** The baseline in `residual` mode with zero commands, on the 64 development seeds:
 
 | Rung | Pass | Mean tilt error | Early ends |
 |---|---|---|---|
-| `nominal` | 62% | 1.51° | none |
-| `machines` | 3% | 3.75° | 1 tilt |
+| `nominal` | 34% | 1.57° | none |
+| `machines` | 0% | 3.78° | 1 tilt |
 
 Scene size 8. The `ground` rung is provisional and not reported (see Rungs and draws). The baseline never reads the tilt. It assumes level, rigid ground, on the `ground` rung too. A pass rate measured against it is therefore not a comparison against a controller with tilt feedback.
 
-On the nominal machine it fails most often on short ramps (29% pass with ramps of 3 to 4.1 s) and with the tip put down 4.8 to 5.7 m ahead (33%). It does best with the tip 3.6 to 4.8 m ahead (86%). Its two nominal failures that the earlier pass mark let through end with a front corner 10.0 and 11.5 mm off the ground at a tilt of about 0.2°. On drawn machines no single drawn parameter explains the failures: the pass rate stays at or under 10% in every third of every parameter.
+On the nominal machine it fails most often on short ramps (5% pass with ramps of 3 to 4.1 s, against 55% with ramps of 4.8 to 6 s) and with the tip put down close (19% with the tip 3.6 to 4.8 m ahead, against 59% at 5.7 to 6.5 m). 16 of its 64 nominal episodes fail on the set-down condition alone: they hold the band and land slowly enough, but the front of the tracks is not set down at the end. 17 nominal episodes end with the front corners carrying nothing. On drawn machines no single drawn parameter explains the failures: none of the 64 passes, so the pass rate is 0% in every third of every parameter, seal friction included.
 
 **Limits.**
 
@@ -764,6 +786,14 @@ python -m hma.train score --out ../runs/prop/score --smoke
 ```
 
 `--smoke` runs for seconds; drop it for a full run. [Propping environment](#propping-environment) lists the options.
+
+`pytest -q` runs the tests. CI installs only the dev extra, so it skips the tests marked `train_extra`, which need the training extra, and gives that as the reason. Run them locally after `pip install -e ".[train,dev]"`:
+
+- `tests/test_train_env.py::test_an_untrained_residual_policy_reproduces_the_baseline_episode`
+- `tests/test_train_round3.py::test_the_scheduled_end_is_a_truncation_and_an_early_end_is_terminal`
+- `tests/test_train_round3.py::test_closing_survives_a_worker_that_died`
+- `tests/test_train_round3.py::test_a_resumed_run_continues_where_the_checkpoint_was_taken`
+- `tests/test_train_round3.py::test_steps_is_the_total_across_a_resume`
 
 ## Limits
 

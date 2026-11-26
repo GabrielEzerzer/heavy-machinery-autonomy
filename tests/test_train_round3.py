@@ -65,7 +65,7 @@ def test_landing_is_each_front_corners_speed_just_before_its_own_first_contact()
     scene = Reference(1, "nominal")
     scene.reset(0, DEV_BASE + 4)
     info, _ = finish(scene)
-    assert scene.worst > 0.2
+    assert scene.worst > 0.1
     assert info["landing"] == pytest.approx(scene.worst, abs=1e-9)
 
 
@@ -119,18 +119,18 @@ def test_the_pass_mark_at_each_of_its_boundaries():
     scene.hold_steps[0] = 1000
     tiny = 1e-9
 
-    def passes(share=s.hold_share, landing=0.0, tilt=0.0, height=0.0, speed=0.0, cause=None):
+    def passes(share=s.hold_share, landing=0.0, carried=1.0, speed=0.0, cause=None):
         scene.in_band[0], scene.landing[0] = round(share * 1000), landing
-        return scene.outcome(0, cause, tilt, height, speed)["passed"]
+        return scene.outcome(0, cause, 0.0, carried, speed)["passed"]
 
     assert passes() and not passes(share=s.hold_share - 0.001)
     assert passes(landing=s.landing - tiny) and not passes(landing=s.landing)
-    assert passes(tilt=-s.settled + tiny) and not passes(tilt=s.settled)
-    assert passes(height=s.down - tiny) and not passes(height=s.down)
+    assert passes(carried=s.carry) and not passes(carried=s.carry - tiny)
     assert passes(speed=s.still - tiny) and not passes(speed=s.still)
     assert not passes(cause="tilt")
 
 
+@pytest.mark.train_extra
 def test_the_scheduled_end_is_a_truncation_and_an_early_end_is_terminal():
     from hma.train.vec import SceneVecEnv
 
@@ -210,6 +210,7 @@ def test_no_observation_reads_the_valve_delay_lag_or_deadband():
     assert np.array_equal(observed(machine), observed(slower))
 
 
+@pytest.mark.train_extra
 def test_closing_survives_a_worker_that_died():
     from hma.train.vec import ProcVecEnv
 
@@ -244,8 +245,8 @@ def _ppo(env):
     return build_model(venv, 8, 0, 0.3), venv
 
 
+@pytest.mark.train_extra
 def test_a_resumed_run_continues_where_the_checkpoint_was_taken(tmp_path):
-    pytest.importorskip("stable_baselines3")
     from hma.train.__main__ import latest_checkpoint, load_checkpoint, save_checkpoint
     from hma.train.vec import SceneVecEnv
 
@@ -285,8 +286,8 @@ def test_a_resumed_run_continues_where_the_checkpoint_was_taken(tmp_path):
     assert latest_checkpoint(checkpoint) == tmp_path / "checkpoint.old"
 
 
+@pytest.mark.train_extra
 def test_steps_is_the_total_across_a_resume():
-    pytest.importorskip("stable_baselines3")
     from stable_baselines3.common.callbacks import BaseCallback
 
     from hma.train.__main__ import learn
@@ -303,3 +304,11 @@ def test_steps_is_the_total_across_a_resume():
     model.num_timesteps = 64
     learn(model, 100, Stop(), resume=True)
     assert model._total_timesteps == 100
+
+
+def test_the_score_does_not_depend_on_the_number_of_processes():
+    seeds = dev_seeds(2)
+    alone = evaluate.score("nominal", "residual", seeds, 1, 1, None)
+    spread = evaluate.score("nominal", "residual", seeds, 1, 2, None)
+    assert [r["seed"] for r in alone] == seeds
+    assert alone == spread

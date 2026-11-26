@@ -54,9 +54,9 @@ class Settings:
     band: float = math.radians(3.0)
     hold_share: float = 0.8
     landing: float = 0.3
-    settled: float = math.radians(1.0)
-    down: float = 0.01
+    carry: float = 0.1
     still: float = 0.02
+    scale: float = 0.2
 
 
 @dataclass(frozen=True)

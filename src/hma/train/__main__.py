@@ -15,14 +15,14 @@ from pathlib import Path
 
 import numpy as np
 
-from hma.train.task import RUNGS, dev_seeds
+from hma.train.task import RUNGS, Settings, dev_seeds
 
 REPO = Path(__file__).resolve().parents[3]
 EGLI_HUTTER = {"gamma": 0.97, "learning_rate": 1e-3, "n_epochs": 10}
 NET = [128, 128]
 MINI_BATCHES = 4
-SPREAD = {"residual": 0.02, "direct": 1.0}
-CONFIG = ("rung", "mode", "procs", "machines", "seed", "spread")
+SPREAD = {"residual": 0.1, "direct": 1.0}
+CONFIG = ("rung", "mode", "procs", "machines", "seed", "spread", "scale")
 SMOKE = {"procs": 2, "machines": 2, "n_steps": 16, "steps": 256, "dev_size": 4, "seconds": 2.0}
 
 
@@ -91,10 +91,10 @@ def _curve_callback(out: Path, seconds: float | None, every: int, save):
     return Curve()
 
 
-def build_model(venv, n_steps: int, seed: int, spread: float):
+def build_model(venv, n_steps: int, seed: int, spread: float, batch: int | None = None):
     from stable_baselines3 import PPO
 
-    batch = max(venv.num_envs * n_steps // MINI_BATCHES, 8)
+    batch = batch or max(venv.num_envs * n_steps // MINI_BATCHES, 8)
     return PPO("MlpPolicy", venv, n_steps=n_steps, batch_size=batch,
                policy_kwargs={"net_arch": {"pi": NET, "vf": NET},
                               "log_std_init": math.log(spread)},
@@ -158,7 +158,7 @@ def train(args) -> None:
 
     from hma.train.vec import ProcVecEnv
 
-    torch.set_num_threads(1)
+    torch.set_num_threads(args.threads)
     out = output_dir(args.out)
     checkpoint = out / "checkpoint"
     found = latest_checkpoint(checkpoint) if args.resume else None
@@ -169,7 +169,8 @@ def train(args) -> None:
             setattr(args, key, config.get(key))
     if args.spread is None:
         args.spread = SPREAD[args.mode]
-    envs = ProcVecEnv(args.procs, args.machines, args.rung, args.mode, args.seed)
+    envs = ProcVecEnv(args.procs, args.machines, args.rung, args.mode, args.seed,
+                      Settings(scale=args.scale))
     print(f"workers: {envs.pids}", flush=True)
     try:
         if resume:
@@ -177,7 +178,10 @@ def train(args) -> None:
         else:
             venv = VecNormalize(envs, norm_obs=True, norm_reward=False,
                                 gamma=EGLI_HUTTER["gamma"])
-            model = build_model(venv, args.n_steps, args.seed, args.spread)
+            model = build_model(venv, args.n_steps, args.seed, args.spread, args.batch)
+        print(f"{envs.num_envs} machines in {args.procs} processes; {model.n_steps} steps per "
+              f"machine per update, {model.n_steps * envs.num_envs} samples, batch "
+              f"{model.batch_size}; learner threads {torch.get_num_threads()}", flush=True)
 
         def save() -> None:
             save_checkpoint(checkpoint, model, venv, envs,
@@ -201,7 +205,7 @@ def score(args) -> None:
     if args.checkpoint:
         config = read_config(Path(args.checkpoint))
         rows += run(args.rung, config["mode"], seeds, args.machines, args.procs,
-                    str(Path(args.checkpoint).resolve()))
+                    str(Path(args.checkpoint).resolve()), Settings(scale=config["scale"]))
     path = write(rows, out, f"score_{args.rung}")
     print(path.read_text(encoding="utf-8"))
 
@@ -210,12 +214,11 @@ def throughput(args) -> None:
     from hma.train.evaluate import throughput as run
 
     out = output_dir(args.out)
-    rows = run(args.rung, args.sizes, args.seconds)
-    lines = ["| machines per scene | control steps/s per process | scene decisions/s | "
-             "process CPU share | redos |", "|---|---|---|---|---|"]
-    lines += [f"| {r['machines']} | {r['control_steps_per_s']:.1f} | "
-              f"{r['scene_decisions_per_s']:.2f} | {r['cpu_share']:.2f} | {r['redos']} |"
-              for r in rows]
+    r = run(args.rung, args.procs, args.machines, args.seconds)
+    lines = ["| processes | machines per scene | control steps/s | per process | "
+             "decisions/s per scene | seconds timed |", "|---|---|---|---|---|---|",
+             f"| {r['procs']} | {r['machines']} | {r['control_steps_per_s']:.0f} | "
+             f"{r['per_process']:.1f} | {r['scene_decisions_per_s']:.2f} | {r['seconds']:.0f} |"]
     (out / "throughput.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(lines))
 
@@ -224,17 +227,24 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="python -m hma.train")
     commands = parser.add_subparsers(dest="command", required=True)
     for name, helptext in (("train", "train PPO"), ("score", "score over the dev seeds"),
-                           ("throughput", "time control steps per process")):
+                           ("throughput", "time control steps over worker processes")):
         sub = commands.add_parser(name, help=helptext)
         sub.add_argument("--out", required=True, help="output directory outside the repository")
         sub.add_argument("--rung", choices=sorted(RUNGS), default="nominal")
         sub.add_argument("--machines", type=int, default=8, help="machines per scene")
         sub.add_argument("--smoke", action="store_true", help="a seconds-long check run")
+        sub.add_argument("--procs", type=int, default=4, help="worker processes, one scene each")
     train_args = commands.choices["train"]
     train_args.add_argument("--mode", choices=("residual", "direct"), default="residual")
-    train_args.add_argument("--procs", type=int, default=4, help="scenes in worker processes")
     train_args.add_argument("--steps", type=int, default=10_000_000, help="total control steps")
-    train_args.add_argument("--n-steps", type=int, default=128, help="rollout length per machine")
+    train_args.add_argument("--n-steps", type=int, default=300,
+                            help="steps per machine per update; above the longest episode")
+    train_args.add_argument("--batch", type=int, default=None,
+                            help="mini-batch size (default: a quarter of the samples per update)")
+    train_args.add_argument("--threads", type=int, default=1,
+                            help="maths threads of the learner; workers use one each")
+    train_args.add_argument("--scale", type=float, default=Settings().scale,
+                            help="residual mode: command = baseline + scale x action")
     train_args.add_argument("--minutes", type=float, default=None, help="stop after this time")
     train_args.add_argument("--every", type=int, default=10, help="checkpoint every N rollouts")
     train_args.add_argument("--spread", type=float, default=None,
@@ -246,17 +256,13 @@ def main(argv: list[str] | None = None) -> None:
     score_args = commands.choices["score"]
     score_args.add_argument("--checkpoint", help="a checkpoint directory written by train")
     score_args.add_argument("--dev-size", type=int, default=64)
-    score_args.add_argument("--procs", type=int, default=4)
     speed_args = commands.choices["throughput"]
-    speed_args.add_argument("--sizes", type=int, nargs="+", default=[1, 4, 8, 16])
-    speed_args.add_argument("--seconds", type=float, default=20.0)
+    speed_args.add_argument("--seconds", type=float, default=30.0, help="time to step for")
     args = parser.parse_args(argv)
     if args.smoke:
         for key, value in SMOKE.items():
             if hasattr(args, key):
                 setattr(args, key, value)
-        if args.command == "throughput":
-            args.sizes = [1, 2]
     {"train": train, "score": score, "throughput": throughput}[args.command](args)
 
 

@@ -49,7 +49,8 @@ OBS_HIGH = np.tile(FRAME_HIGH, HISTORY)
 SCALE = np.concatenate([np.full(f[1], f[2]) for f in FIELDS])
 EPISODE_ARRAYS = ("k", "steps_total", "pitch0", "roll0", "est0", "sent", "history", "up", "v_prev",
                   "gyro_bias", "accel_bias", "imu_on", "tip_prev", "bucket_prev", "front_prev",
-                  "corner_prev", "landing", "in_band", "hold_steps", "err_total", "done", "active")
+                  "corner_prev", "touched", "rest_load", "rest_count", "landing", "in_band",
+                  "hold_steps", "err_total", "done", "active")
 
 
 def _matrices(quat: np.ndarray) -> np.ndarray:
@@ -117,8 +118,6 @@ class PropScene:
         self._swing_v = self.layer._qvel[:, SWING]
         self._upper_at = model.body(machine_prefix(0) + "upper").pos.copy()
         self._corners = footing.front_corners(model)
-        self._origin = np.array([model.geom_pos[footing.ground_shapes(model, i)[0], :2]
-                                 for i in range(n)])
         self._tips = np.array([model.site(machine_prefix(i) + TIP_SITE).id for i in range(n)])
         self._own_q = [np.concatenate([np.arange(model.jnt_qposadr[j],
                                                  model.jnt_qposadr[j] + size)
@@ -173,6 +172,9 @@ class PropScene:
         self.bucket_prev = np.zeros(n, bool)
         self.front_prev = np.zeros((n, len(self._corners)), bool)
         self.corner_prev = np.zeros((n, len(self._corners)))
+        self.touched = np.zeros(n, bool)
+        self.rest_load = np.zeros((n, len(self._corners)))
+        self.rest_count = np.zeros(n, np.intp)
         self.landing = np.zeros(n)
         self.in_band = np.zeros(n, np.intp)
         self.hold_steps = np.zeros(n, np.intp)
@@ -229,7 +231,10 @@ class PropScene:
         self.tip_prev[index] = self.data.site_xpos[self._tips[index]]
         self.bucket_prev[index] = False
         self.front_prev[index] = self._contacts()[1][index]
-        self.corner_prev[index] = -self._corner_motion()[1][index, 2]
+        self.corner_prev[index] = -self._corner_velocity()[index, 2]
+        self.touched[index] = False
+        self.rest_load[index] = 0.0
+        self.rest_count[index] = 0
         self.landing[index] = 0.0
         self.in_band[index] = 0
         self.hold_steps[index] = 0
@@ -270,15 +275,12 @@ class PropScene:
         arm = rot @ self._upper_at
         return v[self._base_v[:, None] + np.arange(3)] + _cross(omega[..., 0], arm)
 
-    def _corner_motion(self) -> tuple[np.ndarray, np.ndarray]:
+    def _corner_velocity(self) -> np.ndarray:
         q, v = self.data.qpos, self.data.qvel
         rot = _matrices(q[self._base_q[:, None] + np.arange(3, 7)])
         offsets = rot @ self._corners.T
         omega = rot @ v[self._base_v[:, None] + np.arange(3, 6)][..., None]
-        position = q[self._base_q[:, None] + np.arange(3)][..., None] + offsets
-        velocity = v[self._base_v[:, None] + np.arange(3)][..., None] + np.cross(omega, offsets,
-                                                                                 axis=1)
-        return position, velocity
+        return v[self._base_v[:, None] + np.arange(3)][..., None] + np.cross(omega, offsets, axis=1)
 
     def _failure(self, failed: np.ndarray, seen: bool) -> bool:
         for warning, owners in self._bad:
@@ -308,7 +310,7 @@ class PropScene:
             raise ValueError("every machine must be reset before the scene steps")
         commands = np.clip(actions, -1.0, 1.0)
         if self.mode == "residual":
-            commands = np.clip(self.baseline() + commands, -1.0, 1.0)
+            commands = np.clip(self.baseline() + self.settings.scale * commands, -1.0, 1.0)
         self.layer.act(commands)
         n, dt, data, s = self.n, self.dt, self.data, self.settings
         times = (self.k[:, None] * self.steps + np.arange(1, self.steps + 1)) * dt
@@ -331,6 +333,7 @@ class PropScene:
         accel_sum = np.zeros((n, 3))
         gain = self.filter_gain
         base_q, base_v = self._base_q, self._base_v
+        touched = self.touched.copy()
         for step in range(self.steps):
             self.layer.step()
             reset_seen = self._failure(failed, reset_seen)
@@ -370,6 +373,7 @@ class PropScene:
             both = bucket & self.bucket_prev
             slide += np.where(both, np.linalg.norm((tip - self.tip_prev)[:, :2], axis=1), 0.0)
             self.tip_prev, self.bucket_prev = tip.copy(), bucket
+            touched |= bucket
             landed = front & ~self.front_prev
             if landed.any():
                 self.landing = np.maximum(self.landing,
@@ -379,6 +383,11 @@ class PropScene:
             corner_v = v[base_v[:, None] + np.arange(3)][..., None] + np.cross(omega, offsets,
                                                                                axis=1)
             self.corner_prev = -corner_v[:, 2]
+        load = self._front_load()
+        aloft = ~touched
+        self.rest_load[aloft] += load[aloft]
+        self.rest_count += aloft
+        self.touched = touched
         self.k += 1
         self.steps_total += self.steps
         self.err_total += err_sum
@@ -400,7 +409,7 @@ class PropScene:
             flags = {"unstable": failed[i], "contact": forbidden[i], "strike": struck[i],
                      "tilt": worst_tilt[i] > s.tilt_limit, "roll": worst_roll[i] > s.roll_limit}
             causes.append(None if cut[i] else next((c for c in CAUSES if flags[c]), None))
-        position, motion = self._corner_motion()
+        motion = self._corner_velocity()
         obs = np.zeros((n, HISTORY * FRAME))
         terminated = np.zeros(n, bool)
         infos: list[dict] = [{} for _ in range(n)]
@@ -421,27 +430,43 @@ class PropScene:
                 terminated[i] = True
                 self.done[i] = True
                 self.active[i] = False
-                local = position[i] - np.r_[self._origin[i], 0.0][:, None]
-                ground = [footing.surface(self.grounds[i], x, y) for x, y in local[:2].T]
-                height = float(np.max(local[2] - ground))
+                rest = self.rest_load[i] / max(int(self.rest_count[i]), 1)
+                carried = float(np.min(np.divide(load[i], rest, out=np.zeros_like(rest),
+                                                 where=rest > 0.0)))
                 speed = float(np.linalg.norm(motion[i], axis=0).max())
-                infos[i] = self.outcome(i, causes[i], pitch[i] - self.pitch0[i], height, speed)
+                infos[i] = self.outcome(i, causes[i], pitch[i] - self.pitch0[i], carried, speed)
                 infos[i]["passed"] &= not cut[i]
                 infos[i]["truncated"] = causes[i] is None
                 infos[i]["cut_short"] = bool(cut[i])
         return obs, reward, terminated, infos
 
-    def outcome(self, index: int, cause: str | None, final_tilt: float, height: float,
+    def outcome(self, index: int, cause: str | None, final_tilt: float, carried: float,
                 speed: float) -> dict:
         s = self.settings
         share = self.in_band[index] / max(int(self.hold_steps[index]), 1)
         passed = (cause is None and share >= s.hold_share and self.landing[index] < s.landing
-                  and abs(final_tilt) < s.settled and height < s.down and speed < s.still)
+                  and carried >= s.carry and speed < s.still)
         return {"seed": self.seeds[index], "cause": cause, "passed": bool(passed),
                 "hold_share": float(share), "landing": float(self.landing[index]),
-                "final_tilt": float(final_tilt), "front_height": height, "front_speed": speed,
+                "final_tilt": float(final_tilt), "front_carried": carried, "front_speed": speed,
                 "tilt_error": float(self.err_total[index] / max(int(self.steps_total[index]), 1)),
                 "decisions": int(self.k[index])}
+
+    def _front_load(self) -> np.ndarray:
+        load = np.zeros((self.n, len(self._corners)))
+        count = self.data.ncon
+        if not count:
+            return load
+        pairs = self.data.contact.geom[:count]
+        role = self._role[pairs]
+        hits = np.flatnonzero(((role[:, 0] == FRONT) & (role[:, 1] == GROUND))
+                              | ((role[:, 1] == FRONT) & (role[:, 0] == GROUND)))
+        force = np.zeros(6)
+        for c in hits:
+            g = pairs[c, 0] if role[c, 0] == FRONT else pairs[c, 1]
+            mujoco.mj_contactForce(self.model, self.data, int(c), force)
+            load[self._owner[g], self._corner[g]] += force[0]
+        return load
 
     def _contacts(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         n = self.n

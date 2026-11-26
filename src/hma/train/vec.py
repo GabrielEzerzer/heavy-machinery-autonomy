@@ -4,6 +4,7 @@ on fresh seeds when they finish, and several scenes in parallel worker processes
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 
 import numpy as np
 from gymnasium import spaces
@@ -93,7 +94,13 @@ class SceneVecEnv(VecEnv):
         return [indices] if isinstance(indices, int) else indices
 
 
+ONE_THREAD = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")
+
+
 def _worker(pipe, args) -> None:
+    import torch
+
+    torch.set_num_threads(1)
     env = SceneVecEnv(*args)
     while True:
         command, payload = pipe.recv()
@@ -119,15 +126,24 @@ class ProcVecEnv(VecEnv):
         context = mp.get_context("spawn")
         self.n = n
         self.pipes, self.processes = [], []
-        for k in range(scenes):
-            here, there = context.Pipe()
-            process = context.Process(target=_worker,
-                                      args=(there, (n, rung, mode, seed * 1000 + k, settings)),
-                                      daemon=True)
-            process.start()
-            there.close()
-            self.pipes.append(here)
-            self.processes.append(process)
+        saved = {name: os.environ.get(name) for name in ONE_THREAD}
+        os.environ.update(dict.fromkeys(ONE_THREAD, "1"))
+        try:
+            for k in range(scenes):
+                here, there = context.Pipe()
+                process = context.Process(target=_worker,
+                                          args=(there, (n, rung, mode, seed * 1000 + k, settings)),
+                                          daemon=True)
+                process.start()
+                there.close()
+                self.pipes.append(here)
+                self.processes.append(process)
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
         self.closed = False
         super().__init__(scenes * n, *spaces_for())
 

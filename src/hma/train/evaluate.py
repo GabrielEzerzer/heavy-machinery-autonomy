@@ -1,6 +1,6 @@
-"""Scoring over the fixed development seeds and throughput timing. Seeds run in fixed scenes, are
-rerun when a neighbour's solver failure cuts them short, and each outcome is joined with its draws
-and grouped by thirds of every drawn parameter. Held-out and repeated seeds are refused here."""
+"""Scoring over the fixed development seeds, and throughput timing over worker processes. Seeds run
+in fixed scenes, are rerun when a neighbour's solver failure cuts them short, and each outcome is
+joined with its draws and grouped by thirds of every drawn parameter. Held-out seeds are refused."""
 
 from __future__ import annotations
 
@@ -16,11 +16,11 @@ from pathlib import Path
 import numpy as np
 
 from hma.train.scene import CAUSES, PropScene
-from hma.train.task import DEV_BASE, HELD_OUT_BASE, training_seed
-from hma.train.vec import SceneVecEnv
+from hma.train.task import DEV_BASE, HELD_OUT_BASE, Settings, training_seed
 
 DRAWN = ("target", "ramp_up", "hold", "ramp_down", "prop_x", "pitch", "friction", "step", "grade",
-         "cross", "delay", "lag", "deadband", "sensor_latency", "counterweight", "link_mass")
+         "cross", "delay", "lag", "deadband", "sensor_latency", "counterweight", "link_mass",
+         "seal_friction")
 DEGREES = {"target", "pitch"}
 FILLER = DEV_BASE - 1
 ROUNDS = 4
@@ -37,7 +37,7 @@ def episode_row(scene, slot: int, info: dict, controller: str) -> dict:
         "cross": ground.cross, "delay": float(np.mean(machine.delay)),
         "lag": float(np.mean(machine.lag)), "deadband": float(np.mean(machine.deadband)),
         "sensor_latency": machine.sensor_latency, "counterweight": machine.counterweight,
-        "link_mass": float(np.mean(machine.link_mass)),
+        "link_mass": float(np.mean(machine.link_mass)), "seal_friction": machine.seal_friction,
     }
 
 
@@ -76,14 +76,16 @@ def _run_round(scene: PropScene, pending: dict[int, int], round_: int, policy,
     return rows
 
 
-def run_group(rung: str, mode: str, seeds: list[int], machines: int,
-              checkpoint: str | None) -> list[dict]:
-    import torch
+def run_group(rung: str, mode: str, seeds: list[int], machines: int, checkpoint: str | None,
+              settings: Settings | None = None) -> list[dict]:
+    policy = None
+    if checkpoint:
+        import torch
 
-    torch.set_num_threads(1)
-    policy = load_policy(Path(checkpoint)) if checkpoint else None
+        torch.set_num_threads(1)
+        policy = load_policy(Path(checkpoint))
     controller = "policy" if checkpoint else "baseline"
-    scene = PropScene(machines, rung, mode)
+    scene = PropScene(machines, rung, mode, settings)
     pending, rows = dict(enumerate(seeds)), []
     for round_ in range(ROUNDS):
         rows += _run_round(scene, pending, round_, policy, controller)
@@ -93,14 +95,14 @@ def run_group(rung: str, mode: str, seeds: list[int], machines: int,
 
 
 def score(rung: str, mode: str, seeds: list[int], machines: int, procs: int,
-          checkpoint: str | None) -> list[dict]:
+          checkpoint: str | None, settings: Settings | None = None) -> list[dict]:
     if any(seed >= HELD_OUT_BASE for seed in seeds):
         raise ValueError("held-out seeds are never scored")
     if len(set(seeds)) != len(seeds):
         raise ValueError("each seed is scored once")
     groups = [seeds[k:k + machines] for k in range(0, len(seeds), machines)]
     args = [[rung] * len(groups), [mode] * len(groups), groups, [machines] * len(groups),
-            [checkpoint] * len(groups)]
+            [checkpoint] * len(groups), [settings] * len(groups)]
     if procs <= 1 or len(groups) == 1:
         parts = list(map(run_group, *args))
     else:
@@ -162,22 +164,24 @@ def write(rows: list[dict], out: Path, name: str) -> Path:
     return path
 
 
-def throughput(rung: str, sizes: list[int], seconds: float, seed: int = 0) -> list[dict]:
-    results = []
-    for n in sizes:
-        env = SceneVecEnv(n, rung, "residual", seed)
-        env.reset()
+def throughput(rung: str, procs: int, machines: int, seconds: float, seed: int = 0) -> dict:
+    from hma.train.vec import ProcVecEnv
+
+    envs = ProcVecEnv(procs, machines, rung, "residual", seed)
+    try:
+        envs.reset()
         rng = np.random.default_rng(seed)
         for _ in range(3):
-            env.step_async(rng.uniform(-0.2, 0.2, (n, 4)))
-            env.step_wait()
-        decisions, wall0, cpu0 = 0, time.perf_counter(), time.process_time()
+            envs.step_async(rng.uniform(-1.0, 1.0, (envs.num_envs, 4)))
+            envs.step_wait()
+        decisions, wall0 = 0, time.perf_counter()
         while time.perf_counter() - wall0 < seconds:
-            env.step_async(rng.uniform(-0.2, 0.2, (n, 4)))
-            env.step_wait()
+            envs.step_async(rng.uniform(-1.0, 1.0, (envs.num_envs, 4)))
+            envs.step_wait()
             decisions += 1
-        wall, cpu = time.perf_counter() - wall0, time.process_time() - cpu0
-        results.append({"machines": n, "control_steps_per_s": decisions * n / wall,
-                        "scene_decisions_per_s": decisions / wall, "cpu_share": cpu / wall,
-                        "redos": env.scene.layer.redos})
-    return results
+        wall = time.perf_counter() - wall0
+    finally:
+        envs.close()
+    return {"procs": procs, "machines": machines, "seconds": wall,
+            "control_steps_per_s": decisions * envs.num_envs / wall,
+            "per_process": decisions * machines / wall, "scene_decisions_per_s": decisions / wall}
