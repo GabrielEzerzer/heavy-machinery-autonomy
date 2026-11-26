@@ -1003,7 +1003,7 @@ python -m hma.train score --out ../runs/prop/score --smoke
 
 `--smoke` runs for seconds; drop it for a full run. [Propping environment](#propping-environment) lists the options.
 
-`pytest -q` runs the tests. CI installs only the dev extra, so it skips the tests marked `train_extra`, which need the training extra, and gives that as the reason. Run them locally after `pip install -e ".[train,dev]"`:
+`pytest -q` runs the tests. The tests marked `train_extra` need the training extra; without it they are skipped with that as the reason. CI installs the CPU build of PyTorch and both extras, so it runs them; locally, install them with `pip install -e ".[train,dev]"`:
 
 - `tests/test_train_env.py::test_an_untrained_residual_policy_sends_the_baseline_plus_its_scaled_action`
 - `tests/test_train_scoring.py::test_the_scheduled_end_is_a_truncation_and_an_early_end_is_terminal`
