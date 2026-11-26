@@ -198,6 +198,11 @@ class Hydraulics:
         self._command_flat = self._commands.reshape(-1)
         self._delay_index = np.zeros((self._command_len, *shape), np.intp)
         self._sensors = np.zeros((self._sensor_len, 4, *shape))
+        self._clean_len = self._sensor_len + self.steps_per_decision
+        self._clean = np.zeros((self._clean_len, 4, *shape))
+        self._clean_head = 0
+        self._mean_noise = np.zeros((n, 4, JOINTS))
+        self._mean_rngs: list[np.random.Generator | None] = [None] * n
         self._command_head = 0
         self._sensor_head = 0
         self._held = np.zeros(shape)
@@ -339,6 +344,8 @@ class Hydraulics:
                                     machine.pressure_noise, machine.pressure_noise)
         self._offset[index] = machine.pressure_offset
         self._rngs[index] = np.random.default_rng((machine.seed, 1))
+        self._mean_rngs[index] = np.random.default_rng((machine.seed, 5))
+        self._mean_noise[index] = self._mean_rngs[index].uniform(-1.0, 1.0, (4, JOINTS))
         self._noise_cursor[index] = 0
 
         self._apply_mass(index, machine)
@@ -427,6 +434,7 @@ class Hydraulics:
         first += self._rngs[index].uniform(-1.0, 1.0, first.shape) * self._noise[:, index]
         self._clip_pressure_rows(first)
         self._sensors[:, :, index] = first
+        self._clean[:, :, index] = self._true_rows()[:, index]
 
     def act(self, commands: np.ndarray) -> None:
         commands = np.asarray(commands, float)
@@ -659,11 +667,14 @@ class Hydraulics:
         self._sensor_head = (self._sensor_head + 1) % self._sensor_len
         reading = self._sensors[self._sensor_head]
         self._true_rows(reading)
+        self._clean_head = (self._clean_head + 1) % self._clean_len
+        self._clean[self._clean_head] = reading
         cursor = self._noise_cursor
         due = cursor == 0
         if due.any():
             for i in np.flatnonzero(due):
                 self._draw_noise(i)
+                self._mean_noise[i] = self._mean_rngs[i].uniform(-1.0, 1.0, (4, JOINTS))
         reading += self._noise_draws[self._machine_index, cursor].transpose(1, 0, 2) * self._noise
         self._clip_pressure_rows(reading)
         cursor += 1
@@ -694,9 +705,9 @@ class Hydraulics:
         self._edge_slope[rows[:, None], RELIEF_EDGES] = tangent
 
     def _refresh(self, rows: np.ndarray) -> np.ndarray:
-        self._rhs[rows, :, 0] = self._edge_flow[rows] @ INFLOW
+        self._rhs[rows, :, 0] = (self._edge_flow @ INFLOW)[rows]
         self._rhs[rows, :c.PUMPS, 0] += self._pump[rows]
-        return (self._weights[rows] @ SYSTEM_MAP).reshape(len(rows), NODES, NODES)
+        return (self._weights @ SYSTEM_MAP)[rows].reshape(len(rows), NODES, NODES)
 
     def _balance(self, matrix: np.ndarray, rhs: np.ndarray, delta: np.ndarray,
                  speed: np.ndarray) -> np.ndarray:
@@ -823,3 +834,34 @@ class Hydraulics:
                                :, np.arange(self.n)]
         rows = np.moveaxis(sample, 1, 0)
         return Observation(rows[0], rows[1], np.stack([rows[2], rows[3]], axis=-1))
+
+    def observe_mean(self) -> Observation:
+        ends = self._clean_head - self._latency_steps
+        steps = (ends[None, :] - np.arange(self.steps_per_decision)[:, None]) % self._clean_len
+        rows = self._clean[steps, :, self._machine_index].mean(axis=0)
+        rows += self._mean_noise * np.moveaxis(self._noise, 0, 1)
+        np.maximum(rows[:, 2:], 0.0, out=rows[:, 2:])
+        return Observation(rows[:, 0], rows[:, 1], np.stack([rows[:, 2], rows[:, 3]], axis=-1))
+
+    def snapshot(self) -> dict:
+        kept = {}
+        for name, value in vars(self).items():
+            if name in ("model", "data", "_scratch", "machines"):
+                continue
+            if name in ("_rngs", "_mean_rngs"):
+                kept[name] = [None if r is None else r.bit_generator.state for r in value]
+            elif not isinstance(value, list):
+                kept[name] = value.copy() if isinstance(value, np.ndarray) else value
+        return kept
+
+    def restore(self, snapshot: dict) -> None:
+        for name, value in snapshot.items():
+            current = getattr(self, name, None)
+            if name in ("_rngs", "_mean_rngs"):
+                for rng, state in zip(current, value, strict=True):
+                    if state is not None:
+                        rng.bit_generator.state = state
+            elif isinstance(current, np.ndarray) and current.shape == value.shape:
+                current[...] = value
+            else:
+                setattr(self, name, value.copy() if isinstance(value, np.ndarray) else value)

@@ -2,7 +2,7 @@
 
 A simulation demo. You type a task in plain English, and a simulated 12-tonne excavator carries it out on rough ground without tipping over. One controller, trained in simulation, handles simulated machines of this type that each behave differently, with no retuning.
 
-**Status: in development.** The machine model and its hydraulics are built, every part of the machine except the hydraulic cylinders and bucket linkage collides with the ground and with itself ([issue 41](../../issues/41)), it can lift and set down a slung concrete block, and a conventional controller follows bucket paths through the hydraulics. The language step runs on its own: it turns an instruction into a carry, prop, turn or travel task and checks it against the machine's rated lift chart and published safety rules. Rough ground, the planner and the learned controller do not exist yet. An earlier version simulated soil and digging; it was removed and is in the repository's history. The [feature map](#feature-map) lists what is built and what is planned.
+**Status: in development.** The machine model and its hydraulics are built, every part of the machine except the hydraulic cylinders and bucket linkage collides with the ground and with itself ([issue 41](../../issues/41)), it can lift and set down a slung concrete block, and a conventional controller follows bucket paths through the hydraulics. The language step runs on its own: it turns an instruction into a carry, prop, turn or travel task and checks it against the machine's rated lift chart and published safety rules. A training environment for propping the machine on its bucket runs several machines per scene, with a baseline, a PPO trainer and a scorer; no controller has been trained in it yet. Rough ground, the planner and the learned controller do not exist yet. An earlier version simulated soil and digging; it was removed and is in the repository's history. The [feature map](#feature-map) lists what is built and what is planned.
 
 ## How it works
 
@@ -342,6 +342,210 @@ The oil model made this controller much worse than it was on the earlier speed-c
 
 The gain is set by the corner where every range is at its worst at once: 0.6 s delay, 0.4 s lag, 0.2 s sensor latency, curve gain 1.1, spool flow 1.2 times rated, the steepest allowed first curve segment, full joint play, the softest oil and sensor noise. With its command dead zone at 25% that machine settles to under 1 mm of motion over the last 2 s, 10 s after the line ends. With the dead zone at zero the swing still hunts, moving the tip by 6.2 cm over 2 s, 30 s after the line ends. Over 300 randomly drawn machines at 10 Hz, 10 s after the line ends, 10 move by more than 3 cm over the last 2 s and one by 11 cm, and the tip sits a median 2.14 m (95th percentile 2.95 m, at worst 3.47 m) from its target. With the command dead zones set to zero on the first 100 of those machines, the median falls to 0.82 m (at worst 2.09 m), but 66 move by more than 3 cm and 11 by more than 10 cm, the worst by 19 cm: the dead zone that stops the joints short also stops them hunting. At a gain of 1 /s, on the first 100 of those machines, the median falls to 0.81 m, 2 move by more than 10 cm and the worst by 25 cm. The slowest machine in range (0.6 s delay, 0.4 s lag) is still closing in 10 s after the line ends, at up to 0.96 m from its target over the last 2 s against a peak error of 1.70 m. The dead zones it cannot see are what leave it metres short ([issue 51](../../issues/51)).
 
+### Propping environment
+
+`hma.train` is the training environment for propping. The machine pushes its bucket into the ground ahead and lifts the front of its tracks, so that the tilt follows a reference over time; then it sets them down again. `PropScene` holds several machines in one MuJoCo scene, and one hydraulics layer steps them together. Each machine runs its own episode.
+
+**Episode contract.** One seed draws one episode. When machine *i* resets, the scene makes these draws in order, each from its own random stream:
+
+1. The machine: `draw_machine(seed)` on rungs 2 and 3, `NOMINAL` on rung 1. This uses stream `(seed, 0)`; the layer's per-step noise uses `(seed, 1)` and its per-decision noise `(seed, 5)`.
+2. The ground and the steel friction: `draw_ground(seed)` on rung 3, from stream `(seed, 3, 0)`, with friction from `draw_friction` on stream `(seed, 2)`. Other rungs get flat ground and the nominal friction of 0.5.
+3. The task, from stream `(seed, 10, attempt)`: target tilt, ramp and hold times, where the tip goes down, its start height above the ground there, and the bucket pitch. The attempt counts up until the baseline's path is within reach at every 0.05 s of the episode.
+4. The start pose: inverse kinematics of that path at time zero.
+5. The IMU's biases, then its noise draws, from stream `(seed, 11)`.
+
+The scene then writes the draws in this order:
+
+1. `apply_ground` writes the machine's height-field cells and steel friction. This also re-rests the load's home pose, the sling ring and the home key entries.
+2. `Hydraulics.reset` writes the link masses and recomputes the model's constants. It resets the joints, load, ring and constraint flags from the home key, then sets the start pose, the oil and the sensor buffers.
+3. The scene parks the load out of reach at (−1, 11) m, with the ring on it.
+4. One `mj_forward`.
+5. The IMU filter, the history and the counters.
+
+Only `PropScene.reset` and `PropScene.restore` write the model. They do it between decisions and only for that machine; nothing writes the model during a decision.
+
+A checkpoint (`PropScene.snapshot`) holds:
+
+- each machine's seed, and the rung, mode and settings;
+- `mj_getState` with `mjSTATE_INTEGRATION`;
+- the layer's arrays and random states (`Hydraulics.snapshot`);
+- the scene's per-machine arrays and IMU random states.
+
+A restore redoes every machine's writes from its seed, then sets the state and arrays. The replay that follows matches the original bit for bit.
+
+Resetting one machine leaves every other machine's trajectory unchanged to the bit. Three things make this hold:
+
+- MuJoCo's constraint islands are on by default and give each machine its own solve.
+- The hydraulics layer computes its network products over all machines and then picks the rows it needs. Its arithmetic therefore does not depend on how many machines take a correction at once.
+- The scene switches off the solver's warm start (`mjDSBL_WARMSTART`). MuJoCo decides whether to warm-start once for the whole scene ([computation docs](https://mujoco.readthedocs.io/en/stable/computation/index.html)).
+
+Switching off the warm start is a solver setting, not physics. On three baseline episodes it changed the tilt by under 1e-4°, and every outcome stayed the same. It costs about 24% of throughput with eight machines: 92 against 122 control steps per second.
+
+**Decisions and timing.** The controller decides 10 times a second, and each decision is held for 20 physics steps of 5 ms. An episode runs in five phases:
+
+1. Rest, 4 s. The bucket goes down to the ground in the first 2.5 s.
+2. Ramp up to the target, 3 to 6 s, on a quintic curve.
+3. Hold, 3 to 10 s.
+4. Ramp down, 3 to 6 s.
+5. Rest, 3 s.
+
+The controller sees the reference now, 0.5 s ahead and 1.0 s ahead.
+
+**Observations.** Each decision gives a frame of 31 values, taken from sensors a retrofitted excavator carries. The policy sees the last 15 frames stacked flat, oldest first: 465 values. It sees no contact flags or forces, no simulator state and no machine parameters.
+
+| Values | Sensor and where it sits | Source |
+|---|---|---|
+| 4 joint angles (swing, boom, arm, bucket) | an encoder on the swing axis; an IMU or inclinometer on each of the boom, arm and bucket links | joint angles from IMUs on each link in [HEAP][heap]; swing encoder unverified |
+| 4 joint speeds | the same sensors | [HEAP][heap] |
+| 8 chamber pressures (two per cylinder, two swing motor ports) | a pressure transducer on each port | pressure sensors on the actuators in [HEAP][heap] |
+| 3 angular rates, 3 specific forces | an IMU on the upper structure, at its origin on the swing axis | cabin and chassis IMUs in [HEAP][heap] |
+| undercarriage pitch and roll since the start | estimated from that IMU and the measured swing angle | roll and pitch to 0.1° from an AHRS of the [Ellipse-A][sbg] class; 0.2° for the [MTi-630][xsens] |
+| 4 commands sent at the last decision | the controller's own output | none needed |
+| 3 reference tilts (now, +0.5 s, +1.0 s) | the task | none needed |
+
+Each reading is an average over the 20 physics steps of a decision:
+
+- **Joint angles, speeds and pressures** come from `Hydraulics.observe_mean`. Each is the mean of the true readings over the 20 steps that ended one sensor latency ago, plus the drawn pressure offset, plus one uniform noise draw per reading. The draw is at the full stated size (±0.02 rad, ±0.05 rad/s, ±0.1 MPa), not that size divided by √20. Pressures are clipped at zero.
+- **Rates and specific forces** are the means of the per-step body values, plus a bias drawn per episode (±0.2 °/s, ±0.05 m/s²) and one noise draw per reading (±0.1 °/s, ±0.05 m/s²).
+- **The tilt** comes from a complementary filter on the IMU's biased signals, with a 2 s time constant, started converged. One draw of ±0.1° is added per reading.
+
+Rung 1 has no IMU noise or bias, just as the nominal machine has no noise or latency on its other sensors. The IMU sizes are assumed. They sit well above the datasheets' in-run gyro bias (7 to 8 °/h, about 0.002 °/s) and stand for a lower-grade unit.
+
+Each value is divided by a fixed scale, which gives these bounds:
+
+| Values | Scale | Bounds after scaling |
+|---|---|---|
+| joint angles | π rad | ±1 |
+| joint speeds | 2 rad/s | ±5 |
+| pressures | 40 MPa | 0 to 2 |
+| angular rates | 2 rad/s | ±5 |
+| specific forces | 9.81 m/s² | ±10 |
+| tilts | π/2 rad | ±2 |
+| commands | 1 | ±1 |
+| reference tilts | π/2 rad | ±1 |
+
+Training also normalises the values by their running mean and spread. Those statistics are frozen at evaluation.
+
+**Action.** Four valve commands in [−1, 1], in the order swing, boom, arm, bucket. In `direct` mode they go to the valves, clipped. In `residual` mode each is added to the baseline's command and the sum is clipped.
+
+**Baseline.** The baseline is a plain path tracker with no tilt feedback and no load-moment limit. It assumes three things: the ground is level and rigid, the tracks roll about their rear wheel without slipping, and the tip stays where it touched down. From these, for each reference tilt θ it computes where the tip must sit in the machine frame and at what bucket pitch (the drawn pitch plus θ). The existing `BaseController` tracks that path from the latest joint readings, with feedforward plus proportional feedback and no integral term. It never reads the tilt.
+
+**Reward.** Each decision earns
+
+r = 0.1 + 0.9·exp(−ē / 3°) − 0.03·Δu − 0.03·roll − 0.03·slide
+
+where:
+
+- ē is the absolute error between the true undercarriage pitch since the start and the reference, averaged over the 20 physics steps;
+- Δu is the mean absolute command change from the last decision, divided by 2;
+- roll is the mean absolute roll since the start, over 5°, capped at 1;
+- slide is the tip's horizontal travel while the bucket touches the ground in consecutive steps, over 0.05 m, capped at 1.
+
+Every term lies in [0, 1], so r lies in [0.01, 1]. The decision on which an episode ends early earns 0 and nothing follows it, so ending early never pays more than going on. The reward uses the true tilt, which only training sees.
+
+**Early ends.** These are checked at every physics step and applied at the decision, and the cause is recorded. In order of precedence:
+
+1. `unstable`: a non-finite state, or MuJoCo's bad-acceleration warning (which resets the whole scene);
+2. `contact`: the belly, the upper structure including the counterweight, the boom or the arm touches the ground;
+3. `tilt`: pitch beyond 35°;
+4. `roll`: roll beyond 10°.
+
+The end of the schedule is a terminal state, not a time limit.
+
+**Pass mark.** The pass mark is separate from the reward. An episode passes when all of these hold:
+
+- it has no early end;
+- the true tilt stays within ±3° of the reference for at least 80% of the hold;
+- the front track edge lands at under 0.3 m/s whenever the front feet regain the ground;
+- the tilt is back within 1° at the end.
+
+The 3° band is the reward's scale. It is fifteen times the AHRS accuracy above, so a real machine can measure it. The 80% allows for settling as the hold begins. The 0.3 m/s is an assumed bound, equal to a free fall of 4.6 mm. All of these are fields of `Settings`.
+
+**Rungs and draws.**
+
+| Rung | Machine | Ground ahead of the tracks | Steel friction |
+|---|---|---|---|
+| `nominal` | `NOMINAL` | flat | 0.5 |
+| `machines` | drawn | flat | 0.5 |
+| `ground` | drawn | a step of ±0.3 m at 2 m ahead of the swing axis, a grade of ±8° along and ±4° across | 0.30 to 0.70 |
+
+Every rung draws the same task ranges:
+
+| Task value | Range |
+|---|---|
+| target tilt | 5 to 20° |
+| each ramp | 3 to 6 s |
+| hold | 3 to 10 s |
+| where the tip goes down | 3.5 to 6.5 m ahead of the swing axis |
+| start height | 0.5 to 1.5 m above the ground there |
+| bucket pitch | 60 to 90° below the upper structure's forward axis |
+
+All of these ranges are settings.
+
+**Seeds.**
+
+- Development set: seeds 10,000,000 + k, 64 by default.
+- Held-out set: seeds 20,000,000 + k. The scorer refuses them, and nothing scores on them.
+- Training: seeds drawn below 10,000,000 from each scene's own stream.
+
+**Training and scoring.**
+
+```
+pip install -e ".[train,dev]"
+python -m hma.train train --out ../runs/prop --rung nominal --procs 4 --machines 8
+python -m hma.train train --out ../runs/prop --resume
+python -m hma.train score --out ../runs/prop/score --rung nominal --checkpoint ../runs/prop/checkpoint
+python -m hma.train throughput --out ../runs/speed --rung machines
+```
+
+`--smoke` makes any command run for seconds. `--out` must lie outside the repository.
+
+Training uses PPO from Stable-Baselines3, with these settings:
+
+- two hidden layers of 128 for both the policy and the value function;
+- observation normalisation;
+- one maths thread per process and one scene per worker process.
+
+It checkpoints the model, the normalisation statistics and every scene's snapshot, so a resume carries on in the middle of the same episodes.
+
+Three starting settings, γ = 0.97, learning rate 1e-3 and 10 epochs, are attributed to [Egli and Hutter][eh] (also [arXiv 2106.07369](https://arxiv.org/abs/2106.07369)). They have not been checked against the paper's text. Everything else is a Stable-Baselines3 default or a choice made here, including the rollout length (128 decisions per machine) and the batch (a quarter of the rollout).
+
+Scoring runs the baseline over the development seeds, and the checkpoint too if one is given. It writes one row per episode (`.csv`) and a table (`.md`) with the pass rate, the mean tilt error and the early ends by cause, overall and by thirds of each drawn parameter.
+
+**Throughput.** Measured on a 4-core laptop processor with other work using about 30% of it: one process, random residual commands, drawn machines.
+
+| Machines per scene | Control steps/s per process | Decisions/s per scene |
+|---|---|---|
+| 1 | 34 | 34 |
+| 4 | 78 | 19 |
+| 8 | 86 | 11 |
+| 16 | 102 | 6.4 |
+
+Eight machines per scene is the recommended size. Going to 16 gains 18% but halves the decision rate per scene, and rollouts get longer for the same number of samples. Each process uses one core fully.
+
+**Baseline scores.** The baseline in `residual` mode with zero commands, on the 64 development seeds:
+
+| Rung | Pass | Mean tilt error | Early ends |
+|---|---|---|---|
+| `nominal` | 66% | 1.51° | none |
+| `machines` | 8% | 3.75° | 1 tilt |
+| `ground` | 2% | 3.89° | 1 tilt |
+
+On the nominal machine it fails most often on short ramps (33% pass with ramps of 3 to 4.1 s) and with the tip put down 4.8 to 5.7 m ahead (33%). It does best with the tip 3.6 to 4.8 m ahead (95%). On drawn machines no single drawn parameter explains the failures: the pass rate stays at or under 19% in every third of every parameter.
+
+**Limits.**
+
+- On this branch the ground under and behind the tracks is a level pad. Only the ground ahead of the tracks is drawn, and it is planar. Slopes under the tracks arrive with the move to the ground module in [issue 53](../../issues/53).
+- The baseline's geometry assumes the tip stays where it touched down. In the simulation the tip slides forward under load: 0.36 m on one development seed.
+- On the open-centre circuit, a proportional tracker with no integral term stalls short when the load is large or the dead zone wide.
+- Those two faults make the baseline undershoot large targets and leave drawn machines tilted at the end.
+- The IMU model is assumed: its bias and noise sizes, a complementary filter in place of a vendor's estimator, no IMU latency, and specific force by finite difference at the swing axis.
+- Contact flags and the tip position come from the start of each physics step, 5 ms behind the joint state.
+- Landing speed counts only in the pass mark, not in the reward.
+
+[sbg]: https://support.sbg-systems.com/sc/el/latest/ellipse-documentation/performance-specifications
+[xsens]: https://mtidocs.xsens.com/sensor-specifications-2
+
 ### Language step
 
 `hma.task` turns one plain-English instruction into a checked task specification. A GPT model, called through the Codex CLI, fills the specification. Trusted code then checks it, and a person confirms it. The planner that would turn an approved specification into bucket and load paths is not built.
@@ -456,8 +660,8 @@ A feature is **done** when it runs from a clean checkout and its checks pass.
 | Planner | Turns a checked specification into paths for the bucket and the load | Planned |
 | Cylinder forces | Joint force limits from the hydraulic cylinders' sizes and positions | Done |
 | Learned controller | One network that moves a load and props the machine on its bucket without tipping, on any machine drawn | Planned |
-| Training | One command that trains the controller in stages of rising difficulty | Planned |
-| Evaluation | Scores a controller on machines it never saw in training | Planned |
+| Training | One command that trains the controller in stages of rising difficulty | In progress: one command trains PPO for propping on one of three rungs, with checkpoints and resume ([Propping environment](#propping-environment)); carrying and moving between rungs are not built |
+| Evaluation | Scores a controller on machines it never saw in training | In progress: scores the baseline and a checkpoint on fixed development seeds by drawn parameter; held-out seeds are reserved and never scored |
 | Language to task | A GPT model fills a carry, prop, turn or travel specification from a plain-English instruction | Done |
 | Plan checks | Refuses a specification that is malformed, out of reach, over the rated lift capacity or against slope, edge and keep-out rules anywhere along its route, and asks a person to confirm | Done; stability while propped is not yet taken from the machine's statics |
 | Demo screen | The plan, the drawn machine's card, both controllers side by side and the results chart | Planned |
@@ -475,6 +679,16 @@ python -m hma.task "put the pallet of kerbstones down at the near marker"
 ```
 
 The first command opens a viewer and moves the arm through its range, with the hydraulic cylinders and bucket linkage drawn on their pins. The second asks a GPT model for a task specification on the demo scene, checks it and asks you to confirm. It calls the [Codex CLI](https://github.com/openai/codex), which must be installed and signed in with your own ChatGPT account; this repo holds no API key.
+
+To train and score the propping controller, install the training extra and give an output directory outside the repository:
+
+```
+pip install -e ".[train]"
+python -m hma.train train --out ../runs/prop --smoke
+python -m hma.train score --out ../runs/prop/score --smoke
+```
+
+`--smoke` runs for seconds; drop it for a full run. [Propping environment](#propping-environment) lists the options.
 
 ## Limits
 
