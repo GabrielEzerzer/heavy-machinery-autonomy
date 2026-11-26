@@ -79,7 +79,7 @@ def _seal(head, rod, speed, speeds, pressures, tables, scales, first_step, last_
     columns = scales.shape[1]
     for k in range(out.shape[0]):
         i = _interp(abs(speed[k]), speeds)
-        i0 = min(int(i), speeds.shape[0] - 2)
+        i0 = min(max(int(i), 0), speeds.shape[0] - 2)
         a = i - i0
         total = 0.0
         for kind in range(2):

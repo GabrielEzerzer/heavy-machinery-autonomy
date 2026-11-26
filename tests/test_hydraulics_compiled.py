@@ -6,6 +6,7 @@ import pytest
 
 import numpy_step
 from hma.hydraulics import NOMINAL, RANGES, Hydraulics, draw_machine
+from hma.hydraulics import layer as layer_module
 from hma.machine import BODY_NAMES, TRAVEL_NAMES, load_scene, machine_prefix, tracks
 from hma.machine.cylinders import SEAL_PRESSURE, SEAL_SPEED, seal_friction
 from scenes import dig_pit
@@ -18,6 +19,7 @@ DRIVEN_POSITION = 1e-7
 DRIVEN_SETTLED_PRESSURE = 5.0
 DRIVEN_LATE_PRESSURE = 0.1
 DRIVEN_END_ENERGY = 1e-7
+WORKSPACE_DECISIONS = 12
 
 
 def extreme_machine(link_mass):
@@ -30,13 +32,16 @@ def extreme_machine(link_mass):
                    backlash=np.full(4, RANGES["backlash"][1]))
 
 
-def pair(welded):
+def scene(welded):
     if welded:
         machines = [extreme_machine(m) for m in RANGES["link_mass"]] + [NOMINAL]
-        model = dig_pit(load_scene(len(machines), weld=True), len(machines))
-    else:
-        machines = [draw_machine(seed) for seed in (3, 7, 12)]
-        model = load_scene(len(machines))
+        return machines, dig_pit(load_scene(len(machines), weld=True), len(machines))
+    machines = [draw_machine(seed) for seed in (3, 7, 12)]
+    return machines, load_scene(len(machines))
+
+
+def pair(welded):
+    machines, model = scene(welded)
     return (Hydraulics(model, mujoco.MjData(model), machines),
             numpy_step.NumpyHydraulics(model, mujoco.MjData(model), machines))
 
@@ -113,6 +118,20 @@ def test_compiled_seal_friction_matches_the_numpy_tables_bit_for_bit(shape):
                           numpy_step.seal_friction(head, rod, speed))
 
 
+@pytest.mark.parametrize("which", [0, 1, 2])
+def test_a_nan_input_gives_a_nan_seal_force_on_that_cylinder_alone(which):
+    rng = np.random.default_rng(1)
+    inputs = [rng.uniform(1e6, 30e6, (4, 3)), rng.uniform(1e6, 30e6, (4, 3)),
+              rng.uniform(-0.4, 0.4, (4, 3))]
+    clean = seal_friction(*inputs)
+    inputs[which][1, 2] = np.nan
+    force = seal_friction(*inputs)
+    others = np.ones(force.shape, bool)
+    others[1, 2] = False
+    assert np.isnan(force[1, 2])
+    assert np.array_equal(force[others], clean[others])
+
+
 def test_compiled_valve_openings_match_the_numpy_openings_bit_for_bit():
     machines = [draw_machine(seed) for seed in (1, 2, 3)]
     model = load_scene(len(machines))
@@ -129,31 +148,81 @@ def test_compiled_valve_openings_match_the_numpy_openings_bit_for_bit():
         assert np.array_equal(new._piloted, old._piloted)
 
 
-def test_the_step_reads_nothing_an_earlier_step_left_in_its_workspace():
-    machines = [draw_machine(seed) for seed in (3, 7, 12)]
-    model = load_scene(len(machines))
+@pytest.mark.parametrize("welded, redo_passes, seed", [(False, 0, 5), (True, 2, 3)])
+def test_the_step_reads_nothing_an_earlier_step_left_in_its_workspace(monkeypatch, welded,
+                                                                      redo_passes, seed):
+    monkeypatch.setattr(layer_module, "REDO_PASSES", redo_passes)
+    machines, model = scene(welded)
     clean = Hydraulics(model, mujoco.MjData(model), machines)
     scrambled = Hydraulics(model, mujoco.MjData(model), machines)
     travel = np.array([[model.actuator(machine_prefix(i) + name).id for name in TRAVEL_NAMES]
                        for i in range(clean.n)])
-    rng = np.random.default_rng(5)
-    for _ in range(20):
-        command = rng.uniform(-1.0, 1.0, (clean.n, 4))
-        drive = rng.uniform(-1.0, 1.0, travel.shape) * model.actuator_ctrlrange[travel, 1]
+    rng = np.random.default_rng(seed)
+    noise = np.random.default_rng(0)
+    replays = 0
+    for _ in range(WORKSPACE_DECISIONS):
+        if welded:
+            command = rng.choice([-1.0, 0.0, 1.0], size=(clean.n, 4))
+        else:
+            command = rng.uniform(-1.0, 1.0, (clean.n, 4))
+            drive = rng.uniform(-1.0, 1.0, travel.shape) * model.actuator_ctrlrange[travel, 1]
         for layer in (clean, scrambled):
             layer.act(command)
-            layer.data.ctrl[travel] = drive
+            if not welded:
+                layer.data.ctrl[travel] = drive
         for _ in range(clean.steps_per_decision):
             for array in scrambled._work:
                 if array.dtype == bool:
-                    np.logical_not(array, out=array)
+                    array[...] = noise.random(array.shape) < 0.5
                 elif array.dtype.kind == "f":
                     array.fill(np.nan)
                 else:
                     array.fill(7)
+            capped, redos = clean.capped, clean.redos
             clean.step()
             scrambled.step()
+            replays += clean.capped > capped and clean.redos - redos == redo_passes + 1
             assert np.array_equal(clean.data.qpos, scrambled.data.qpos)
+            assert np.array_equal(clean.data.qvel, scrambled.data.qvel)
             assert np.array_equal(clean._pressure, scrambled._pressure)
             assert np.array_equal(clean.data.userdata, scrambled.data.userdata)
-    assert clean.redos > 0 and clean.redos == scrambled.redos
+            assert np.array_equal(energies(clean), energies(scrambled))
+            assert np.array_equal(clean.pump_power, scrambled.pump_power)
+            assert len(clean.scores) == len(scrambled.scores)
+            for kept, other in zip(clean.scores, scrambled.scores, strict=True):
+                assert np.array_equal(kept, other)
+            assert (clean.redos, clean.capped, clean.check_bound) == (
+                scrambled.redos, scrambled.capped, scrambled.check_bound)
+    assert clean.capped > 0
+    assert replays > 0 if welded else clean.check_bound > 0
+
+
+def test_compiled_used_power_matches_the_numpy_track_step_bit_for_bit():
+    machines = [draw_machine(seed) for seed in (3, 7, 12)]
+    model = load_scene(len(machines))
+    layer = Hydraulics(model, mujoco.MjData(model), machines)
+    lay = tracks.drives(model)
+    travel = np.array([[model.actuator(machine_prefix(i) + name).id for name in TRAVEL_NAMES]
+                       for i in range(layer.n)])
+    rng = np.random.default_rng(2)
+    stored = []
+    for _ in range(10):
+        layer.act(rng.uniform(-1.0, 1.0, (layer.n, 4)))
+        layer.data.ctrl[travel] = rng.uniform(-1.0, 1.0, travel.shape) * model.actuator_ctrlrange[
+            travel, 1]
+        for _ in range(layer.steps_per_decision):
+            layer.step()
+            compiled, reference = mujoco.MjData(model), mujoco.MjData(model)
+            mujoco.mj_copyData(compiled, model, layer.data)
+            belt = compiled.qvel[lay.dofs] * tracks.WHEEL_RADIUS
+            mujoco.mj_step(model, compiled)
+            mujoco.mj_copyData(reference, model, compiled)
+            tracks._store_used(compiled.efc_type, compiled.efc_id, compiled.efc_force,
+                               tracks.FRICTION_TENDON, lay.tendons, compiled.qfrc_applied,
+                               lay.dofs, belt, compiled.userdata, tracks.WHEEL_RADIUS)
+            tracks.used_power(model, reference)[:] = np.maximum(
+                tracks.drive_forces(model, reference) * belt, 0.0)
+            assert np.array_equal(compiled.userdata, reference.userdata)
+            stored.append(tracks.used_power(model, compiled).copy())
+    stored = np.array(stored)
+    assert (stored == 0.0).any() and (stored > 0.0).any()

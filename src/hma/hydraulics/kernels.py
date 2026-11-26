@@ -65,7 +65,8 @@ def openings(head, commands, flat, held, spool, alpha, delay_index, deadband, op
             opening = opening if opening >= 0.0 or opening != opening else 0.0
             piloted[i] = piloted[i] or opening * open_scale[i, j] > pilot
             opening *= open_scale[i, j]
-            segment = min(int(opening), segments - 1) + segment_base[i, j]
+            segment = int(opening) if opening < segments - 1 else segments - 1
+            segment += segment_base[i, j]
             value = slope[segment] * opening
             value += intercept[segment]
             value *= gain[i, j]
@@ -408,7 +409,7 @@ def begin(circuit, p, dt, area, params, state, mj, drag, work):
         for c in range(joints - 1):
             u = (q[c + 1] - geometry_start[c]) * geometry_scale[c]
             u = min(max(u, 0.0), k[C_GEOMETRY_LAST])
-            index = int(u)
+            index = int(u) if u >= 0.0 else 0
             u -= index
             index += geometry_base[c]
             length[c + 1] = geometry_table[index, 0] + u * geometry_step[index, 0]
@@ -417,7 +418,10 @@ def begin(circuit, p, dt, area, params, state, mj, drag, work):
         for j in range(joints):
             demand_in[i, j] = area[i, j] * (1.0 if extend[j] else 0.0)
             demand_in[i, joints + j] = area[i, j]
-        cap = power[i] / max(pressure[i, 0] + pressure[i, 1], 1.0)
+        supply = 0.0
+        for c in range(pumps):
+            supply += pressure[i, c]
+        cap = power[i] / max(supply, 1.0)
         for c in range(pumps):
             demand = 0.0
             for r in range(2 * joints):

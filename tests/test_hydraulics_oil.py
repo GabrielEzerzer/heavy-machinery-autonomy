@@ -12,8 +12,6 @@ from hma.hydraulics.layer import (
     CHECKS,
     DISPLACEMENT,
     DROPS,
-    INFLOW,
-    NODE_DROPS,
     ORIFICES,
     VOLUME_SLOPE,
 )
@@ -27,6 +25,7 @@ from hma.machine import (
     statics,
 )
 from hma.machine.cylinders import MAIN_RELIEF, areas, cylinder_length
+from numpy_step import INFLOW, NODE_DROPS, _one_way
 from scenes import dig_pit
 
 DT = 0.005
@@ -564,7 +563,7 @@ def backward_check_flow(layer, start):
 def blocked_check_flow(layer):
     gain = layer._orifice_gain
     shut = CHECKS & (layer._edge_slope[:, ORIFICES] == 0.0) & (gain > 0.0)
-    flow = oil_layer._one_way(gain, check_drops(layer))[0]
+    flow = _one_way(gain, check_drops(layer))[0]
     return np.where(shut, flow, 0.0) / layer._pump_max[:, None]
 
 

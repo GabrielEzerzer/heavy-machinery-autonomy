@@ -12,16 +12,11 @@ from hma.hydraulics.layer import (
     CORRECTOR_PASSES,
     DEMAND_MAP,
     DISPLACEMENT,
-    DISPLACEMENT_T,
     DROPS,
-    IDENTITY,
-    INFLOW,
-    JOINT_INDEX,
     JOINTS,
     LEAKS,
     MASK_EXTEND,
     MASK_RETRACT,
-    NODE_DROPS,
     NODES,
     ORIFICES,
     PLAY_CLOSED,
@@ -29,7 +24,6 @@ from hma.hydraulics.layer import (
     REDO_FORCE,
     REDO_PASSES,
     RELIEF_BAND,
-    RELIEF_EDGES,
     RELIEF_MISS,
     RELIEF_STEP,
     RELIEFS,
@@ -37,10 +31,8 @@ from hma.hydraulics.layer import (
     STATE,
     SWING,
     SWING_BLEND,
-    SYSTEM_MAP,
     VOLUME_SLOPE,
     Hydraulics,
-    _one_way,
 )
 from hma.hydraulics.params import CURVE_SEGMENTS
 from hma.machine.cylinders import (
@@ -63,6 +55,24 @@ from hma.machine.tracks import (
     drives,
     used_power,
 )
+
+RELIEF_EDGES = np.arange(RELIEFS.start, RELIEFS.stop)
+JOINT_INDEX = np.arange(JOINTS)
+NODE_INCIDENCE = c.INCIDENCE[:, :NODES].copy()
+NODE_DROPS = NODE_INCIDENCE.T.copy()
+INFLOW = -NODE_INCIDENCE
+DISPLACEMENT_T = DISPLACEMENT.T.copy()
+SYSTEM_MAP = np.concatenate([
+    np.einsum("ei,ej->eij", NODE_INCIDENCE, NODE_INCIDENCE).reshape(len(c.INCIDENCE), -1),
+    np.eye(NODES * NODES)[::NODES + 1]])
+IDENTITY = np.eye(NODES)
+
+
+def _one_way(gain: np.ndarray, drop: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    x = np.maximum(drop, 0.0)
+    shifted = x + c.ROOT_SMOOTHING
+    chord = gain * x / (shifted * np.sqrt(shifted))
+    return chord * x, chord
 
 
 def seal_friction(head, rod, speed) -> np.ndarray:
@@ -139,6 +149,11 @@ def _settle(cond: np.ndarray, opened: np.ndarray, gain: np.ndarray, end: np.ndar
 
 
 class NumpyHydraulics(Hydraulics):
+    def _refresh(self, rows: np.ndarray) -> np.ndarray:
+        self._rhs[rows, :, 0] = self._edge_flow[rows] @ INFLOW
+        self._rhs[rows, :c.PUMPS, 0] += self._pump[rows]
+        return (self._weights[rows] @ SYSTEM_MAP).reshape(len(rows), NODES, NODES)
+
     def _openings(self) -> np.ndarray:
         head = self._command_head = (self._command_head + 1) % self._command_len
         self._commands[head] = self._held

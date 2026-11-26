@@ -104,25 +104,15 @@ def _counterweight_solid(model: mujoco.MjModel) -> _Solid:
 ORIFICES = slice(0, len(c.ORIFICES))
 RELIEFS = slice(len(c.ORIFICES), len(c.ORIFICES) + len(c.RELIEFS))
 LEAKS = slice(len(c.ORIFICES) + len(c.RELIEFS), len(c.INCIDENCE))
-RELIEF_EDGES = np.arange(RELIEFS.start, RELIEFS.stop)
 CHECKS = np.array([dst != c.TANK for _, dst, *_ in c.ORIFICES])
-JOINT_INDEX = np.arange(JOINTS)
 DROPS = c.INCIDENCE.T.copy()
-NODE_INCIDENCE = c.INCIDENCE[:, :NODES].copy()
-NODE_DROPS = NODE_INCIDENCE.T.copy()
-INFLOW = -NODE_INCIDENCE
 DISPLACEMENT = np.zeros((NODES, JOINTS))
 DISPLACEMENT[c.PUMPS::2, :] = -np.diag(c.AREA[:, 0])
 DISPLACEMENT[c.PUMPS + 1::2, :] = np.diag(c.AREA[:, 1])
-DISPLACEMENT_T = DISPLACEMENT.T.copy()
 DEMAND_MAP = np.concatenate([c.TABLES["demand"][0] - c.TABLES["demand"][1],
                              c.TABLES["demand"][1]])
-SYSTEM_MAP = np.concatenate([
-    np.einsum("ei,ej->eij", NODE_INCIDENCE, NODE_INCIDENCE).reshape(len(c.INCIDENCE), -1),
-    np.eye(NODES * NODES)[::NODES + 1]])
 MASK_EXTEND, MASK_RETRACT = c.DEMAND_MASK
 PLAY_CLOSED = 1.0 - 1e-9
-IDENTITY = np.eye(NODES)
 VOLUME_SLOPE = np.stack([c.STROKE_AREA[:, 0], -c.STROKE_AREA[:, 1]], axis=-1)
 VOLUME_CONSTANT = np.stack([-c.STROKE_AREA[:, 0] * c.STROKE[:, 0],
                             c.STROKE_AREA[:, 1] * c.STROKE[:, 1]], axis=-1)
@@ -141,13 +131,6 @@ CIRCUIT = (CIRCUIT_VALUES, EDGE_ENDS[0].copy(), EDGE_ENDS[1].copy(), CHECKS, c.G
            c.GEOMETRY_SCALE, c.GEOMETRY_BASE, REDO_FORCE)
 if len(CIRCUIT_VALUES) != kernels.C_SIZE or len(COUNTS) != kernels.P_SIZE:
     raise ImportError("the circuit constants do not match the compiled step")
-
-
-def _one_way(gain: np.ndarray, drop: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    x = np.maximum(drop, 0.0)
-    shifted = x + c.ROOT_SMOOTHING
-    chord = gain * x / (shifted * np.sqrt(shifted))
-    return chord * x, chord
 
 
 class Hydraulics:
@@ -550,11 +533,6 @@ class Hydraulics:
         self._clip_pressure_rows(reading)
         cursor += 1
         cursor[cursor == self.steps_per_decision] = 0
-
-    def _refresh(self, rows: np.ndarray) -> np.ndarray:
-        self._rhs[rows, :, 0] = self._edge_flow[rows] @ INFLOW
-        self._rhs[rows, :c.PUMPS, 0] += self._pump[rows]
-        return (self._weights[rows] @ SYSTEM_MAP).reshape(len(rows), NODES, NODES)
 
     def _true_rows(self, out: np.ndarray | None = None) -> np.ndarray:
         if out is None:
