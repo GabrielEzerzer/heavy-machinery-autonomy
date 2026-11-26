@@ -1,6 +1,6 @@
 """The propping task: settings, rungs, seeded draws, the tilt reference against time, and the
-baseline's tip path, which gives the reference tilt on level rigid ground when the tracks roll
-about their rear wheel and the tip stays pinned where it was put down."""
+baseline's tip path: put down, held where it touched while the tracks roll about their rear wheel
+on level rigid ground to give the reference tilt, then lifted back along the same vertical path."""
 
 from __future__ import annotations
 
@@ -47,16 +47,17 @@ class Settings:
     tilt_limit: float = math.radians(35.0)
     roll_limit: float = math.radians(10.0)
     sigma: float = math.radians(3.0)
-    floor: float = 0.1
-    weights: dict = field(default_factory=lambda: {"change": 0.03, "roll": 0.03, "slide": 0.03})
+    floor: float = 0.2
+    weights: dict = field(default_factory=lambda: {"change": 0.03, "roll": 0.03, "slide": 0.03,
+                                                   "landing": 0.05, "set_down": 0.05})
     roll_scale: float = math.radians(5.0)
     slide_scale: float = 0.05
     band: float = math.radians(3.0)
     hold_share: float = 0.8
     landing: float = 0.3
-    carry: float = 0.1
+    carry: float = 0.5
     still: float = 0.02
-    scale: float = 0.2
+    scale: float = 0.3
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,10 @@ class PropPath:
         task, side = self.task, float(BOOM_PIVOT[1])
         if t < task.place:
             z = self.height + (task.start_z - self.height) * (1.0 - _ease(t, task.place))
+            return np.array([task.prop_x, side, z]), task.pitch
+        down = task.length - task.final
+        if t > down:
+            z = self.height + (task.start_z - self.height) * _ease(t - down, task.place)
             return np.array([task.prop_x, side, z]), task.pitch
         theta = task.tilt(t)
         cx, cz, radius = self.pivot

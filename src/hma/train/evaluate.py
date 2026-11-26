@@ -1,6 +1,6 @@
-"""Scoring over the fixed development seeds, and throughput timing over worker processes. Seeds run
-in fixed scenes, are rerun when a neighbour's solver failure cuts them short, and each outcome is
-joined with its draws and grouped by thirds of every drawn parameter. Held-out seeds are refused."""
+"""Scoring over the fixed development seeds, and throughput timing. Seeds run in fixed scenes and
+are rerun when a neighbour's solver failure cuts them short; outcomes are grouped by thirds of every
+drawn parameter and compared seed by seed against the baseline. Held-out seeds are refused."""
 
 from __future__ import annotations
 
@@ -115,12 +115,45 @@ def score(rung: str, mode: str, seeds: list[int], machines: int, procs: int,
 
 def _summary(rows: list[dict]) -> str:
     if not rows:
-        return "| 0 | - | - | - |"
+        return "| 0 | - | - | - | - |"
     passed = 100.0 * np.mean([r["passed"] for r in rows])
+    share = float(np.mean([r["hold_share"] for r in rows]))
     error = math.degrees(float(np.mean([r["tilt_error"] for r in rows])))
     causes = Counter(r["cause"] for r in rows if r["cause"])
     ends = ", ".join(f"{c} {causes[c]}" for c in CAUSES if causes[c]) or "none"
-    return f"| {len(rows)} | {passed:.0f}% | {error:.2f} | {ends} |"
+    return f"| {len(rows)} | {passed:.0f}% | {share:.2f} | {error:.2f} | {ends} |"
+
+
+def _mean_and_error(values: np.ndarray) -> str:
+    error = values.std(ddof=1) / math.sqrt(len(values)) if len(values) > 1 else float("nan")
+    return f"{values.mean():+.3f} ± {error:.3f}"
+
+
+def paired(rows: list[dict], reference: str = "baseline") -> list[str]:
+    base = {r["seed"]: r for r in rows if r["controller"] == reference}
+    lines = []
+    for controller in sorted({r["controller"] for r in rows} - {reference}):
+        pairs = [(base[r["seed"]], r) for r in rows
+                 if r["controller"] == controller and r["seed"] in base]
+        if not pairs:
+            continue
+        share = np.array([c["hold_share"] - b["hold_share"] for b, c in pairs])
+        error = np.degrees([c["tilt_error"] - b["tilt_error"] for b, c in pairs])
+        flips = Counter((b["passed"], c["passed"]) for b, c in pairs)
+        lines += [f"### {controller} against {reference}, seed by seed", "",
+                  f"{len(pairs)} seeds. Change in hold share in band "
+                  f"{_mean_and_error(share)}; change in tilt error {_mean_and_error(error)} deg "
+                  "(mean ± standard error of the paired differences). Passes gained "
+                  f"{flips[(False, True)]}, lost {flips[(True, False)]}.", "",
+                  f"| seed | pass ({reference}, {controller}) | hold share in band | "
+                  "tilt error (deg) |", "|---|---|---|---|"]
+        for b, c in pairs:
+            lines.append(f"| {b['seed']} | {'yes' if b['passed'] else 'no'}, "
+                         f"{'yes' if c['passed'] else 'no'} | {b['hold_share']:.2f}, "
+                         f"{c['hold_share']:.2f} | {math.degrees(b['tilt_error']):.2f}, "
+                         f"{math.degrees(c['tilt_error']):.2f} |")
+        lines.append("")
+    return lines
 
 
 def _value(row: dict, name: str) -> float:
@@ -134,10 +167,10 @@ def table(rows: list[dict]) -> str:
         lines += [f"### {controller}, rung {mine[0]['rung']}", "",
                   f"Scene size {mine[0]['scene_size']} machines; each seed keeps the slot its "
                   "place in the seed list gives it.", "",
-                  "| group | episodes | pass | tilt error (deg) | early ends |",
-                  "|---|---|---|---|---|", "| all " + _summary(mine), ""]
-        lines += ["| drawn parameter (range) | episodes | pass | tilt error (deg) | early ends |",
-                  "|---|---|---|---|---|"]
+                  "| group | episodes | pass | hold share in band | tilt error (deg) | "
+                  "early ends |", "|---|---|---|---|---|---|", "| all " + _summary(mine), ""]
+        lines += ["| drawn parameter (range) | episodes | pass | hold share in band | "
+                  "tilt error (deg) | early ends |", "|---|---|---|---|---|---|"]
         for name in DRAWN:
             values = np.array([_value(r, name) for r in mine])
             if np.ptp(values) == 0:
@@ -150,7 +183,7 @@ def table(rows: list[dict]) -> str:
                 label = f"{name} {edges[k]:.3g} to {edges[k + 1]:.3g}"
                 lines.append(f"| {label} " + _summary(picked))
         lines.append("")
-    return "\n".join(lines)
+    return "\n".join(lines + paired(rows))
 
 
 def write(rows: list[dict], out: Path, name: str) -> Path:

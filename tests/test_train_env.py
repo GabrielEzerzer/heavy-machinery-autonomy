@@ -9,7 +9,7 @@ from hma.hydraulics import NOMINAL, RANGES, BaseController, Hydraulics, draw_mac
 from hma.hydraulics.params import LITRE
 from hma.machine import inverse_kinematics, load_scene, machine_prefix
 from hma.train import footing
-from hma.train.scene import FIELDS, OBS_HIGH, OBS_LOW, PropScene
+from hma.train.scene import OBS_HIGH, OBS_LOW, PropScene
 from hma.train.task import (
     DEV_BASE,
     HELD_OUT_BASE,
@@ -90,20 +90,21 @@ def test_save_restore_and_replay_is_bit_for_bit():
 
 
 def test_resetting_one_machine_leaves_its_neighbours_bit_for_bit():
-    actions = np.random.default_rng(1).uniform(-0.3, 0.3, (60, 3, 4))
+    actions = np.random.default_rng(1).uniform(-0.3, 0.3, (120, 4, 4))
+    others = [0, 2, 3]
 
     def neighbours(reset_middle):
-        scene = PropScene(3, "ground")
-        for i in range(3):
+        scene = PropScene(4, "ground")
+        for i in range(4):
             scene.reset(i, SEED + i)
         seen = []
         for k, a in enumerate(actions):
-            if reset_middle and k in (17, 41):
+            if reset_middle and k and k % 6 == 0:
                 scene.reset(1, 555 + k)
             obs, reward, done, _ = scene.step(a)
             for i in np.flatnonzero(done):
                 scene.reset(i, 900 + i)
-            seen.append((obs[[0, 2]].copy(), reward[[0, 2]].copy()))
+            seen.append((obs[others].copy(), reward[others].copy()))
         return seen, scene.layer.redos
 
     alone, _ = neighbours(False)
@@ -256,35 +257,64 @@ def test_period_readings_are_delayed_means_with_one_full_size_noise_draw_each(la
 
 
 @pytest.mark.train_extra
-def test_an_untrained_residual_policy_reproduces_the_baseline_episode():
+def test_an_untrained_residual_policy_sends_the_baseline_plus_its_scaled_action():
     from stable_baselines3.common.vec_env import VecNormalize
 
-    from hma.train.__main__ import EGLI_HUTTER, SPREAD, build_model
+    from hma.train.__main__ import COMMAND_NOISE, EGLI_HUTTER, SPREAD, build_model
     from hma.train.vec import SceneVecEnv
 
-    assert SPREAD["residual"] * Settings().scale == pytest.approx(0.02)
-    pitch = sum(count for name, count, *_ in FIELDS[:[f[0] for f in FIELDS].index("tilt")])
-
-    def episode(untrained):
-        env = SceneVecEnv(1, "nominal", "residual", 0, seeds=[DEV_BASE + 4])
-        venv = VecNormalize(env, norm_obs=True, norm_reward=False, gamma=EGLI_HUTTER["gamma"])
-        model = build_model(venv, 128, 0, SPREAD["residual"]) if untrained else None
-        if model:
-            spread = model.policy.log_std.exp().detach().numpy()
-            assert np.allclose(spread, SPREAD["residual"])
-        obs, largest, tilts = venv.reset(), 0.0, []
+    scale = Settings().scale
+    assert SPREAD["residual"] * scale == pytest.approx(COMMAND_NOISE)
+    env = SceneVecEnv(1, "nominal", "residual", 0, seeds=[DEV_BASE + 4])
+    venv = VecNormalize(env, norm_obs=True, norm_reward=False, gamma=EGLI_HUTTER["gamma"])
+    model = build_model(venv, 128, 0, SPREAD["residual"])
+    assert np.allclose(model.policy.log_std.exp().detach().numpy(), SPREAD["residual"])
+    scene, baselines, sent = env.scene, [], []
+    plain, act = scene.baseline, scene.layer.act
+    scene.baseline = lambda: baselines.append(plain()) or baselines[-1]
+    scene.layer.act = lambda commands: sent.append(np.copy(commands)) or act(commands)
+    obs, largest, actions = venv.reset(), 0.0, []
+    for deterministic in (True, False):
         while True:
-            action = (model.predict(obs, deterministic=True)[0] if model
-                      else np.zeros((1, 4), np.float32))
-            largest = max(largest, float(np.abs(action).max()))
-            obs, _, done, info = venv.step(action)
-            tilts.append(env.scene.history[0, -1, pitch] * np.pi / 2)
+            action = model.predict(obs, deterministic=deterministic)[0]
+            if deterministic:
+                largest = max(largest, float(np.abs(action).max()))
+            actions.append(np.clip(np.asarray(action, float), -1.0, 1.0))
+            obs, _, done, _ = venv.step(action)
             if done[0]:
-                return info[0], largest, np.array(tilts)
-
-    policy, largest, policy_tilts = episode(True)
-    baseline, _, baseline_tilts = episode(False)
+                break
     assert largest <= 0.02
-    assert (policy["cause"], policy["passed"]) == (baseline["cause"], baseline["passed"])
-    assert abs(policy["tilt_error"] - baseline["tilt_error"]) <= np.radians(0.3)
-    assert np.abs(policy_tilts - baseline_tilts).max() <= np.radians(0.5)
+    assert len(sent) == len(baselines) == len(actions) > 300
+    for b, a, u in zip(baselines, actions, sent, strict=True):
+        assert np.array_equal(u, np.clip(b + scale * a, -1.0, 1.0))
+
+
+def test_period_means_clip_each_pressure_sample_before_averaging():
+    model = load_scene(1, weld=True)
+    layer = Hydraulics(model, mujoco.MjData(model), [NOMINAL])
+    layer._mean_noise[:] = 0.0
+    layer._latency_steps[:] = 0
+    layer._clean_head = layer._clean_len - 1
+    signs = np.where(np.arange(layer._clean_len) % 2 == 0, -1.0, 1.0)
+    layer._clean[:, 2:] = 1e6 * signs[:, None, None, None]
+    assert np.allclose(layer.observe_mean().pressures, 5e5)
+
+
+def test_no_observation_reads_the_valve_delay_lag_or_deadband():
+    machine = draw_machine(SEED)
+    slower = replace(machine, delay=machine.delay * 0.5, lag=machine.lag * 0.5,
+                     deadband=machine.deadband * 0.5)
+
+    def observed(drawn):
+        class Fixed(PropScene):
+            def draw(self, index, seed):
+                _, ground, task = super().draw(index, seed)
+                return drawn, ground, task
+
+        scene = Fixed(1, "machines", mode="direct")
+        seen = [scene.reset(0, SEED)]
+        for _ in range(30):
+            seen.append(scene.step(np.zeros((1, 4)))[0][0])
+        return np.array(seen)
+
+    assert np.array_equal(observed(machine), observed(slower))

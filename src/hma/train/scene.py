@@ -90,6 +90,16 @@ def _wrap(angle: np.ndarray) -> np.ndarray:
     return np.arctan2(np.sin(angle), np.cos(angle))
 
 
+def reward(s: Settings, error, change, roll, slide, landing, shortfall) -> np.ndarray:
+    w = s.weights
+    return (s.floor + (1.0 - s.floor) * np.exp(-np.asarray(error) / s.sigma)
+            - w["change"] * np.minimum(change, 1.0)
+            - w["roll"] * np.minimum(np.asarray(roll) / s.roll_scale, 1.0)
+            - w["slide"] * np.minimum(np.asarray(slide) / s.slide_scale, 1.0)
+            - w["landing"] * np.minimum(np.asarray(landing) / s.landing, 1.0)
+            - w["set_down"] * np.clip(shortfall, 0.0, 1.0))
+
+
 class PropScene:
     def __init__(self, n: int, rung: str = "nominal", mode: str = "residual",
                  settings: Settings | None = None):
@@ -388,6 +398,10 @@ class PropScene:
         self.rest_load[aloft] += load[aloft]
         self.rest_count += aloft
         self.touched = touched
+        rest = self.rest_load / np.maximum(self.rest_count, 1)[:, None]
+        carried = np.min(np.divide(load, rest, out=np.zeros_like(rest), where=rest > 0.0), axis=1)
+        settling = times[:, -1] > np.array([task.length - task.final for task in self.tasks])
+        shortfall = np.where(settling, 1.0 - np.minimum(carried / s.carry, 1.0), 0.0)
         self.k += 1
         self.steps_total += self.steps
         self.err_total += err_sum
@@ -395,11 +409,7 @@ class PropScene:
         mean_err = err_sum / self.steps
         change = np.abs(commands - self.sent).mean(1) / 2.0
         self.sent = commands
-        w = s.weights
-        reward = (s.floor + (1.0 - s.floor) * np.exp(-mean_err / s.sigma)
-                  - w["change"] * change
-                  - w["roll"] * np.minimum(roll_sum / self.steps / s.roll_scale, 1.0)
-                  - w["slide"] * np.minimum(slide / s.slide_scale, 1.0))
+        earned = reward(s, mean_err, change, roll_sum / self.steps, slide, self.landing, shortfall)
         for i in range(n):
             failed[i] |= not (np.all(np.isfinite(data.qpos[self._own_q[i]]))
                               and np.all(np.isfinite(self.layer._pressure[i])))
@@ -425,20 +435,18 @@ class PropScene:
             obs[i] = self.history[i].ravel()
             end = self.k[i] * self.period >= self.tasks[i].length - 1e-9
             if causes[i] is not None or cut[i]:
-                reward[i] = 0.0
+                earned[i] = 0.0
             if causes[i] is not None or cut[i] or end:
                 terminated[i] = True
                 self.done[i] = True
                 self.active[i] = False
-                rest = self.rest_load[i] / max(int(self.rest_count[i]), 1)
-                carried = float(np.min(np.divide(load[i], rest, out=np.zeros_like(rest),
-                                                 where=rest > 0.0)))
                 speed = float(np.linalg.norm(motion[i], axis=0).max())
-                infos[i] = self.outcome(i, causes[i], pitch[i] - self.pitch0[i], carried, speed)
+                infos[i] = self.outcome(i, causes[i], pitch[i] - self.pitch0[i],
+                                        float(carried[i]), speed)
                 infos[i]["passed"] &= not cut[i]
                 infos[i]["truncated"] = causes[i] is None
                 infos[i]["cut_short"] = bool(cut[i])
-        return obs, reward, terminated, infos
+        return obs, earned, terminated, infos
 
     def outcome(self, index: int, cause: str | None, final_tilt: float, carried: float,
                 speed: float) -> dict:

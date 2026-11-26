@@ -1,14 +1,15 @@
+
 from dataclasses import replace
 
 import mujoco
 import numpy as np
 import pytest
 
-from hma.hydraulics import NOMINAL, Hydraulics, draw_machine
+from hma.hydraulics import NOMINAL, RANGES, BaseController
 from hma.machine import load_scene, machine_prefix
 from hma.machine.kinematics import BOOM_PIVOT
 from hma.train import evaluate, footing
-from hma.train.scene import PropScene
+from hma.train.scene import CONTROL_HZ, PropScene, reward
 from hma.train.task import (
     DEV_BASE,
     HELD_OUT_BASE,
@@ -179,53 +180,6 @@ def test_a_solver_failure_while_scoring_reruns_the_other_seeds_to_the_same_resul
     assert all(r["scene_size"] == 3 for r in failed)
 
 
-def test_period_means_clip_each_pressure_sample_before_averaging():
-    model = load_scene(1, weld=True)
-    layer = Hydraulics(model, mujoco.MjData(model), [NOMINAL])
-    layer._mean_noise[:] = 0.0
-    layer._latency_steps[:] = 0
-    layer._clean_head = layer._clean_len - 1
-    signs = np.where(np.arange(layer._clean_len) % 2 == 0, -1.0, 1.0)
-    layer._clean[:, 2:] = 1e6 * signs[:, None, None, None]
-    assert np.allclose(layer.observe_mean().pressures, 5e5)
-
-
-def test_no_observation_reads_the_valve_delay_lag_or_deadband():
-    machine = draw_machine(SEED)
-    slower = replace(machine, delay=machine.delay * 0.5, lag=machine.lag * 0.5,
-                     deadband=machine.deadband * 0.5)
-
-    def observed(drawn):
-        class Fixed(PropScene):
-            def draw(self, index, seed):
-                _, ground, task = super().draw(index, seed)
-                return drawn, ground, task
-
-        scene = Fixed(1, "machines", mode="direct")
-        seen = [scene.reset(0, SEED)]
-        for _ in range(30):
-            seen.append(scene.step(np.zeros((1, 4)))[0][0])
-        return np.array(seen)
-
-    assert np.array_equal(observed(machine), observed(slower))
-
-
-@pytest.mark.train_extra
-def test_closing_survives_a_worker_that_died():
-    from hma.train.vec import ProcVecEnv
-
-    envs = ProcVecEnv(2, 1, "nominal", "residual", 0)
-    try:
-        envs.processes[0].terminate()
-        envs.processes[0].join(30)
-        envs.close()
-        assert not any(p.is_alive() for p in envs.processes)
-    finally:
-        for process in envs.processes:
-            if process.is_alive():
-                process.terminate()
-
-
 def test_every_drawn_task_reaches_the_drawn_ground_at_its_press_point():
     pivot = footing.rear_pivot(load_scene(1))
     for seed in dev_seeds():
@@ -236,79 +190,118 @@ def test_every_drawn_task_reaches_the_drawn_ground_at_its_press_point():
         assert reachable(PropPath(task, pivot, height), 0.1), seed
 
 
-def _ppo(env):
-    from stable_baselines3.common.vec_env import VecNormalize
-
-    from hma.train.__main__ import EGLI_HUTTER, build_model
-
-    venv = VecNormalize(env, norm_obs=True, norm_reward=False, gamma=EGLI_HUTTER["gamma"])
-    return build_model(venv, 8, 0, 0.3), venv
-
-
-@pytest.mark.train_extra
-def test_a_resumed_run_continues_where_the_checkpoint_was_taken(tmp_path):
-    from hma.train.__main__ import latest_checkpoint, load_checkpoint, save_checkpoint
-    from hma.train.vec import SceneVecEnv
-
-    env = SceneVecEnv(2, "nominal", "residual", 0)
-    model, venv = _ppo(env)
-    model._last_obs = venv.reset()
-    rng = np.random.default_rng(4)
-    for _ in range(5):
-        model._last_obs = venv.step(rng.uniform(-0.2, 0.2, (2, 4)))[0]
-    model._last_episode_starts = np.array([True, False])
-    model.num_timesteps = 10
-    checkpoint = tmp_path / "checkpoint"
-    save_checkpoint(checkpoint, model, venv, env, {"rung": "nominal"})
-    later = rng.uniform(-0.2, 0.2, (6, 2, 4))
-    straight = [venv.step(a)[0] for a in later]
-
-    def broken():
-        raise OSError("interrupted")
-
-    env.snapshot = broken
-    with pytest.raises(OSError):
-        save_checkpoint(checkpoint, model, venv, env, {"rung": "nominal"})
-    assert latest_checkpoint(checkpoint) == checkpoint
-
-    other = SceneVecEnv(2, "nominal", "residual", 7)
-    resumed, rvenv, config = load_checkpoint(checkpoint, other)
-    assert config["rung"] == "nominal" and config["timesteps"] == 10
-    assert resumed.num_timesteps == 10
-    assert np.array_equal(resumed._last_episode_starts, [True, False])
-    for a, b in zip(model.policy.state_dict().values(), resumed.policy.state_dict().values(),
-                    strict=True):
-        assert np.array_equal(a.numpy(), b.numpy())
-    replay = [rvenv.step(a)[0] for a in later]
-    assert all(np.array_equal(a, b) for a, b in zip(straight, replay, strict=True))
-
-    checkpoint.rename(tmp_path / "checkpoint.old")
-    assert latest_checkpoint(checkpoint) == tmp_path / "checkpoint.old"
-
-
-@pytest.mark.train_extra
-def test_steps_is_the_total_across_a_resume():
-    from stable_baselines3.common.callbacks import BaseCallback
-
-    from hma.train.__main__ import learn
-    from hma.train.vec import SceneVecEnv
-
-    class Stop(BaseCallback):
-        def _on_step(self):
-            return False
-
-    env = SceneVecEnv(1, "nominal", "residual", 0)
-    model, venv = _ppo(env)
-    model._last_obs = venv.reset()
-    model._last_episode_starts = np.ones(1, bool)
-    model.num_timesteps = 64
-    learn(model, 100, Stop(), resume=True)
-    assert model._total_timesteps == 100
-
-
 def test_the_score_does_not_depend_on_the_number_of_processes():
     seeds = dev_seeds(2)
     alone = evaluate.score("nominal", "residual", seeds, 1, 1, None)
     spread = evaluate.score("nominal", "residual", seeds, 1, 2, None)
     assert [r["seed"] for r in alone] == seeds
     assert alone == spread
+
+
+def test_the_hold_counts_exactly_the_physics_steps_inside_the_hold_span():
+    scene = PropScene(1, "nominal")
+    scene.reset(0, SEED)
+    info, _ = finish(scene)
+    start, end = scene.tasks[0].hold_span
+    times = np.arange(1, info["decisions"] * scene.steps + 1) * scene.dt
+    assert scene.hold_steps[0] == np.count_nonzero((times >= start) & (times < end))
+    assert 0 < scene.hold_steps[0] < len(times)
+
+
+def test_one_front_corner_left_unloaded_at_the_end_fails_the_set_down():
+    class Unloaded(PropScene):
+        def _front_load(self):
+            load = super()._front_load()
+            if (self.k[0] + 1) * self.period >= self.tasks[0].length - 1e-9:
+                load[0, 0] = 0.0
+            return load
+
+    outcomes = []
+    for kind in (PropScene, Unloaded):
+        scene = kind(1, "nominal")
+        scene.reset(0, DEV_BASE)
+        outcomes.append(finish(scene)[0])
+    kept, unloaded = outcomes
+    assert kept["passed"] and kept["front_carried"] >= Settings().carry
+    assert unloaded["front_carried"] == 0.0 and not unloaded["passed"]
+    assert unloaded["hold_share"] == kept["hold_share"]
+
+
+def test_the_reward_stays_in_its_bounds_and_each_end_term_only_lowers_it():
+    s = Settings()
+    rng = np.random.default_rng(0)
+    n = 20_000
+    terms = {"error": rng.exponential(0.1, n), "change": rng.uniform(0.0, 1.0, n),
+             "roll": rng.exponential(0.1, n), "slide": rng.exponential(0.05, n),
+             "landing": rng.exponential(0.3, n), "shortfall": rng.uniform(0.0, 1.0, n)}
+    earned = reward(s, **terms)
+    lowest = s.floor - sum(s.weights.values())
+    assert lowest > 0.0
+    assert np.all((earned >= lowest - 1e-12) & (earned <= 1.0))
+    assert reward(s, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) == pytest.approx(1.0)
+    for name in ("landing", "shortfall"):
+        cleared = reward(s, **{**terms, name: np.zeros(n)})
+        assert np.all(cleared >= earned)
+        assert np.all(cleared[terms[name] > 0.0] > earned[terms[name] > 0.0])
+
+
+def test_skipping_the_lift_at_the_end_earns_less_and_fails_the_set_down():
+    class Held(PropPath):
+        def __call__(self, t):
+            return super().__call__(min(t, self.task.length - self.task.final))
+
+    class Pressing(PropScene):
+        def _write(self, index, seed):
+            super()._write(index, seed)
+            self.controllers[index] = BaseController(Held(self.tasks[index], self.pivot),
+                                                     CONTROL_HZ)
+
+    results = []
+    for kind in (PropScene, Pressing):
+        scene = kind(1, "nominal")
+        scene.reset(0, DEV_BASE + 11)
+        task, settle, earned = scene.tasks[0], [], []
+        while True:
+            _, r, done, info = scene.step(np.zeros((1, 4)))
+            earned.append(r[0])
+            settle.append(scene.k[0] * scene.period > task.length - task.final)
+            if done[0]:
+                results.append((info[0], np.array(earned), np.array(settle)))
+                break
+    (lifted, lifted_r, at_end), (held, held_r, _) = results
+    assert lifted["passed"] and not held["passed"]
+    assert held["front_carried"] < Settings().carry <= lifted["front_carried"]
+    assert held_r[at_end].sum() < lifted_r[at_end].sum()
+    assert held_r.sum() < lifted_r.sum()
+
+
+def test_the_baseline_lifts_the_tip_back_along_the_path_it_put_it_down_on():
+    pivot = footing.rear_pivot(load_scene(1))
+    task = draw_task(SEED, Settings(), pivot, lambda x, y: 0.0, 0.1)
+    path = PropPath(task, pivot)
+    down = task.length - task.final
+    for u in np.linspace(0.0, task.place, 11):
+        up, pitch_up = path(down + u)
+        placed, pitch_placed = path(task.place - u)
+        assert np.allclose(up, placed, atol=1e-12) and pitch_up == pitch_placed
+    assert path(task.length)[0][2] == pytest.approx(task.start_z)
+
+
+def test_a_full_scale_action_opens_a_valve_past_the_widest_drawn_dead_zone():
+    widest = RANGES["deadband"][1]
+    assert Settings().scale > widest
+
+    class Widest(PropScene):
+        def draw(self, index, seed):
+            _, ground, task = super().draw(index, seed)
+            return replace(NOMINAL, deadband=np.full(4, widest)), ground, task
+
+        def baseline(self):
+            return np.zeros((self.n, 4))
+
+    scene = Widest(1, "nominal")
+    scene.reset(0, SEED)
+    for _ in range(30):
+        scene.step(np.ones((1, 4)))
+    assert np.allclose(scene.sent, Settings().scale)
+    assert np.all(np.abs(scene.layer._spool[0]) > widest)

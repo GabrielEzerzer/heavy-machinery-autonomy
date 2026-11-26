@@ -21,7 +21,8 @@ REPO = Path(__file__).resolve().parents[3]
 EGLI_HUTTER = {"gamma": 0.97, "learning_rate": 1e-3, "n_epochs": 10}
 NET = [128, 128]
 MINI_BATCHES = 4
-SPREAD = {"residual": 0.1, "direct": 1.0}
+COMMAND_NOISE = 0.02
+SPREAD = {"residual": COMMAND_NOISE / Settings().scale, "direct": 1.0}
 CONFIG = ("rung", "mode", "procs", "machines", "seed", "spread", "scale")
 SMOKE = {"procs": 2, "machines": 2, "n_steps": 16, "steps": 256, "dev_size": 4, "seconds": 2.0}
 
@@ -131,6 +132,20 @@ def read_config(path: Path) -> dict:
     return json.loads((path / "config.json").read_text(encoding="utf-8"))
 
 
+def resume_seed(seed: int, timesteps: int) -> int:
+    return int(np.random.SeedSequence([seed, timesteps]).generate_state(1)[0])
+
+
+def trim_curve(path: Path, timesteps: int) -> None:
+    if not path.exists():
+        return
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    kept = rows[:1] + [row for row in rows[1:] if int(row[0]) <= timesteps]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(kept)
+
+
 def load_checkpoint(path: Path, envs):
     from stable_baselines3 import PPO
 
@@ -138,6 +153,7 @@ def load_checkpoint(path: Path, envs):
         venv = pickle.load(f)
     venv.set_venv(envs)
     model = PPO.load(path / "model.zip", env=venv, device="cpu")
+    model.set_random_seed(resume_seed(model.seed, model.num_timesteps))
     with open(path / "scenes.pkl", "rb") as f:
         raw = envs.restore(pickle.load(f))
     with open(path / "starts.pkl", "rb") as f:
@@ -167,9 +183,11 @@ def train(args) -> None:
         config = read_config(found)
         for key in CONFIG:
             setattr(args, key, config.get(key))
+        trim_curve(out / "curve.csv", config["timesteps"])
     if args.spread is None:
-        args.spread = SPREAD[args.mode]
-    envs = ProcVecEnv(args.procs, args.machines, args.rung, args.mode, args.seed,
+        args.spread = COMMAND_NOISE / args.scale if args.mode == "residual" else SPREAD[args.mode]
+    envs = ProcVecEnv(args.procs, args.machines, args.rung, args.mode,
+                      resume_seed(args.seed, config["timesteps"]) if resume else args.seed,
                       Settings(scale=args.scale))
     print(f"workers: {envs.pids}", flush=True)
     try:
@@ -248,8 +266,8 @@ def main(argv: list[str] | None = None) -> None:
     train_args.add_argument("--minutes", type=float, default=None, help="stop after this time")
     train_args.add_argument("--every", type=int, default=10, help="checkpoint every N rollouts")
     train_args.add_argument("--spread", type=float, default=None,
-                            help="starting action spread (default per mode: "
-                                 f"{SPREAD['residual']} residual, {SPREAD['direct']} direct)")
+                            help="starting action spread (default: "
+                                 f"{COMMAND_NOISE} / scale residual, {SPREAD['direct']} direct)")
     train_args.add_argument("--seed", type=int, default=0)
     train_args.add_argument("--resume", action="store_true",
                             help="continue from --out; --steps stays the total")
