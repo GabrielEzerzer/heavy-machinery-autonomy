@@ -55,6 +55,7 @@ from hma.machine.model import (
 )
 from hma.machine.tracks import (
     BELT_ROLLERS,
+    BELT_X,
     FRICTION,
     FRICTION_RANGE,
     GAUGE,
@@ -212,17 +213,18 @@ def test_a_ground_edge_under_a_track_becomes_the_tipping_line(name, factor):
     assert (angle > TIPPED) if factor > 1 else (angle < TIPPED), angle
 
 
-BETWEEN = (WHEEL_X[-2] + WHEEL_X[-1]) / 2
+WORST_EDGE = 1.20
 
 
-def between_wheels(factor, edit=None):
-    return tipping_about(Ground(boxes=(Box(BETWEEN - 6.0, 0.0, 0.0, 6.0, 6.0, 1.0),)),
-                         chart_pose(1.5, 6.0), [BETWEEN, 0.0, 0.0], [0.0, 1.0, 0.0], factor, edit)
+def worst_edge(factor):
+    return tipping_about(Ground(boxes=(Box(WORST_EDGE - 6.0, 0.0, 0.0, 6.0, 6.0, 1.0),)),
+                         chart_pose(1.5, 6.0), [WORST_EDGE, 0.0, 0.0], [0.0, 1.0, 0.0], factor)
 
 
-def test_an_edge_between_two_wheels_holds_the_machine_to_0_93_of_the_hand_tipping_load():
-    assert between_wheels(0.93) < TIPPED
-    assert between_wheels(1.0) > TIPPED
+def test_an_edge_between_a_wheel_and_a_belt_roller_holds_0_85_of_the_hand_tipping_load():
+    assert WHEEL_X[-2] < WORST_EDGE < BELT_X[-1]
+    assert worst_edge(0.85) < TIPPED
+    assert worst_edge(0.87) > TIPPED
 
 
 def propped(mu):
@@ -520,6 +522,8 @@ FEATURES = {
 }
 FRICTION_ANGLE = math.atan(FRICTION)
 SET_DOWN = math.radians(10.0)
+TILT_CREEP = 2e-3
+KERB_SLIP = 0.025
 
 
 def tilted(feature, across, angle, edit=None):
@@ -557,7 +561,8 @@ def tilted(feature, across, angle, edit=None):
 @pytest.mark.parametrize("feature", list(FEATURES))
 def test_over_a_bump_or_kerb_the_brakes_hold_below_the_friction_angle_and_slide_above(
         feature, across):
-    _, held, bare = tilted(feature, across, 0.97 * FRICTION_ANGLE)
+    creep, held, bare = tilted(feature, across, 0.97 * FRICTION_ANGLE)
+    assert creep < (KERB_SLIP if (feature, across) == ("kerb", False) else TILT_CREEP)
     assert held < 1e-3
     assert bare == 0.0
     _, slid, _ = tilted(feature, across, 1.03 * FRICTION_ANGLE)
@@ -567,6 +572,12 @@ def test_over_a_bump_or_kerb_the_brakes_hold_below_the_friction_angle_and_slide_
 def frictionless_belt(model, data):
     belts = [model.geom(P + belt_name(side, k)).id for side in SIDES for k in range(BELT_ROLLERS)]
     model.pair_dim[np.isin(model.pair_geom1, belts) | np.isin(model.pair_geom2, belts)] = 1
+
+
+def free_belt(model, data):
+    belts = [model.joint(P + belt_name(side, k)).id for side in SIDES for k in range(BELT_ROLLERS)]
+    coupled = model.eq_type == mujoco.mjtEq.mjEQ_JOINT
+    model.eq_active0[coupled & np.isin(model.eq_obj1id, belts)] = 0
 
 
 def test_a_welded_machine_that_would_be_buried_is_refused():
@@ -855,6 +866,9 @@ def test_each_broken_piece_of_physics_fails_its_check(monkeypatch):
     assert brake_drift(no_brake) > 1e-2
 
     assert sum(tilted("kerb", False, 0.97 * FRICTION_ANGLE, frictionless_belt)[:2]) > 0.1
+    assert tilted("kerb", False, 0.97 * FRICTION_ANGLE, free_belt)[0] > KERB_SLIP
+    assert tilted("bump", True, 0.97 * FRICTION_ANGLE, free_belt)[0] > TILT_CREEP
+    assert tilted("kerb", True, 0.97 * FRICTION_ANGLE, free_belt)[1] > 1e-3
 
     def friction_damping(b):
         def edit(model, data):
