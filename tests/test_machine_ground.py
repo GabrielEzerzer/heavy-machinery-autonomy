@@ -29,6 +29,7 @@ from hma.machine.measure import (
     CASES,
     LOAD_AWAY,
     TIPPED,
+    TRAVEL_POSE,
     base_frame,
     chart_pose,
     hand_tipping_load,
@@ -226,17 +227,25 @@ def test_a_machine_propped_on_its_bucket_stays_put_with_its_brakes_far_from_slip
 
 def wall_push(edit=None):
     wall = Box(4.0, 0.0, 0.0, 0.5, 3.0, 1.2)
-    model, data = machine(Ground(boxes=(wall,)))
+    model = load_scene(1)
+    apply_ground(model, 0, Ground(boxes=(wall,)))
+    data = mujoco.MjData(model)
     if edit is not None:
         edit(model, data)
+    layer = Hydraulics(model, data, [NOMINAL])
+    layer.reset(0, NOMINAL, TRAVEL_POSE)
+    place_load(model, data, 0, *LOAD_AWAY)
+    layer.act(np.zeros((1, 4)))
     data.ctrl[travel(model)] = TRAVEL_SPEED
-    run(model, data, 3.0)
+    for _ in range(round(3.0 / model.opt.timestep)):
+        layer.step()
     start = data.qpos[0]
-    run(model, data, 3.0)
+    for _ in range(round(3.0 / model.opt.timestep)):
+        layer.step()
     weight = model.body_subtreemass[model.body(P + "base").id] * G
     pushes = []
-    for _ in range(200):
-        step(model, data)
+    for _ in range(round(8.0 / model.opt.timestep)):
+        layer.step()
         pushes.append(drive_forces(model, data)[0].sum())
     return data.qpos[0] - start, data.qpos[0] + OUTLINE[1] - wall.x + wall.half_length, (
         np.mean(pushes) / (FRICTION * weight))

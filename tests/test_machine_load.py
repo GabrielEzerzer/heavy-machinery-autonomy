@@ -407,7 +407,7 @@ def test_heaviest_and_tallest_draws_are_hooked_and_lifted_clear_over_the_side():
         anchor = data.xanchor[model.joint(P + "bucket").id]
         assert anchor[2] <= height and math.hypot(anchor[0], anchor[1]) <= radius[height]
         layer.act(np.zeros((1, 4)))
-        run(model, data, 1.0)
+        run(model, data, 4.0)
         tension = []
         for _ in range(round(1.0 / model.opt.timestep)):
             layer.step()

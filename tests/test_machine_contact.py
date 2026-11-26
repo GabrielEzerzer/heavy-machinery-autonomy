@@ -407,18 +407,20 @@ def bounce(model, data, layer, seconds):
     start, end = 1.0, 3.3
     kept = (t > start) & (t < end) & (swing[peaks] > 0.01)
     window = slice(round(start / model.opt.timestep), round(end / model.opt.timestep))
-    return np.polyfit(t[kept], swing[peaks][kept], 1)[0], np.median(np.diff(t[kept])), np.mean(
-        boom_seals[window])
+    return t[kept], swing[peaks][kept], np.median(np.diff(t[kept])), np.mean(boom_seals[window])
 
 
 def test_hung_load_bounce_dies_at_the_rate_the_boom_seals_give_by_hand(monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(oil_layer, "seal_friction", lambda head, rod, speed: np.zeros(np.shape(head)))
         model, data = hung(3000.0)
-        oil_only, half_period, _ = bounce(model, data, held(model, data), 3.5)
+        t, peaks, half_period, _ = bounce(model, data, held(model, data), 3.5)
+    oil_only = np.polyfit(t, np.log(peaks), 1)[0]
     model, data = hung(3000.0)
     layer = held(model, data)
-    with_seals, _, seals = bounce(model, data, layer, 3.5)
+    t, peaks, _, seals = bounce(model, data, layer, 3.5)
+    fade = np.exp(oil_only * (t - t[0]))
+    _, by_seals = np.linalg.lstsq(np.c_[fade, (1.0 - fade) / oil_only], peaks, rcond=None)[0]
     mass = np.zeros((model.nv, model.nv))
     mujoco.mj_fullM(model, data, mass)
     boom = layer._qvel[0, 1]
@@ -426,7 +428,7 @@ def test_hung_load_bounce_dies_at_the_rate_the_boom_seals_give_by_hand(monkeypat
     inertia = mass[boom, boom] + 3000.0 * reach ** 2
     hand = 4.0 * abs(reach) * seals / (inertia * G) / (2.0 * half_period)
     assert oil_only < 0.0
-    assert hand <= oil_only - with_seals <= 1.25 * hand
+    assert hand <= by_seals <= 1.25 * hand
 
 
 def test_sling_readings_match_statics_and_a_snatch_reads_over_the_rating():

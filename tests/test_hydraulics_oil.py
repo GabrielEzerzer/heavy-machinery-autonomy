@@ -311,27 +311,37 @@ def swing_with(other, pose=None, seconds=4.0):
     if other is not None:
         u[0, other[0]] = other[1]
     layer.act(u)
-    speeds, quarter = [], None
+    speeds, ports, quarter = [], [], None
     for k in range(round(seconds / DT)):
         layer.step()
         speeds.append(layer.true_state().velocities[0, SWING])
+        ports.append(layer.chamber_pressures()[0, SWING])
         if quarter is None and layer.true_state().positions[0, SWING] - start >= math.pi / 2:
             quarter = (k + 1) * DT
-    return np.array(speeds), quarter
+    return np.array(speeds), quarter, layer, np.array(ports)
 
 
 def test_swing_keeps_its_priority_when_the_arm_shares_its_pump():
-    alone, _ = swing_with(None)
-    shared, _ = swing_with((ARM, 1.0))
+    alone, *_ = swing_with(None)
+    shared, *_ = swing_with((ARM, 1.0))
     at = round(1.0 / DT) - 1
     assert shared[at] > 0.9 * alone[at]
     assert shared.max() < 1.1 * c.PUMP_FLOW / c.SWING_DISPLACEMENT
 
 
 def test_swing_with_boom_raise_turns_ninety_degrees_in_the_published_time():
-    speeds, quarter = swing_with((BOOM, -1.0), (0.0, 0.0, 1.0, 1.0))
+    speeds, quarter, layer, ports = swing_with((BOOM, -1.0), (0.0, 0.0, 1.0, 1.0), seconds=16.0)
     assert 3.0 < quarter < 3.6
-    assert speeds.max() <= c.SWING_SPEED
+    steady = speeds[-round(2.0 / DT):]
+    shared = NOMINAL.power * c.PUMP_EFFICIENCY / layer.pump_pressures()[0].sum()
+    assert steady.std() < 1e-3 * steady.mean()
+    assert steady.mean() == pytest.approx(shared / c.SWING_DISPLACEMENT, rel=0.01)
+    assert steady.mean() <= c.SWING_SPEED
+    peak = int(np.argmax(speeds))
+    stored = (ports[:peak] ** 2).sum(1).max() * layer._volume0[0, SWING, 0]
+    stored /= 2 * NOMINAL.bulk_modulus
+    free = c.PUMP_FLOW / c.SWING_DISPLACEMENT
+    assert speeds[peak] <= math.sqrt(free ** 2 + 2 * stored / swing_inertia(layer))
 
 
 def test_full_boom_raise_takes_both_pumps_into_the_head_chambers():
@@ -481,17 +491,50 @@ def test_random_combined_commands_at_the_corners_keep_floor_relief_and_torque_co
     assert flips[2].max() <= 0.003
 
 
-def test_a_capped_step_keeps_the_attempt_whose_forces_matched_best(monkeypatch):
-    monkeypatch.setattr(oil_layer, "REDO_PASSES", 1)
+def capped_run(attempts):
     machines, layer = corner_scene()
     rng = np.random.default_rng(11)
-    mismatch = []
+    capped, mismatch = [], []
     for _ in range(50):
         layer.act(rng.choice([-1.0, 0.0, 1.0], size=(len(machines), 4)))
         for _ in range(layer.steps_per_decision):
+            attempts.clear()
+            before, redos = layer.capped, layer.redos
             mismatch.append(stepped_force_mismatch(layer))
-    assert layer.capped >= 3
-    assert np.array(mismatch)[..., SWING].max() < 0.5e3
+            final = layer.data.qpos[layer._qpos]
+            kept = [[np.array_equal(q[layer._qpos[i]], final[i]) for q in attempts]
+                    for i in range(len(machines))]
+            capped.append((layer.capped - before, layer.redos - redos, len(attempts), kept))
+    return layer, capped, np.array(mismatch)
+
+
+def test_a_capped_step_keeps_the_attempt_whose_forces_matched_best(monkeypatch):
+    monkeypatch.setattr(oil_layer, "REDO_PASSES", 1)
+    attempts = []
+    step = oil_layer.track_step
+
+    def recorded(model, data):
+        step(model, data)
+        attempts.append(data.qpos.copy())
+
+    monkeypatch.setattr(oil_layer, "track_step", recorded)
+    runs = []
+    for _ in range(2):
+        layer, capped, mismatch = capped_run(attempts)
+        runs.append((layer.data.qpos.copy(), layer.data.qvel.copy(), layer.capped, layer.redos))
+        assert all(redos == tries - 1 for _, redos, tries, _ in capped)
+        assert all(count == 0 or tries >= 2 for count, _, tries, _ in capped)
+        assert all(count == 1 for count, _, tries, _ in capped if tries == 3)
+        assert layer.capped == sum(count for count, *_ in capped)
+        replayed = [kept for count, _, tries, kept in capped if tries == 3]
+        assert replayed
+        for kept in replayed:
+            assert all(any(machine[:-1]) for machine in kept)
+            assert any(not machine[-2] for machine in kept)
+        assert np.isfinite(runs[-1][0]).all() and np.isfinite(runs[-1][1]).all()
+        assert mismatch[..., SWING].max() < 0.5e3
+    assert np.array_equal(runs[0][0], runs[1][0]) and np.array_equal(runs[0][1], runs[1][1])
+    assert runs[0][2:] == runs[1][2:]
 
 
 def check_drops(layer):
@@ -628,7 +671,7 @@ def test_energy_closes_with_cavitation_and_outside_forces_once_the_integration_t
     assert opened
     assert np.all(residual > 0.0)
     assert np.all(np.abs(residual - damping + growth) < 1e-9 * pump)
-    assert np.all(np.abs(layer.work_energy - actuator) < 3e-4 * pump)
+    assert np.all(np.abs(layer.work_energy - actuator) < 1e-4 * pump)
     assert np.all(play > 0.0)
 
 
