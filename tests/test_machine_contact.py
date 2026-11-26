@@ -168,7 +168,7 @@ def test_pressed_bucket_ground_reaction_matches_statics_at_the_boom_cap():
     for joint in ("arm", "bucket"):
         assert below_port_relief(model, data, joint)
     hand = (tau + gravity_moment(model, data, GRAVITY_BODIES, xp)) / (centre[0] - xp)
-    assert force[2] == pytest.approx(hand, rel=0.01)
+    assert force[2] == pytest.approx(hand, rel=0.005)
 
 
 def test_propped_machine_bucket_reaction_matches_statics():

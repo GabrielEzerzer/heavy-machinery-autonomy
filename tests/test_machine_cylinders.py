@@ -126,6 +126,8 @@ def test_every_chart_point_is_reached_at_the_pose_found():
      (None, None, 0.875 * 777.5 + 1.25 * 249.55)),
     ((0.3e6, 0.3e6, 0.3e6), (34.3e6, 34.3e6, 34.3e6), (0.01, 0.01, 0.01),
      (None, 1.0 * (1195.0 + 22.0 * 18.3) + 1.4375 * (285.0 + 19.0 * 18.0), None)),
+    ((22e6, 22e6, 22e6), (11e6, 11e6, 11e6), (0.10, 0.10, 0.10),
+     (1.75 * (1085.0 + 920.0) / 2 + 2.625 * (190.0 + 195.0) / 2, None, None)),
 ])
 def test_seal_friction_matches_the_published_table_worked_by_hand(head, rod, speed, hand):
     force = seal_friction(np.array(head), np.array(rod), np.array(speed))

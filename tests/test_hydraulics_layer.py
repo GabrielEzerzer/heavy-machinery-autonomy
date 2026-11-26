@@ -8,7 +8,7 @@ from hma.hydraulics import EFFECTS, NOMINAL, RANGES, Hydraulics, draw_machine
 from hma.hydraulics import circuit as c
 from hma.hydraulics.params import PORT_RELIEF_TOLERANCE, RELIEF_TOLERANCE
 from hma.machine import BODY_NAMES, JOINT_NAMES, LINK_MASSES, load_scene, machine_prefix
-from hma.machine.cylinders import MAIN_RELIEF
+from hma.machine.cylinders import MAIN_RELIEF, seal_friction
 from hma.machine.model import COUNTERWEIGHT_MASS, _machine_spec
 from scenes import dig_pit
 
@@ -185,6 +185,25 @@ def test_backlash_crosses_the_drawn_play_when_the_load_reverses():
     assert np.argmax(gap > 0.99) > reversal
     assert gap[-1] == 1.0
     assert q_nominal[-1] - q[-1] == pytest.approx(machine.backlash[ARM], rel=0.15)
+
+
+def test_each_held_cylinder_drags_by_its_seals_at_its_own_head_and_rod_pressures():
+    layer = layer_for(NOMINAL)
+    run(layer, [0, 0, 0, 0], 0.2)
+    data = layer.data
+    chambers = layer.chamber_pressures()[0, 1:]
+    speed = layer._piston_speed[0, 1:].copy()
+    lever = np.abs(c.geometry(data.qpos[layer._qpos])[1][0, 1:])
+    expected = seal_friction(chambers[:, 0], chambers[:, 1], speed) * lever
+    swapped = seal_friction(chambers[:, 1], chambers[:, 0], speed) * lever
+    assert (np.abs(swapped / expected - 1.0) > 0.05).all()
+    layer.step()
+    rows = data.efc_type[:data.nefc] == mujoco.mjtConstraint.mjCNSTR_FRICTION_DOF
+    loss = dict(zip(data.efc_id[:data.nefc][rows], data.efc_frictionloss[:data.nefc][rows],
+                    strict=True))
+    for dof, base, drag in zip(layer._qvel[0, 1:], layer._base_frictionloss[0, 1:], expected,
+                               strict=True):
+        assert loss[dof] == pytest.approx(base + drag, rel=1e-9)
 
 
 def test_changed_masses_shift_the_links_and_the_home_pose_still_rests():
