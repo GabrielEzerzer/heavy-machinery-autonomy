@@ -187,6 +187,8 @@ def train(args) -> None:
             setattr(args, key, config.get(key))
         trim_curve(out / "curve.csv", config["timesteps"])
     args.hold = args.hold or 0
+    if args.hold < 0:
+        raise SystemExit("--hold must be 0 or more")
     if args.spread is None:
         args.spread = COMMAND_NOISE / args.scale if args.mode == "residual" else SPREAD[args.mode]
     envs = ProcVecEnv(args.procs, args.machines, args.rung, args.mode, args.seed,
