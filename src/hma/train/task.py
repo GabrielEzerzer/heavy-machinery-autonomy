@@ -49,7 +49,8 @@ class Settings:
     sigma: float = math.radians(3.0)
     floor: float = 0.2
     weights: dict = field(default_factory=lambda: {"change": 0.03, "roll": 0.03, "slide": 0.03,
-                                                   "landing": 0.05, "set_down": 0.05})
+                                                   "landing": 0.05, "set_down": 0.05,
+                                                   "finish": 30.0})
     roll_scale: float = math.radians(5.0)
     slide_scale: float = 0.05
     hop: float = 0.025

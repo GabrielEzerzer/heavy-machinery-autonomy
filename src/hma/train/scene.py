@@ -577,6 +577,9 @@ class PropScene:
             end = self.k[i] * self.period >= self.tasks[i].length - 1e-9
             if causes[i] is not None or cut[i]:
                 earned[i] = 0.0
+            elif end:
+                earned[i] += (s.weights["finish"] * (1.0 - shortfall[i])
+                              * math.exp(-(self.landing[i] / s.landing) ** 2))
             if causes[i] is not None or cut[i] or end:
                 terminated[i] = True
                 self.done[i] = True
