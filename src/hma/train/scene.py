@@ -107,12 +107,12 @@ def _wrap(angle: np.ndarray) -> np.ndarray:
 
 def reward(s: Settings, error, change, roll, slide, landing, shortfall) -> np.ndarray:
     w = s.weights
-    return (s.floor + (1.0 - s.floor) * np.exp(-np.asarray(error) / s.sigma)
-            - w["change"] * np.minimum(change, 1.0)
-            - w["roll"] * np.minimum(np.asarray(roll) / s.roll_scale, 1.0)
-            - w["slide"] * np.minimum(np.asarray(slide) / s.slide_scale, 1.0)
-            - w["landing"] * np.minimum(np.asarray(landing) / s.landing, 1.0)
-            - w["set_down"] * np.clip(shortfall, 0.0, 1.0))
+    earned = (s.floor + (1.0 - s.floor) * np.exp(-np.asarray(error) / s.sigma)
+              - w["change"] * np.minimum(change, 1.0)
+              - w["roll"] * np.minimum(np.asarray(roll) / s.roll_scale, 1.0)
+              - w["slide"] * np.minimum(np.asarray(slide) / s.slide_scale, 1.0)
+              - w["set_down"] * np.clip(shortfall, 0.0, 1.0))
+    return earned * np.exp(-(np.asarray(landing) / s.landing) ** 2)
 
 
 def warm_compiled_step() -> None:
@@ -550,7 +550,7 @@ class PropScene:
         change = np.abs(commands - self.sent).mean(1) / 2.0
         self.sent = commands
         earned = reward(s, mean_err, change, roll_sum / max(done_steps, 1), slide,
-                        self.recent.max(1),
+                        self.landing,
                         shortfall)
         for i in range(n):
             failed[i] |= not (np.all(np.isfinite(data.qpos[self._own_q[i]]))
