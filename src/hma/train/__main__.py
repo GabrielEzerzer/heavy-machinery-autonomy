@@ -1,6 +1,6 @@
-"""Command line: python -m hma.train train|score|throughput --out DIR, or play. Train runs PPO in
-worker processes with checkpoints and resume; score runs a checkpoint and the baseline over the dev
-seeds; throughput times control steps; play shows one episode in the viewer. See --help."""
+"""Command line: python -m hma.train train|score|throughput --out DIR, or play, on the prop or turn
+task. Train runs PPO in worker processes with checkpoints and resume; score runs a checkpoint and
+the baseline over the dev seeds; throughput times control steps; play opens the viewer. --help."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import numpy as np
 
 from hma.train.evaluate import read_config
 from hma.train.task import RUNGS, Settings, dev_seeds
+from hma.train.turn import TASKS
 
 REPO = Path(__file__).resolve().parents[3]
 EGLI_HUTTER = {"gamma": 0.97, "learning_rate": 1e-3, "n_epochs": 10}
@@ -24,7 +25,8 @@ NET = [128, 128]
 MINI_BATCHES = 4
 COMMAND_NOISE = 0.02
 SPREAD = {"residual": COMMAND_NOISE / Settings().scale, "direct": 1.0}
-CONFIG = ("rung", "mode", "procs", "machines", "seed", "spread", "scale", "hold")
+CONFIG = ("rung", "mode", "procs", "machines", "seed", "spread", "scale", "hold", "task")
+ROLLOUT = {"prop": 300, "turn": 400}
 SMOKE = {"procs": 2, "machines": 2, "n_steps": 16, "steps": 256, "dev_size": 4, "seconds": 2.0}
 
 
@@ -131,6 +133,21 @@ def latest_checkpoint(checkpoint: Path) -> Path | None:
     return None
 
 
+def checkpoint_task(config: dict) -> str:
+    return config.get("task") or "prop"
+
+
+def pick_task(args, config: dict | None = None) -> str:
+    found = checkpoint_task(config) if config is not None else None
+    if found is not None and args.task not in (None, found):
+        raise SystemExit(f"the checkpoint was trained on the {found} task, not {args.task}")
+    task = found or args.task or "prop"
+    if task == "turn" and args.rung == "ground":
+        raise SystemExit("the turn task runs on level ground only (rungs nominal and machines); "
+                         "rough ground is not built for it yet")
+    return task
+
+
 def resume_seed(seed: int, timesteps: int) -> int:
     return int(np.random.SeedSequence([seed, timesteps]).generate_state(1)[0])
 
@@ -180,16 +197,22 @@ def train(args) -> None:
     resume = found is not None
     if resume:
         config = read_config(found)
+        task = pick_task(args, config)
         for key in CONFIG:
             setattr(args, key, config.get(key))
+        args.task = task
         trim_curve(out / "curve.csv", config["timesteps"])
+    else:
+        args.task = pick_task(args)
+    if args.n_steps is None:
+        args.n_steps = ROLLOUT[args.task]
     args.hold = args.hold or 0
     if args.hold < 0:
         raise SystemExit("--hold must be 0 or more")
     if args.spread is None:
         args.spread = COMMAND_NOISE / args.scale if args.mode == "residual" else SPREAD[args.mode]
     envs = ProcVecEnv(args.procs, args.machines, args.rung, args.mode, args.seed,
-                      Settings(scale=args.scale))
+                      TASKS[args.task].settings_type(scale=args.scale), args.task)
     print(f"workers: {envs.pids}", flush=True)
     try:
         if resume:
@@ -219,33 +242,38 @@ def score(args) -> None:
     from hma.train.evaluate import score as run
     from hma.train.evaluate import write
 
+    config = read_config(Path(args.checkpoint)) if args.checkpoint else None
+    task = pick_task(args, config)
     out = output_dir(args.out)
     seeds = dev_seeds(args.dev_size)
-    rows = run(args.rung, "residual", seeds, args.machines, args.procs, None)
+    rows = run(args.rung, "residual", seeds, args.machines, args.procs, None, task=task)
     if args.checkpoint:
-        config = read_config(Path(args.checkpoint))
         rows += run(args.rung, config["mode"], seeds, args.machines, args.procs,
-                    str(Path(args.checkpoint).resolve()), Settings(scale=config["scale"]))
-    path = write(rows, out, f"score_{args.rung}")
+                    str(Path(args.checkpoint).resolve()),
+                    TASKS[task].settings_type(scale=config["scale"]), task)
+    path = write(rows, out, f"score_{args.rung}" if task == "prop" else f"score_{task}_{args.rung}")
     print(path.read_text(encoding="utf-8"))
 
 
 def play(args) -> None:
     from hma.train.play import watch_checkpoint
 
-    watch_checkpoint(args.rung, args.seed, args.checkpoint)
+    task = pick_task(args, read_config(Path(args.checkpoint)) if args.checkpoint else None)
+    watch_checkpoint(args.rung, args.seed, args.checkpoint, kind=task)
 
 
 def throughput(args) -> None:
     from hma.train.evaluate import throughput as run
 
+    task = pick_task(args)
     out = output_dir(args.out)
-    r = run(args.rung, args.procs, args.machines, args.seconds)
+    r = run(args.rung, args.procs, args.machines, args.seconds, task=task)
     lines = ["| processes | machines per scene | control steps/s | per process | "
              "decisions/s per scene | seconds timed |", "|---|---|---|---|---|---|",
              f"| {r['procs']} | {r['machines']} | {r['control_steps_per_s']:.0f} | "
              f"{r['per_process']:.1f} | {r['scene_decisions_per_s']:.2f} | {r['seconds']:.0f} |"]
-    (out / "throughput.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    name = "throughput.md" if task == "prop" else f"throughput_{task}.md"
+    (out / name).write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(lines))
 
 
@@ -260,11 +288,14 @@ def main(argv: list[str] | None = None) -> None:
         sub.add_argument("--machines", type=int, default=8, help="machines per scene")
         sub.add_argument("--smoke", action="store_true", help="a seconds-long check run")
         sub.add_argument("--procs", type=int, default=4, help="worker processes, one scene each")
+        sub.add_argument("--task", choices=sorted(TASKS), default=None,
+                         help="prop (the default) or turn; a checkpoint keeps its own")
     train_args = commands.choices["train"]
     train_args.add_argument("--mode", choices=("residual", "direct"), default="residual")
     train_args.add_argument("--steps", type=int, default=10_000_000, help="total control steps")
-    train_args.add_argument("--n-steps", type=int, default=300,
-                            help="steps per machine per update; above the longest episode")
+    train_args.add_argument("--n-steps", type=int, default=None,
+                            help="steps per machine per update, above the longest episode "
+                                 f"(default {ROLLOUT['prop']} prop, {ROLLOUT['turn']} turn)")
     train_args.add_argument("--batch", type=int, default=None,
                             help="mini-batch size (default: a quarter of the samples per update)")
     train_args.add_argument("--threads", type=int, default=1,
@@ -290,6 +321,8 @@ def main(argv: list[str] | None = None) -> None:
     play_args = commands.add_parser("play", help="watch the baseline and a checkpoint on one seed")
     play_args.add_argument("--checkpoint", help="a checkpoint directory (default: baseline twice)")
     play_args.add_argument("--rung", choices=sorted(RUNGS), default="nominal")
+    play_args.add_argument("--task", choices=sorted(TASKS), default=None,
+                           help="prop (the default) or turn; a checkpoint keeps its own")
     play_args.add_argument("--seed", type=int, default=dev_seeds(1)[0],
                            help="a development seed; held-out seeds are refused")
     args = parser.parse_args(argv)

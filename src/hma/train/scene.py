@@ -123,6 +123,13 @@ def warm_compiled_step() -> None:
 
 
 class PropScene:
+    actions = JOINTS
+    frame = FRAME
+    obs_low, obs_high = OBS_LOW, OBS_HIGH
+    causes = CAUSES
+    episode_arrays = EPISODE_ARRAYS
+    settings_type = Settings
+
     def __init__(self, n: int, rung: str = "nominal", mode: str = "residual",
                  settings: Settings | None = None):
         if rung not in RUNGS:
@@ -130,7 +137,7 @@ class PropScene:
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}")
         self.n, self.rung, self.mode = n, rung, mode
-        self.settings = settings or Settings()
+        self.settings = settings or self.settings_type()
         model = load_scene(n)
         model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_WARMSTART)
         self.model, self.data = model, mujoco.MjData(model)
@@ -203,8 +210,8 @@ class PropScene:
         self.steps_total = np.zeros(n, np.intp)
         self.stance = np.tile([0.0, 0.0, 1.0], (n, 1))
         self.est0 = np.zeros((n, 2))
-        self.sent = np.zeros((n, JOINTS))
-        self.history = np.zeros((n, HISTORY, FRAME))
+        self.sent = np.zeros((n, self.actions))
+        self.history = np.zeros((n, HISTORY, self.frame))
         self.up = np.zeros((n, 3))
         self.v_prev = np.zeros((n, 3))
         self.gyro_bias = np.zeros((n, 3))
@@ -292,7 +299,7 @@ class PropScene:
             try:
                 self._apply(index, ground, friction)
                 surface = self._surface(index, *self._plane_frame(index, ground))
-                task = draw_task(seed, self.settings, self.pivot, surface, self.period)
+                task = self._draw(seed, surface)
                 if not footing.flat_press(ground, task.prop_x, side):
                     continue
                 self.layer.reset(index, machine, self._start(task))
@@ -317,11 +324,17 @@ class PropScene:
             friction, ground, height = STEEL_FRICTION[0], LEVEL, 0.0
             self._apply(index, ground, friction)
             if task is None:
-                task = draw_task(seed, self.settings, self.pivot, lambda x, y: 0.0, self.period)
+                task = self._draw(seed, lambda x, y: 0.0)
             self.layer.reset(index, machine, self._start(task))
         self.seeds[index], self.tasks[index], self.machines[index] = seed, task, machine
         self.grounds[index], self.frictions[index], self.heights[index] = ground, friction, height
-        self.controllers[index] = BaseController(PropPath(task, self.pivot), CONTROL_HZ)
+        self.controllers[index] = self._controller(task)
+
+    def _draw(self, seed: int, surface) -> Task:
+        return draw_task(seed, self.settings, self.pivot, surface, self.period)
+
+    def _controller(self, task: Task):
+        return BaseController(PropPath(task, self.pivot), CONTROL_HZ)
 
     def reset(self, index: int, seed: int, task: Task | None = None) -> np.ndarray:
         if task is None:
@@ -359,6 +372,7 @@ class PropScene:
         self.err_total[index] = 0.0
         self.done[index] = False
         self.active[index] = True
+        self._begin(index)
         sensed = self.layer.observe_mean()
         gyro = self.gyro_bias[index] + rng.uniform(-1.0, 1.0, 3) * GYRO_NOISE * on
         accel = (_matrices(quat[None])[0].T @ -self.gravity)
@@ -366,6 +380,7 @@ class PropScene:
         accel += rng.uniform(-1.0, 1.0, 3) * ACCEL_NOISE * on
         tilt = self._sensed_tilt(index, sensed.positions[index, SWING], rng)
         self.est0[index] = tilt
+        self._sense(index, sensed, gyro)
         frame = self._frame(index, sensed, gyro, accel, tilt)
         self.history[index] = frame
         return self.history[index].ravel().copy()
@@ -382,7 +397,7 @@ class PropScene:
         reference = [task.tilt(t + ahead) for ahead in PREVIEW]
         raw = np.concatenate([_wrap(sensed.positions[index]), sensed.velocities[index],
                               sensed.pressures[index].ravel(), gyro, accel,
-                              tilt - self.est0[index], self.sent[index], reference])
+                              tilt - self.est0[index], self.sent[index, :JOINTS], reference])
         return raw / SCALE
 
     def _upper_velocity(self) -> np.ndarray:
@@ -422,7 +437,7 @@ class PropScene:
 
     def baseline(self) -> np.ndarray:
         sensed = self.layer.observe()
-        out = np.zeros((self.n, JOINTS))
+        out = np.zeros((self.n, self.actions))
         for i, controller in enumerate(self.controllers):
             if controller is not None and self.active[i]:
                 out[i] = controller(self.k[i] * self.period, sensed.positions[i],
@@ -431,14 +446,14 @@ class PropScene:
 
     def step(self, actions: np.ndarray):
         actions = np.asarray(actions, float)
-        if actions.shape != (self.n, JOINTS) or not np.all(np.isfinite(actions)):
-            raise ValueError(f"actions must be finite with shape {(self.n, JOINTS)}")
+        if actions.shape != (self.n, self.actions) or not np.all(np.isfinite(actions)):
+            raise ValueError(f"actions must be finite with shape {(self.n, self.actions)}")
         if not self.active.all():
             raise ValueError("every machine must be reset before the scene steps")
         commands = np.clip(actions, -1.0, 1.0)
         if self.mode == "residual":
             commands = np.clip(self.baseline() + self.settings.scale * commands, -1.0, 1.0)
-        self.layer.act(commands)
+        self._send(commands)
         n, dt, data, s = self.n, self.dt, self.data, self.settings
         times = (self.k[:, None] * self.steps + np.arange(1, self.steps + 1)) * dt
         reference = np.array([[task.tilt(t) for t in row]
@@ -468,6 +483,7 @@ class PropScene:
         pitch = _tilts(np.einsum("nk,nkj->nj", self.stance, rot))[0]
         bucket, front = self.apart == 0, self.front_prev.copy()
         motion = self._part_velocity(rot)
+        self._prepare(times, commands)
         done_steps = self.steps
         for step in range(self.steps):
             self.layer.step()
@@ -520,6 +536,7 @@ class PropScene:
                 load_sum += np.where(resting[:, step, None], self._front_load(), 0.0)
             motion = self._part_velocity(rot)
             self.corner_prev = self._approach(motion)
+            self._watch(step, rot, pitch, roll)
         self.landing = np.maximum(self.landing, fresh)
         self.recent[:, :-1] = self.recent[:, 1:]
         self.recent[:, -1] = fresh
@@ -549,7 +566,8 @@ class PropScene:
         mean_err = err_sum / max(done_steps, 1)
         change = np.abs(commands - self.sent).mean(1) / 2.0
         self.sent = commands
-        earned = reward(s, mean_err, change, roll_sum / max(done_steps, 1), slide,
+        earned = reward(s, self._error(mean_err, done_steps), change,
+                        roll_sum / max(done_steps, 1), slide,
                         self.recent.max(1),
                         shortfall)
         for i in range(n):
@@ -557,11 +575,13 @@ class PropScene:
                               and np.all(np.isfinite(self.layer._pressure[i])))
         cut = reset_seen & ~failed
         causes: list[str | None] = []
+        extra = self._ends()
         for i in range(n):
             flags = {"unstable": failed[i], "contact": forbidden[i], "strike": struck[i],
-                     "tilt": worst_tilt[i] > s.tilt_limit, "roll": worst_roll[i] > s.roll_limit}
-            causes.append(None if cut[i] else next((c for c in CAUSES if flags[c]), None))
-        obs = np.zeros((n, HISTORY * FRAME))
+                     "tilt": worst_tilt[i] > s.tilt_limit, "roll": worst_roll[i] > s.roll_limit,
+                     **{name: flag[i] for name, flag in extra.items()}}
+            causes.append(None if cut[i] else next((c for c in self.causes if flags[c]), None))
+        obs = np.zeros((n, HISTORY * self.frame))
         terminated = np.zeros(n, bool)
         infos: list[dict] = [{} for _ in range(n)]
         for i in range(n):
@@ -571,6 +591,7 @@ class PropScene:
             accel = accel_sum[i] / self.steps + rng.uniform(-1.0, 1.0, 3) * ACCEL_NOISE * on
             tilt = self._sensed_tilt(i, sensed.positions[i, SWING], rng)
             if not (cut[i] or failed[i]):
+                self._sense(i, sensed, gyro)
                 self.history[i, :-1] = self.history[i, 1:]
                 self.history[i, -1] = self._frame(i, sensed, gyro, accel, tilt)
             obs[i] = self.history[i].ravel()
@@ -588,6 +609,40 @@ class PropScene:
                 infos[i]["truncated"] = causes[i] is None
                 infos[i]["cut_short"] = bool(cut[i])
         return obs, earned, terminated, infos
+
+    def _begin(self, index: int) -> None:
+        pass
+
+    def _sense(self, index: int, sensed, gyro: np.ndarray) -> None:
+        pass
+
+    def _send(self, commands: np.ndarray) -> None:
+        self.layer.act(commands)
+
+    def _prepare(self, times: np.ndarray, commands: np.ndarray) -> None:
+        pass
+
+    def _watch(self, step: int, rot: np.ndarray, pitch: np.ndarray, roll: np.ndarray) -> None:
+        pass
+
+    def _error(self, tilt_error: np.ndarray, done_steps: int) -> np.ndarray:
+        return tilt_error
+
+    def _ends(self) -> dict[str, np.ndarray]:
+        return {}
+
+    def reasons(self, info: dict) -> list[str]:
+        s = self.settings
+        checks = ((info["cause"] is not None, f"early end: {info['cause']}"),
+                  (info["hold_share"] < s.hold_share,
+                   f"hold share in band under {s.hold_share:.2f}"),
+                  (info["landing"] >= s.landing, f"a landing at {s.landing} m/s or faster"),
+                  (info["bucket_down"], "bucket on the ground at the end"),
+                  (not info["front_down"], "front of the tracks not set down"),
+                  (info["front_carried"] < s.carry,
+                   f"front carries under {s.carry:.0%} of its load"),
+                  (info["front_speed"] >= s.still, f"front moving at {s.still} m/s or faster"))
+        return [reason for failed, reason in checks if failed]
 
     def outcome(self, index: int, cause: str | None, final_tilt: float, carried: float,
                 speed: float, bucket_down: bool, front_down: bool) -> dict:
@@ -649,7 +704,7 @@ class PropScene:
             "seeds": list(self.seeds), "physics": state, "layer": self.layer.snapshot(),
             "drawn": [list(x) for x in (self.tasks, self.machines, self.grounds, self.frictions,
                                         self.heights)],
-            "episode": {name: np.copy(getattr(self, name)) for name in EPISODE_ARRAYS},
+            "episode": {name: np.copy(getattr(self, name)) for name in self.episode_arrays},
             "imu": [rng.bit_generator.state for rng in self._imu_rngs],
         }
 
@@ -663,8 +718,7 @@ class PropScene:
             self._apply(index, grounds[index], frictions[index])
             self.layer.machines[index] = machines[index]
             self.layer._apply_mass(index, machines[index])
-            self.controllers[index] = BaseController(PropPath(tasks[index], self.pivot),
-                                                     CONTROL_HZ)
+            self.controllers[index] = self._controller(tasks[index])
         set_const(self.model, self.layer._scratch)
         self.seeds = list(snapshot["seeds"])
         self.tasks, self.machines, self.grounds = list(tasks), list(machines), list(grounds)

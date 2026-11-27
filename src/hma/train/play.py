@@ -1,6 +1,6 @@
-"""One propping episode in the interactive viewer: the baseline and a trained controller on the same
-seed, side by side, on the task drawn from the seed or on a given one. Each runs in its own
-one-machine scene and is not stepped again once its episode ends; a two-machine scene shows both."""
+"""One propping or turning episode in the interactive viewer: the baseline and a trained controller
+on the same seed, side by side, on the task drawn from the seed or on a given one. Each runs in its
+own one-machine scene and is not stepped again once it ends; a two-machine scene shows both."""
 
 from __future__ import annotations
 
@@ -13,22 +13,22 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from hma.hydraulics.layer import JOINTS
 from hma.machine.model import MACHINE_SPACING, machine_prefix
 from hma.machine.render import apply_look, default_camera, draw_hydraulics, view_option
 from hma.train.scene import PropScene
 from hma.train.task import HELD_OUT_BASE, Settings, Task
+from hma.train.turn import TASKS, TurnScene, _heading
 
 LABELS = ("baseline", "trained")
 SIZES = {int(mujoco.mjtJoint.mjJNT_FREE): 7, int(mujoco.mjtJoint.mjJNT_BALL): 4}
 
 
 def episodes(rung: str, seed: int, policy=None, mode: str = "residual",
-             settings: Settings | None = None,
-             task: Task | None = None) -> Iterator[tuple[list[PropScene], list]]:
+             settings: Settings | None = None, task: Task | None = None,
+             kind: str = "prop") -> Iterator[tuple[list[PropScene], list]]:
     if seed >= HELD_OUT_BASE:
         raise ValueError("held-out seeds are never played")
-    scenes = [PropScene(1, rung), PropScene(1, rung, mode, settings)]
+    scenes = [TASKS[kind](1, rung), TASKS[kind](1, rung, mode, settings)]
     policies = [None, policy]
     obs = [scene.reset(0, seed, task)[None] for scene in scenes]
     outcomes: list[dict | None] = [None, None]
@@ -38,28 +38,20 @@ def episodes(rung: str, seed: int, policy=None, mode: str = "residual",
             if outcomes[i] is not None:
                 continue
             action = (policies[i](obs[i].astype(np.float32)) if policies[i]
-                      else np.zeros((1, JOINTS)))
+                      else np.zeros((1, scene.actions)))
             obs[i], _, done, infos = scene.step(np.asarray(action, float))
             if done[0]:
                 outcomes[i] = infos[0]
         yield scenes, outcomes
 
 
-def why(info: dict, s: Settings) -> list[str]:
-    checks = ((info["cause"] is not None, f"early end: {info['cause']}"),
-              (info["hold_share"] < s.hold_share, f"hold share in band under {s.hold_share:.2f}"),
-              (info["landing"] >= s.landing, f"a landing at {s.landing} m/s or faster"),
-              (info["bucket_down"], "bucket on the ground at the end"),
-              (not info["front_down"], "front of the tracks not set down"),
-              (info["front_carried"] < s.carry, f"front carries under {s.carry:.0%} of its load"),
-              (info["front_speed"] >= s.still, f"front moving at {s.still} m/s or faster"))
-    return [reason for failed, reason in checks if failed]
-
-
-def summary(label: str, info: dict, s: Settings) -> str:
-    verdict = "pass" if info["passed"] else "fail (" + "; ".join(why(info, s)) + ")"
+def summary(label: str, info: dict, scene: PropScene) -> str:
+    verdict = "pass" if info["passed"] else "fail (" + "; ".join(scene.reasons(info)) + ")"
+    turned = (f", heading {math.degrees(info['heading']):.2f} deg for a step of "
+              f"{math.degrees(scene.tasks[0].heading):.2f} deg" if "heading" in info else "")
     return (f"{label}: {verdict}; hold share in band {info['hold_share']:.2f}, tilt error "
-            f"{math.degrees(info['tilt_error']):.2f} deg, landing {info['landing']:.3f} m/s")
+            f"{math.degrees(info['tilt_error']):.2f} deg, landing {info['landing']:.3f} m/s"
+            + turned)
 
 
 def mirror(display: PropScene, scenes: list[PropScene]):
@@ -93,19 +85,25 @@ def texts(scenes: list[PropScene], outcomes: list) -> list[tuple]:
                                          mujoco.mjtGridPos.mjGRID_BOTTOMRIGHT), strict=True):
         commanded, measured = np.degrees(scene.tilt(0))
         state = "running" if info is None else ("pass" if info["passed"] else "fail")
-        out.append((mujoco.mjtFontScale.mjFONTSCALE_150, grid,
-                    f"{label}\ncommanded tilt\nmeasured tilt",
-                    f"{state}\n{commanded:.1f} deg\n{measured:.1f} deg"))
+        names, values = (f"{label}\ncommanded tilt\nmeasured tilt",
+                         f"{state}\n{commanded:.1f} deg\n{measured:.1f} deg")
+        if isinstance(scene, TurnScene):
+            heading = _heading(scene._base_rot()[0]) - scene.heading0[0]
+            goal = scene.tasks[0].heading_at(scene.k[0] * scene.period)
+            names += "\ncommanded heading\nmeasured heading"
+            values += f"\n{math.degrees(goal):.1f} deg\n{math.degrees(heading):.1f} deg"
+        out.append((mujoco.mjtFontScale.mjFONTSCALE_150, grid, names, values))
     return out
 
 
 def watch(rung: str, seed: int, policy=None, mode: str = "residual",
-          settings: Settings | None = None, task: Task | None = None) -> list[dict]:
+          settings: Settings | None = None, task: Task | None = None,
+          kind: str = "prop") -> list[dict]:
     import mujoco.viewer
 
-    steps = episodes(rung, seed, policy, mode, settings, task)
+    steps = episodes(rung, seed, policy, mode, settings, task, kind)
     scenes, outcomes = next(steps)
-    display = PropScene(2, rung)
+    display = TASKS[kind](2, rung)
     for slot in range(2):
         display.reset(slot, seed, task)
     copy = mirror(display, scenes)
@@ -135,7 +133,7 @@ def watch(rung: str, seed: int, policy=None, mode: str = "residual",
             viewer.sync()
             if running and None not in outcomes:
                 for label, scene, info in zip(LABELS, scenes, outcomes, strict=True):
-                    print(summary(label, info, scene.settings), flush=True)
+                    print(summary(label, info, scene), flush=True)
             frames += 1
             ahead = start + frames * scenes[0].period - time.perf_counter()
             if ahead > 0:
@@ -146,11 +144,14 @@ def watch(rung: str, seed: int, policy=None, mode: str = "residual",
 
 
 def watch_checkpoint(rung: str, seed: int, checkpoint: str | None = None,
-                     task: Task | None = None) -> list[dict]:
+                     task: Task | None = None, kind: str = "prop") -> list[dict]:
     if not checkpoint:
-        return watch(rung, seed, task=task)
+        return watch(rung, seed, task=task, kind=kind)
     from hma.train.evaluate import load_policy, read_config
 
     config = read_config(Path(checkpoint))
+    if config.get("task", "prop") != kind:
+        raise ValueError(f"the checkpoint was trained on the {config.get('task', 'prop')} task, "
+                         f"not {kind}")
     return watch(rung, seed, load_policy(Path(checkpoint)), config["mode"],
-                 Settings(scale=config["scale"]), task)
+                 TASKS[kind].settings_type(scale=config["scale"]), task, kind)

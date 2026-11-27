@@ -1,5 +1,5 @@
-"""Vectorised environments for Stable-Baselines3: one PropScene as a VecEnv whose machines restart
-on fresh seeds when they finish, and several scenes in parallel worker processes over pipes."""
+"""Vectorised environments for Stable-Baselines3: one propping or turning scene as a VecEnv whose
+machines restart on fresh seeds when they finish, and several scenes in worker processes."""
 
 from __future__ import annotations
 
@@ -10,26 +10,30 @@ import numpy as np
 from gymnasium import spaces
 from stable_baselines3.common.vec_env import VecEnv
 
-from hma.train.scene import OBS_HIGH, OBS_LOW, PropScene, warm_compiled_step
+from hma.train.scene import warm_compiled_step
 from hma.train.task import Settings, training_seed
+from hma.train.turn import TASKS
 
 
-def spaces_for() -> tuple[spaces.Box, spaces.Box]:
-    obs = spaces.Box(OBS_LOW.astype(np.float32), OBS_HIGH.astype(np.float32), dtype=np.float32)
-    return obs, spaces.Box(-1.0, 1.0, (4,), dtype=np.float32)
+def spaces_for(task: str = "prop") -> tuple[spaces.Box, spaces.Box]:
+    kind = TASKS[task]
+    obs = spaces.Box(kind.obs_low.astype(np.float32), kind.obs_high.astype(np.float32),
+                     dtype=np.float32)
+    return obs, spaces.Box(-1.0, 1.0, (kind.actions,), dtype=np.float32)
 
 
 class SceneVecEnv(VecEnv):
     def __init__(self, n: int, rung: str, mode: str, seed: int,
-                 settings: Settings | None = None, seeds: list[int] | None = None):
-        self.scene = PropScene(n, rung, mode, settings)
+                 settings: Settings | None = None, seeds: list[int] | None = None,
+                 task: str = "prop"):
+        self.scene = TASKS[task](n, rung, mode, settings)
         self.stream = np.random.default_rng((seed, 99))
         self.queue = list(seeds) if seeds is not None else None
         self.returns = np.zeros(n)
         self.lengths = np.zeros(n, np.intp)
-        self._actions = np.zeros((n, 4))
+        self._actions = np.zeros((n, self.scene.actions))
         self.render_mode = None
-        super().__init__(n, *spaces_for())
+        super().__init__(n, *spaces_for(task))
 
     def next_seed(self) -> int:
         if self.queue is not None:
@@ -45,7 +49,7 @@ class SceneVecEnv(VecEnv):
         return np.stack([self._start(i) for i in range(self.num_envs)]).astype(np.float32)
 
     def step_async(self, actions: np.ndarray) -> None:
-        self._actions = np.asarray(actions, float).reshape(self.num_envs, 4)
+        self._actions = np.asarray(actions, float).reshape(self.num_envs, self.scene.actions)
 
     def step_wait(self):
         obs, reward, done, infos = self.scene.step(self._actions)
@@ -122,7 +126,7 @@ def _worker(pipe, args) -> None:
 
 class ProcVecEnv(VecEnv):
     def __init__(self, scenes: int, n: int, rung: str, mode: str, seed: int,
-                 settings: Settings | None = None):
+                 settings: Settings | None = None, task: str = "prop"):
         warm_compiled_step()
         context = mp.get_context("spawn")
         self.n = n
@@ -133,7 +137,8 @@ class ProcVecEnv(VecEnv):
             for k in range(scenes):
                 here, there = context.Pipe()
                 process = context.Process(target=_worker,
-                                          args=(there, (n, rung, mode, seed * 1000 + k, settings)),
+                                          args=(there, (n, rung, mode, seed * 1000 + k,
+                                                        settings, None, task)),
                                           daemon=True)
                 process.start()
                 there.close()
@@ -146,7 +151,8 @@ class ProcVecEnv(VecEnv):
                 else:
                     os.environ[name] = value
         self.closed = False
-        super().__init__(scenes * n, *spaces_for())
+        self.actions = TASKS[task].actions
+        super().__init__(scenes * n, *spaces_for(task))
 
     @property
     def pids(self) -> list[int]:
@@ -161,7 +167,7 @@ class ProcVecEnv(VecEnv):
         return np.concatenate(self._all("reset"))
 
     def step_async(self, actions: np.ndarray) -> None:
-        actions = np.asarray(actions, float).reshape(len(self.pipes), self.n, 4)
+        actions = np.asarray(actions, float).reshape(len(self.pipes), self.n, self.actions)
         for pipe, chunk in zip(self.pipes, actions, strict=True):
             pipe.send(("step", chunk))
 
