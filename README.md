@@ -761,6 +761,8 @@ python -m hma.train play --checkpoint ../runs/prop/checkpoint --rung nominal --s
 
 `play` opens the viewer on one episode at real time, the baseline on the far left and the checkpoint on the near right, both on `--seed` (the first development seed by default; held-out seeds are refused). It takes the mode and correction scale from the checkpoint's `config.json`; without `--checkpoint` both machines run the baseline. Each controller runs in its own one-machine scene, because a scene cannot step while one of its machines has ended; a finished machine is not stepped again, so it stands still where its episode ended. A two-machine scene built from the same seed shows both. When both episodes have ended it prints each one's pass or fail and why, its hold share in band, its tilt error and its landing speed, and the viewer stays open until it is closed. On `nominal` seeds 10,000,000, 10,000,001, 10,000,003 and 10,000,004 these match the `score` rows from scenes of eight machines: the same pass, early end, hold share and decisions; the tilt error, landing speed and set-down load differ by under 10⁻⁷.
 
+`PropScene.reset(index, seed, task)` resets a machine onto a given `Task` instead of the one the seed draws; the machine, its drawn parameters and its sensor noise still come from the seed, and `reset(index, seed)` is unchanged. Only the flat rungs take a given task: the `ground` rung refuses one, because its ground is drawn to fit its task. `play`'s episode loop and viewer take the same task, which is how `python -m hma.task --run` shows a planned prop (see *Running a prop* under [Language step](#language-step)).
+
 **On 32 cores.** First size the run, then train for an hour, then score:
 
 ```
@@ -875,7 +877,7 @@ On the nominal machine it fails most often on short ramps (45% pass with ramps u
 
 ### Language step
 
-`hma.task` turns one plain-English instruction into a checked task specification. A GPT model, called through the Codex CLI, fills the specification. Trusted code then checks it, and a person confirms it. The planner that would turn an approved specification into bucket and load paths is not built.
+`hma.task` turns one plain-English instruction into a checked task specification. A GPT model, called through the Codex CLI, fills the specification. Trusted code then checks it, and a person confirms it. An approved prop can be run in the viewer (see *Running a prop* below); the planner that would turn the other tasks into bucket and load paths is not built.
 
 **Tasks.** Places are named only by marker id and loads only by load id; the model never writes a coordinate, a mass or a limit.
 
@@ -921,6 +923,8 @@ The ground under the machine is read over its track footprint, not at one point:
 | Carry height | The load travels 0.3 m above the ground between its ends | [Komatsu PC160LC-7KA][k160t] raises the bucket 20 to 30 cm for travel; used for carrying: assumed |
 
 Every limit lives in `hma.task.checks.Limits`; the chart is `hma.machine.statics.CHART` with its at-maximum-reach column in `hma.task.body.MAX_REACH`. `hma.task.scene.SAME_HEIGHT_M` is not a limit, only the tolerance for calling two heights equal. Neither the instruction nor the model's output can change any of them.
+
+**Running a prop.** `python -m hma.task "prop yourself up on the bucket and hold for five seconds" --run` goes on, after the operator approves, to show the plan in the viewer. `hma.task.prop.prop_task` turns the plan into the propping environment's `Task`: the prop distance is the distance from where the machine stands to the plan's prop point, and the hold is `hold_s`. The rest are fixed at the middle of the ranges the controller trains on (`Settings`): a 12.5° tilt, ramps of 4.5 s up and down, the bucket at 75°, starting 1 m above the ground. As in training, the bucket presses in line with the boom foot, 0.16 m to the side of the plan's prop point. These plans are refused with a sentence, exit code 3 and no window: a task other than prop; a plan that drives first, since there is no travel controller yet; a hold outside 3 to 10 s or a prop distance outside 3.5 to 6.5 m, the ranges the controller trained on; ground under the machine or the bucket that slopes, or that lies at a different height under each, since both rungs it runs on are flat; and a path the arm cannot follow with the fixed values. The viewer and the printed outcomes are `play`'s (see [Propping environment](#propping-environment)), on `--rung nominal` (the default) or `machines` and `--machine-seed` (the first development seed by default; held-out seeds are refused). Without `--checkpoint` both machines run the baseline. Without `--run` the command stops at the approval as before. In the demo scene the checks put the prop point 6.6 m ahead, where the boom-to-arm angle is nearest 100°, so the demo prop is refused as 0.1 m past the trained range.
 
 **The machine seam.** Capacity, plan size and the propping pose reach the checks through the `Body` protocol, the way reach does through `Reach`. `MachineBody` reads plan size, track footprint, travel reach and boom-to-arm angles from `hma.machine`, and its `lift_capacity` calls `hma.machine.statics.lift` for the side tipping load and the hydraulic capacity at main relief. One call takes about 1.7 s, so the results for every chart cell are stored in `hma.task.capacity_table`, written by `python -m hma.task.capacity`. Run that command after any change to the machine model; a test compares the table with `statics.lift` and fails until it is rerun. A model capacity can only lower the chart rating, never raise it. 75% of the model's side tipping load is below the chart at 7 of its 18 rated cells, by up to 2.7% (the comparison is under [Machine on the ground](#machine-on-the-ground)); there the model sets the rating. Every rating a demo carry reaches falls on other cells, so in the demo scene the chart sets every rating.
 
@@ -992,7 +996,7 @@ A feature is **done** when it runs from a clean checkout and its checks pass.
 | Baseline controller | A conventional controller tuned once on the standard machine | Done: follows paths in free air, but stops tens of centimetres to metres short of the target on the oil model |
 | Rough ground | Slopes, steps and edges of rigid ground. The machine can slide, rock and tip, and the arm and bucket meet the ground | Done: ground of MuJoCo primitives drawn from a seed; the tracks stand, drive, slide and tip on it, checked against hand statics, and every part of the machine except the cylinders and bucket linkage meets it ([issue 41](../../issues/41)). Turns run slow and high steps need speed ([issue 57](../../issues/57), [issue 58](../../issues/58)) |
 | Carried load | A load with real mass on the bucket | Done: a rigid concrete block on a four-leg sling, lifted, swung and set down through the oil; its mass, size and leg angle are drawn together so every draw can be lifted 0.3 m clear within the over-side chart rating |
-| Planner | Turns a checked specification into paths for the bucket and the load | Planned |
+| Planner | Turns a checked specification into paths for the bucket and the load | Planned; an approved prop already runs in the viewer with fixed tilt, ramps and bucket angle (`python -m hma.task --run`) |
 | Cylinder forces | Joint force limits from the hydraulic cylinders' sizes and positions | Done |
 | Learned controller | One network that moves a load and props the machine on its bucket without tipping, on any machine drawn | Planned |
 | Training | One command that trains the controller in stages of rising difficulty | In progress: one command trains PPO for propping on one of three rungs, with checkpoints and resume ([Propping environment](#propping-environment)); carrying and moving between rungs are not built |
@@ -1029,7 +1033,13 @@ python -m hma.train score --out ../runs/prop/score --smoke
 python -m hma.train play --checkpoint ../runs/prop/checkpoint
 ```
 
-Without `--checkpoint` both machines run the baseline.
+Without `--checkpoint` both machines run the baseline. To go from a typed instruction to the same viewer, add `--run` to the language step:
+
+```
+python -m hma.task "prop yourself up on the bucket and hold for five seconds" --run --checkpoint ../runs/prop/checkpoint
+```
+
+It runs approved props only, within the ranges the controller trained on; *Running a prop* under [Language step](#language-step) lists the fixed values and what is refused.
 
 `pytest -q` runs the tests. The tests marked `train_extra` need the training extra; without it they are skipped with that as the reason. CI installs the CPU build of PyTorch and both extras, so it runs them; locally, install them with `pip install -e ".[train,dev]"`:
 
