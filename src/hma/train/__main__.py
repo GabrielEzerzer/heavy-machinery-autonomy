@@ -23,7 +23,7 @@ NET = [128, 128]
 MINI_BATCHES = 4
 COMMAND_NOISE = 0.02
 SPREAD = {"residual": COMMAND_NOISE / Settings().scale, "direct": 1.0}
-CONFIG = ("rung", "mode", "procs", "machines", "seed", "spread", "scale")
+CONFIG = ("rung", "mode", "procs", "machines", "seed", "spread", "scale", "hold")
 SMOKE = {"procs": 2, "machines": 2, "n_steps": 16, "steps": 256, "dev_size": 4, "seconds": 2.0}
 
 
@@ -92,11 +92,13 @@ def _curve_callback(out: Path, seconds: float | None, every: int, save):
     return Curve()
 
 
-def build_model(venv, n_steps: int, seed: int, spread: float, batch: int | None = None):
+def build_model(venv, n_steps: int, seed: int, spread: float, batch: int | None = None,
+                hold: int = 0):
     from stable_baselines3 import PPO
 
     batch = batch or max(venv.num_envs * n_steps // MINI_BATCHES, 8)
-    return PPO("MlpPolicy", venv, n_steps=n_steps, batch_size=batch,
+    held = {"use_sde": True, "sde_sample_freq": hold} if hold else {}
+    return PPO("MlpPolicy", venv, n_steps=n_steps, batch_size=batch, **held,
                policy_kwargs={"net_arch": {"pi": NET, "vf": NET},
                               "log_std_init": math.log(spread)},
                seed=seed, device="cpu", verbose=0, **EGLI_HUTTER)
@@ -184,6 +186,7 @@ def train(args) -> None:
         for key in CONFIG:
             setattr(args, key, config.get(key))
         trim_curve(out / "curve.csv", config["timesteps"])
+    args.hold = args.hold or 0
     if args.spread is None:
         args.spread = COMMAND_NOISE / args.scale if args.mode == "residual" else SPREAD[args.mode]
     envs = ProcVecEnv(args.procs, args.machines, args.rung, args.mode, args.seed,
@@ -195,7 +198,8 @@ def train(args) -> None:
         else:
             venv = VecNormalize(envs, norm_obs=True, norm_reward=False,
                                 gamma=EGLI_HUTTER["gamma"])
-            model = build_model(venv, args.n_steps, args.seed, args.spread, args.batch)
+            model = build_model(venv, args.n_steps, args.seed, args.spread, args.batch,
+                                args.hold)
         print(f"{envs.num_envs} machines in {args.procs} processes; {model.n_steps} steps per "
               f"machine per update, {model.n_steps * envs.num_envs} samples, batch "
               f"{model.batch_size}; learner threads {torch.get_num_threads()}", flush=True)
@@ -267,6 +271,9 @@ def main(argv: list[str] | None = None) -> None:
     train_args.add_argument("--spread", type=float, default=None,
                             help="starting action spread (default: "
                                  f"{COMMAND_NOISE} / scale residual, {SPREAD['direct']} direct)")
+    train_args.add_argument("--hold", type=int, default=0,
+                            help="explore with state-dependent noise redrawn every N steps "
+                                 "(0: fresh noise every step)")
     train_args.add_argument("--seed", type=int, default=0)
     train_args.add_argument("--resume", action="store_true",
                             help="continue from --out; --steps stays the total")
