@@ -138,3 +138,39 @@ def test_a_resume_drops_curve_rows_written_after_its_checkpoint(tmp_path):
     trim_curve(path, 200)
     assert path.read_text(encoding="utf-8").splitlines() == rows[:3]
     trim_curve(tmp_path / "missing.csv", 200)
+
+
+@pytest.mark.train_extra
+def test_held_exploration_repeats_its_noise_until_redrawn_and_survives_a_checkpoint(tmp_path):
+    import torch
+    from stable_baselines3.common.vec_env import VecNormalize
+
+    from hma.train.__main__ import EGLI_HUTTER, build_model, load_checkpoint, save_checkpoint
+    from hma.train.vec import SceneVecEnv
+
+    env = SceneVecEnv(2, "nominal", "residual", 0)
+    venv = VecNormalize(env, norm_obs=True, norm_reward=False, gamma=EGLI_HUTTER["gamma"])
+    first_obs = venv.reset()
+    obs = torch.as_tensor(first_obs, dtype=torch.float32)
+
+    def sample(model):
+        with torch.no_grad():
+            return model.policy(obs)[0].numpy()
+
+    fresh = build_model(venv, 8, 0, 0.3)
+    assert not fresh.use_sde
+    assert not np.array_equal(sample(fresh), sample(fresh))
+
+    held = build_model(venv, 8, 0, 0.3, hold=4)
+    assert held.use_sde and held.sde_sample_freq == 4
+    held.policy.reset_noise(2)
+    first = sample(held)
+    assert np.array_equal(first, sample(held))
+    held.policy.reset_noise(2)
+    assert not np.array_equal(first, sample(held))
+
+    held._last_obs = first_obs
+    held._last_episode_starts = np.array([True, True])
+    save_checkpoint(tmp_path / "checkpoint", held, venv, env, {"hold": 4})
+    resumed, _, config = load_checkpoint(tmp_path / "checkpoint", env)
+    assert resumed.use_sde and resumed.sde_sample_freq == 4 and config["hold"] == 4
