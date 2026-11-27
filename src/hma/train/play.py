@@ -15,7 +15,7 @@ import numpy as np
 
 from hma.machine.model import MACHINE_SPACING, machine_prefix
 from hma.machine.render import apply_look, default_camera, draw_hydraulics, view_option
-from hma.train.scene import PropScene
+from hma.train.scene import PropScene, _wrap
 from hma.train.task import HELD_OUT_BASE, Settings, Task
 from hma.train.turn import TASKS, TurnScene, _heading
 
@@ -88,7 +88,7 @@ def texts(scenes: list[PropScene], outcomes: list) -> list[tuple]:
         names, values = (f"{label}\ncommanded tilt\nmeasured tilt",
                          f"{state}\n{commanded:.1f} deg\n{measured:.1f} deg")
         if isinstance(scene, TurnScene):
-            heading = _heading(scene._base_rot()[0]) - scene.heading0[0]
+            heading = float(_wrap(_heading(scene._base_rot()[0]) - scene.heading0[0]))
             goal = scene.tasks[0].heading_at(scene.k[0] * scene.period)
             names += "\ncommanded heading\nmeasured heading"
             values += f"\n{math.degrees(goal):.1f} deg\n{math.degrees(heading):.1f} deg"
@@ -150,8 +150,8 @@ def watch_checkpoint(rung: str, seed: int, checkpoint: str | None = None,
     from hma.train.evaluate import load_policy, read_config
 
     config = read_config(Path(checkpoint))
-    if config.get("task", "prop") != kind:
-        raise ValueError(f"the checkpoint was trained on the {config.get('task', 'prop')} task, "
-                         f"not {kind}")
+    trained = config.get("task") or "prop"
+    if trained != kind:
+        raise ValueError(f"the checkpoint was trained on the {trained} task, not {kind}")
     return watch(rung, seed, load_policy(Path(checkpoint)), config["mode"],
                  TASKS[kind].settings_type(scale=config["scale"]), task, kind)

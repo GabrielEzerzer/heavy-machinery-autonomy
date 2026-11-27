@@ -899,7 +899,7 @@ Those controllers hold well and land badly. They take the bucket off the ground 
 
 `hma.train.turn` is the training environment for turning the tracks while propped. The machine props on its bucket as in the propping environment, counter-rotates its tracks while the front is up so that the undercarriage turns to a new heading about the bucket, sets the front down gently, and swings the upper structure back over the tracks. `TurnScene` is a subclass of `PropScene`. It reuses the propping scene's stepping loop, resets, snapshot, reward, early ends and pass mark, and adds the turn through a few hooks the propping scene calls and leaves empty: how a task is drawn, which controller is the baseline, how commands are sent, what is watched at each physics step, what is added to the tracking error, the extra early ends and the extra observation values. The propping scene's arithmetic is unchanged, and its tests pass untouched. A task kind inside `PropScene` was not used because it would put the turn's branches into every propping step.
 
-Operator manuals describe lifting one track with the boom, arm and bucket: the bucket's round side on the ground and the boom-to-arm angle at 90 to 110° ([Hitachi ZX135US-5B, p. 217][zx135]; [Volvo EC330B, p. 111][ec330b]; [US Army TM 5-3805-294-10, WP 0031][tm294]). Hitachi, Kubota and the Army manual then run the raised track, to clear mud, sand or gravel ([Hitachi][zx135], [Kubota U25, p. 46][u25], [TM 5-3805-294-10][tm294]); Volvo puts a plank under it. None of them describes turning the undercarriage on the bucket. That manoeuvre, lowering the boom to lift the front of the tracks and turning the tracks one way while swinging the upper structure the other, is described only by a rental company's blog ([Vandalia Rental][vandalia]) and an operators' forum thread ([HeavyEquipmentForums][hef]), where one poster advises against lifting the tracks at all. Both were read only through search summaries, so the manoeuvre itself is unverified.
+Operator manuals describe lifting one track with the boom, arm and bucket: the bucket's round side or bottom on the ground and the boom-to-arm angle at 90 to 110° ([Hitachi ZX135US-5B, p. 217][zx135]; [Volvo EC330B, p. 111][ec330b]; [US Army TM 5-3805-294-10, WP 0031][tm294]). Hitachi, Kubota and the Army manual then run the raised track, to clear mud, sand or gravel ([Hitachi][zx135], [Kubota U25, p. 46][u25], [TM 5-3805-294-10][tm294]); Volvo puts a plank under it. The cited page of each of these four manuals was read in full: Hitachi p. 217 (swing the upper structure 90°, lower the bucket to raise the track, rotate the raised track back and forth), Kubota p. 46 (lift one track with the boom, arm and bucket and let it rotate), Volvo p. 111 (raise the bogged track with the bucket and put a plank under it; nothing about running it) and the Army manual's WP 0031 (round side of the bucket down, run the raised track for about 5 minutes, then lower it and swing back 90°). None of them describes turning the undercarriage on the bucket. That manoeuvre, lowering the boom to lift the front of the tracks and turning the tracks one way while swinging the upper structure the other, is described only by a rental company's blog ([Vandalia Rental][vandalia]) and an operators' forum thread ([HeavyEquipmentForums][hef]), where one poster advises against lifting the tracks at all. Both were read only through search summaries (the forum refuses automated reading), so the manoeuvre itself is unverified.
 
 **Task and draws.** One seed draws one turning episode. The machine, its sensors and its IMU are drawn as for propping. The task comes from stream `(seed, 13, attempt)`:
 
@@ -928,28 +928,29 @@ The ranges are choices made here for a first turning task, inside what the scrip
 7. Re-centre: the upper structure swings back over the tracks.
 8. Rest, 1 s.
 
-The settle and the turn together are the propping task's hold, so the tilt path, the bucket's path and the baseline's arm are those of propping. The controller sees the tilt and heading references now, 0.5 s ahead and 1.0 s ahead.
+The settle and the turn together are the propping task's hold, so the tilt path, the bucket's path and the baseline's arm are those of propping. The controller sees the tilt and heading references now, 0.5 s ahead and 1.0 s ahead, and at the same three times whether the re-centring has begun.
 
 **Actions.** Six commands in [−1, 1]: the four valves in the propping order (swing, boom, arm, bucket), then the left and right tracks. A track command of 1 asks for a belt speed of 0.3 m/s forwards. The track commands go to the `travel_left` and `travel_right` velocity actuators of *Drive* under Machine on the ground: each belt is held to its commanded speed up to the 51 kN traction cap and the shared power cap, and zero is the parking brake. In `residual` mode all six are added to the baseline's commands and clipped; in `direct` mode they are sent as they are. The baseline asks for at most 0.17 m/s on a belt over the drawn ranges (a 22° step at 7 °/s with the tip 4 m ahead, computed from its belt law below), so its track commands stay under 0.6, and a residual of the propping scale 0.3 moves a belt by up to 0.09 m/s, about the size of the baseline's own counter-rotation.
 
 The track drive leaves out what a real machine's travel circuit does. On a real excavator each track is driven by a hydraulic travel motor through a planetary reduction, fed from a travel spool in the main valve, usually one motor per pump, with a counterbalance valve that brakes the motor when it overruns, a two-speed displacement switch, a spring-set brake released by pilot pressure, and a travel-straight valve that ties both motors to one pump when the arm moves at the same time (unverified for this machine; see *Hydraulics model*). The model has none of this: a belt follows its commanded speed at once, up to fixed force and power caps, draws no oil from the pumps that drive the arm and swing, and has no spool dead zone, delay or lag. So the tracks here start, stop and hold speed more readily than a real machine's, and travelling does not slow the arm.
 
-**Observation.** Each frame is the propping frame of 31 values with 7 added, 38 in all, and the policy sees the last 15 frames, 570 values:
+**Observation.** Each frame is the propping frame of 31 values with 10 added, 41 in all, and the policy sees the last 15 frames, 615 values:
 
 | Values | Source | Scale | Bounds after scaling |
 |---|---|---|---|
 | 2 track commands sent at the last decision | the controller's own output | 1 | ±1 |
-| the lower body's yaw rate | the gyro's vertical rate less the measured swing speed | 2 rad/s | ±5 |
-| heading still to go | the step less the heading estimate | π/2 rad | ±2 |
+| the lower body's yaw rate | the gyro's vertical rate less the measured swing speed | 2 rad/s | ±10 |
+| heading still to go | the step less the heading estimate, wrapped to ±180° | π/2 rad | ±2 |
 | 3 heading references (now, +0.5 s, +1.0 s) | the task | π/2 rad | ±1 |
+| 3 re-centring flags (now, +0.5 s, +1.0 s) | the task: 1 once the re-centring has begun, else 0 | 1 | 0 to 1 |
 
-The heading estimate integrates the lower body's yaw rate from the start of the episode, from the simulated gyro with its drawn bias and noise on the `machines` rung, never the true heading. A gyro bias of 0.2 °/s, the largest drawn, puts it off by up to 7.6° by the end of the longest episode, 38.2 s, and by up to 2° by the time the turn starts. The propping frame's 4 commands are the 4 valve commands.
+The yaw rate's bound is the sum of the gyro's and the swing speed's own bounds, so it holds whatever their signs. The heading estimate integrates that yaw rate from the start of the episode, never the true heading. It is the gyro less the swing sensor's rate, so on the `machines` rung it carries the gyro's drawn bias and noise and also the swing sensor's drawn noise and latency of up to 0.2 s: while the upper structure swings, the latency puts the estimate off by the angle swung in that time, which comes back out once the swing stops. A gyro bias of 0.2 °/s, the largest drawn, puts it off by up to 7.6° by the end of the longest episode, 38.2 s, and by up to 2° by the time the turn starts. The propping frame's 4 commands are the 4 valve commands. The re-centring flags tell the controller when the upper structure's angle starts to count in the reward (see *Reward*); nothing else in the frame shows when the lift ends.
 
 **Baseline.** The baseline is a scripted manoeuvre, with nothing tuned per machine:
 
 - the arm follows the propping baseline's tip path with `BaseController`, unchanged;
 - during the turn the belts counter-rotate so that the undercarriage follows the heading reference's rate, with a forward correction on both belts that grows with the angle turned;
-- during the turn the swing valve is open 0.3 the way that lets the upper structure stay put while the tracks turn under it;
+- during the turn the swing valve is driven at 0.3 in the direction that turns the undercarriage towards the step against the propped upper structure, so the swing motor pushes the turn along with the tracks: it did 946 J and 1258 J of work during the turn on `nominal` seeds 10,000,000 and 10,000,003;
 - after the lift, the swing valve re-centres the upper structure on its measured swing angle: a command of 2 per radian of error, at least 0.3 while the error is above 1° and at most 0.6, and closed once the error is under 0.3°.
 
 The belt speeds come from the reference, not from a measured heading: the inner and outer belts run at ∓ω·g/2, where ω is the reference's rate and g the 1.99 m gauge, plus a forward speed d(1 + d/x)·|ψ|·|ω| on both, where ψ is the reference heading, x the drawn prop distance and d = 1.44 m the distance from the swing axis to the rear wheel. Turning about the bucket swings the rear wheels sideways across the ground; the forward speed keeps them under the propped tracks' own pivot, so the bucket does not slide. The baseline never reads the tilt or the heading.
@@ -961,28 +962,31 @@ With the swing valve shut the turn stalls: on `nominal` seeds 10,000,000 and 10,
 - the final heading is within 1.5° of the step;
 - the bucket tip moves at most 0.15 m across the ground during the turn, measured as its largest horizontal distance from where it was when the turn began;
 - the roll from the settled stance never exceeds 2°;
-- the final heading is within 1.5° of the heading the belts turned: the integral, over every physics step of the episode, of the right belt's speed less the left's, over the 1.99 m gauge;
+- the final heading is within 1.5° of the heading the drive wheels turned: the integral, over every physics step of the episode, of the right drive wheel's rim speed less the left's (wheel speed times its 0.35 m radius), over the 1.99 m gauge;
+- the tracks travel at most 0.05 m outside the propped turn: each drive wheel's rim travel is summed, with its sign, over every physics step except those inside the turn with the tilt at 1° or more, and the two sums' sizes are added;
 - at the end the upper structure is within 2° of straight over the tracks.
 
-The belt condition is here because of the sliding contact hop ([issue 57](../../issues/57)). With the baseline's arm and the swing valve fully open during the turn and both tracks braked, `nominal` seed 10,000,000 (target 5.3°, tip 4.3 m ahead) turned 24.7° and ended as `overshoot`, and seed 10,000,003 (target 6.0°, tip 5.9 m ahead) turned 5.3°, with the belts not turning at all. A propped track resting on its rear wheels turns only as far as its belts drive it: over the 64 `nominal` baseline episodes the heading and the belts' heading differ by at most 0.34°, and over the 64 `machines` episodes by at most 1.6° (seed 10,000,062, whose bucket slid 0.19 m during the turn and which fails on four other conditions). So a heading the belts did not drive is the hop, and does not count as a turn.
+The belt condition is here because of the sliding contact hop ([issue 57](../../issues/57)). With the baseline's arm and the swing valve fully open during the turn and both tracks braked, `nominal` seed 10,000,000 (target 5.3°, tip 4.3 m ahead) turned 24.7° and ended as `overshoot`, and seed 10,000,003 (target 6.0°, tip 5.9 m ahead) turned 5.3°, with the belts not turning at all. A propped track resting on its rear wheels turns only as far as its belts drive it: over the 64 `nominal` baseline episodes the heading and the drive wheels' heading differ by at most 0.33°, and over the 23 `machines` episodes whose tracks stayed still outside the propped turn by at most 0.88°, apart from seed 10,000,062 at 1.60°, whose bucket slid 0.19 m during the turn and which fails on four other conditions. So a heading the belts did not drive is the hop, and does not count as a turn. The rule reads the drive wheels, not the belt speed commanded: the travel valve follows its command within milliseconds, but the wheels can fall behind it at the traction and power caps. With the swing valve shut and both tracks at full counter-rotation through the turn, seed 10,000,000's commands added up to a 91.56° turn and its drive wheels to 90.09°. A machine that turns with its front on the ground skids, so its heading falls short of its wheels': on `machines`, the 41 episodes that turned without the front up differ by up to 5.17°.
 
-The propping set-down conditions are unchanged: every landing under 0.3 m/s, the bucket off the ground, each track's front down, still and carrying at least half its resting load. All of these are fields of `TurnSettings`. `score` lists, for the turning task, how many episodes fail each condition.
+The travel condition covers a spin turn with the bucket in the air, a slow turn with the front on the ground, driving away after set-down, and a turn made before or after the turn span. Over the 64 `nominal` baseline episodes the tracks travel at most 0.2 mm outside the propped turn, and over the other 23 `machines` episodes at most 1.5 mm; the 41 `machines` episodes that turned without the front up (none of them spent any of the turn in the tilt band) travel 0.09 to 0.27 m before they end. A turn held back until the ramp down, which the bucket-slide condition (watched during the turn only) does not see, travels this way too, and the suite checks that it fails. The slide is not watched through the ramp down because the propping baseline's own set-down drags the bucket: with a step of 0.0001°, so no turn at all, the tip moves a median 0.218 m between the start of the turn span and the lift on the same 64 `nominal` seeds, 38 of them over 0.15 m.
 
-A spin turn on level ground with the bucket in the air does not pass: its tilt never enters the band and the bucket moves with the machine. The suite checks this with the early ends switched off.
+The propping set-down conditions are unchanged: every landing under 0.3 m/s, the bucket off the ground, each track's front down, still and carrying at least half its resting load. All of these are fields of `TurnSettings`. For the turning task, `score` lists how many episodes fail each condition, and its tables give the mean final heading error beside the tilt error: overall, by thirds of each drawn parameter, and seed by seed against the baseline when a checkpoint is scored.
+
+A spin turn on level ground with the bucket in the air does not pass: its tilt never enters the band, the bucket moves with the machine and its tracks travel outside the propped turn. The suite checks this with the early ends switched off.
 
 **Early ends.** The propping early ends, in their order, and then:
 
 6. `slide`: the bucket tip has moved more than 0.3 m across the ground during the turn;
-7. `overshoot`: the heading is more than 5° past the step;
-8. `lost`: the tracks are commanded to turn (a speed difference over 0.04 m/s, 0.02 m/s either way) while the tilt is under 1°.
+7. `overshoot`: the heading is more than 5° past the step, or more than 5° the wrong way;
+8. `stray`: the tracks have travelled more than 0.25 m outside the propped turn, measured as in the pass mark.
 
-`lost` holds at any time, not only during the turn, so a policy cannot turn the tracks with the front on the ground either. The suite checks that lifting the bucket off the ground mid-turn ends the episode as `lost`.
+`stray` is loose so that exploration does not end episodes before the bucket is down. With random commands of spread 0.33 added to the baseline at every decision, on the 64 `nominal` seeds the tracks travelled at most 0.068 m before the bucket touched the ground and at most 0.082 m before the front reached 1°; with the same draw held for 10 decisions, at most 0.217 m before the bucket touched. The suite checks that an episode driven by such commands reaches the turn. Lifting the bucket off the ground mid-turn ends the episode as `slide` 0.9 s later on seed 10,000,003, and as `stray` 1.9 s later with the slide end switched off; the suite checks both.
 
-**Reward.** The propping reward, with the tracking error ē taken as the tilt error plus the absolute heading error, each averaged over the 20 physics steps:
+**Reward.** The propping reward, with the tracking error ē taken as the tilt error, the absolute heading error and, from the start of the re-centring, the upper structure's angle off the tracks, each averaged over the 20 physics steps, plus the tracks' travel outside the propped turn during the decision, over the 1.99 m gauge:
 
-r = 0.2 + 0.8·exp(−(ē_tilt + ē_heading) / 3°) − 0.03·Δu − 0.03·roll − 0.03·slide − 0.05·landing − 0.05·aloft
+r = 0.2 + 0.8·exp(−(ē_tilt + ē_heading + ē_swing + travel / g) / 3°) − 0.03·Δu − 0.03·roll − 0.03·slide − 0.05·landing − 0.05·aloft
 
-The heading error counts at every step; outside the turn its reference is 0 before and the step after, so a heading that drifts after the turn costs reward. Δu is the mean change over all six commands. Every term lies in [0, 1] as before, so r lies in [0.01, 1]. The scene calls the propping `reward` function and changes only the error it is given, so a change to its set-down terms applies to both tasks.
+The heading error counts at every step; outside the turn its reference is 0 before and the step after, so a heading that drifts after the turn costs reward. The travel term is at least the heading that travel would turn if it were all counter-rotation, so a controller pays for stray travel at every decision, long before the pass limit, while the baseline's 0.2 mm costs it nothing measurable. Without the swing term, a controller that cancelled the baseline's re-centring was paid more than the baseline: on seed 10,000,003, 261.217 against 261.208. With it, 183.3 against 228.4. Δu is the mean change over all six commands. Every term lies in [0, 1] as before, so r lies in [0.01, 1]. The scene calls the propping `reward` function and changes only the error it is given, so a change to its set-down terms applies to both tasks.
 
 **Rungs.** `nominal` and `machines`. The `ground` rung is refused, by the scene and by the command line, because the turn's draws, footprint checks and baseline are written for level ground only.
 
@@ -998,35 +1002,36 @@ python -m hma.train play --task turn --checkpoint ../runs/turn/checkpoint --rung
 
 The task is kept in the checkpoint's `config.json`. A resume, a score or a play of a checkpoint takes its task from there, and refuses a `--task` that differs; a checkpoint written before the turning task has no task in its config and is read as propping. A training rollout is 400 steps per machine for the turn, above its longest episode of 382 decisions, against 300 for propping.
 
-On a 4-core laptop processor, `train --task turn --smoke` (2 processes of 2 machines, rollouts of 16 steps, 256 steps) took 25 s, a resume of it to 512 steps (`train --resume --steps 512`; `--smoke` would set `--steps` back to 256, which the run has already reached) 27 s, and `score --smoke` of the resumed checkpoint on 4 development seeds, baseline and checkpoint, 95 s. `play --task turn` with that checkpoint on seed 10,000,000 printed a pass for the baseline (heading 19.20° for a step of 19.37°) and a fail for the checkpoint, which turned 11.27° and was charged with a heading the belts did not turn; 512 steps of training is not a controller.
+On a 4-core laptop processor, `train --task turn --smoke` (2 processes of 2 machines, rollouts of 16 steps, 256 steps) took 32 s, and `score --smoke` of its checkpoint on 4 development seeds, baseline and checkpoint, 93 s; 256 steps of training is not a controller, and it lost both of the baseline's passes. A resume to more steps takes `train --resume --steps 512`: `--smoke` would set `--steps` back to 256, which the run has already reached.
 
-**Throughput.** Measured as for propping, `throughput --procs 1 --machines 8` on the `machines` rung for 30 s per run, on the same laptop processor with other work using part of it, three runs of each task alternated: the turning scene gave 23.9, 23.4 and 24.0 control steps/s per process, against 30.7, 30.6 and 32.3 for the propping scene in the runs between, about 0.76 of it. These rates are below the propping table's because of the load at the time; only the ratio carries over. For the turning task the throughput command sends random valve commands and leaves the two track residuals at zero, so the tracks follow the baseline: with random track commands nearly every episode ends as `lost` on its first decision, and the same runs measured resets instead, 1.5 to 1.6 control steps/s per process. Propping draws the same random commands as before. Where the extra time goes was not measured.
+**Throughput.** Measured as for propping, `throughput --procs 1 --machines 8` on the `machines` rung for 30 s per run, random commands on all six actions, on the same laptop processor with other work using part of it, six runs of each task alternated: the turning scene gave 24.2, 23.7, 55.8, 25.9, 24.5 and 24.3 control steps/s per process, against 25.6, 26.6, 47.0, 28.2, 33.4 and 26.8 for the propping scene in the runs between. The pairs' ratios are 0.95, 0.89, 1.19, 0.92, 0.73 and 0.91, a median of 0.91; the third pair ran while the other load dropped. These rates are below the propping table's because of that load; only the ratio carries over. Where the extra time goes was not measured.
 
 **Baseline scores.** The baseline in `residual` mode with zero commands, on the 64 development seeds, scene size 8, through `score --task turn`:
 
-| Rung | Pass | Hold share in band (turn) | Mean tilt error | Final heading error, median (largest) | Turn slide, median (largest) | Early ends |
-|---|---|---|---|---|---|---|
-| `nominal` | 75% (48) | 0.75 | 0.79° | 0.06° (0.34°) | 0.011 m (0.037 m) | none |
-| `machines` | 5% (3) | 0.12 | 2.54° | 7.35° (21.26°) | 0.004 m (0.193 m) | 41 lost |
+| Rung | Pass | Hold share in band (turn) | Mean tilt error | Final heading error, mean / median (largest) | Turn slide, median (largest) | Track travel outside the propped turn, largest | Early ends |
+|---|---|---|---|---|---|---|---|
+| `nominal` | 75% (48) | 0.75 | 0.79° | 0.09° / 0.06° (0.34°) | 0.011 m (0.037 m) | 0.2 mm | none |
+| `machines` | 5% (3) | 0.12 | 2.75° | 6.13° / 3.29° (19.86°) | 0.018 m (0.345 m) | 0.270 m | 26 stray, 6 slide |
 
 Failures by condition (an episode can fail several):
 
 | Condition | `nominal` | `machines` |
 |---|---|---|
 | tilt in band under 80% of the turn | 16 | 58 |
-| early end | 0 | 41 (all `lost`) |
-| final heading more than 1.5° off | 0 | 42 |
-| front carries under 50% of its load | 0 | 43 |
-| front moving at 0.02 m/s or faster | 0 | 28 |
-| bucket on the ground at the end | 0 | 26 |
-| front not set down | 0 | 19 |
+| early end | 0 | 32 (26 `stray`, 6 `slide`) |
+| tracks travelled more than 0.05 m outside the propped turn | 0 | 41 |
+| upper structure more than 2° off the tracks | 0 | 41 |
+| final heading more than 1.5° off | 0 | 38 |
+| heading more than 1.5° from what the drive wheels turned | 0 | 36 |
+| front carries under 50% of its load | 0 | 34 |
+| front moving at 0.02 m/s or faster | 0 | 32 |
+| bucket on the ground at the end | 0 | 23 |
+| front not set down | 0 | 20 |
+| bucket slid more than 0.15 m in the turn | 0 | 17 |
 | landing at 0.3 m/s or faster | 0 | 11 |
-| heading more than 1.5° from what the belts turned | 0 | 1 |
-| upper structure more than 2° off the tracks | 0 | 6 |
-| bucket slid more than 0.15 m in the turn | 0 | 3 |
 | roll above 2° | 0 | 0 |
 
-On `nominal` every failure is the tilt band alone: the turn, the slide, the roll, the re-centring and the set-down pass on all 64 seeds, with a largest roll of 0.01° and the upper structure left at most 0.17° off the tracks. The failures are the propping baseline's own undershoot (see *Limits* under Propping environment): by prop distance, 100% pass with the tip 4.2 to 4.9 m ahead against 52% at 4.9 to 5.7 m, and by ramp up 57% pass at 3.0 to 3.5 s. On `machines` the 41 `lost` ends are machines whose front does not reach 1° by the time the tracks turn. The propping baseline undershoots on drawn machines (a mean tilt error of 3.58° on that rung, see *Limits* under Propping environment), and the turning targets of 5° to 10° leave less room than propping's 5° to 20°: on seed 10,000,010 the measured tilt stayed at 0.00° against a reference of 5.8° up to the turn, and the episode ended 0.9 s into it. An early end leaves the heading where it was, which is where most of the 42 heading failures come from.
+On `nominal` every failure is the tilt band alone: the turn, the slide, the roll, the track travel, the re-centring and the set-down pass on all 64 seeds, with a largest roll of 0.01° and the upper structure left at most 0.17° off the tracks. The failures are the propping baseline's own undershoot (see *Limits* under Propping environment): by prop distance, 100% pass with the tip 4.2 to 4.9 m ahead against 52% at 4.9 to 5.7 m, and by ramp up 57% pass at 3.0 to 3.5 s. On `machines`, 41 episodes turn without the front up: their front has not reached 1° by the time the tracks turn, so the tracks travel outside the propped turn, and 26 of them end as `stray` once that travel passes 0.25 m. The propping baseline undershoots on drawn machines (a mean tilt error of 3.58° on that rung, see *Limits* under Propping environment), and the turning targets of 5° to 10° leave less room than propping's 5° to 20°: on seed 10,000,010 the measured tilt stayed at 0.00° against a reference of 5.8° up to the turn, and the episode ended as `stray` 11.3 s in. An early end leaves the heading and the upper structure where they were, which is where 32 of the 38 heading failures and 31 of the 41 re-centring failures come from.
 
 **Left out.**
 
@@ -1111,7 +1116,7 @@ What is assumed or missing:
 - Stability while propped (the machine resting on the rear of its tracks and the bucket) is not checked. `hma.machine.statics.propping` computes a margin, but the checks do not call it yet.
 - Nothing is lifted closer than 4.5 m, because the chart's 4.5 m height row starts there. A lift that stays below 4.5 m height could be rated from the other rows, which start at 1.5 or 3.0 m.
 - The travel pose is assumed, not taken from a manual: the arm stretched ahead with the bucket 0.3 m up. A real operator may carry the arm tucked closer, so the overhead keep-out in travel is conservative.
-- No manual found here permits or forbids turning the undercarriage while propped. The [Hitachi ZX135US-5B manual][zx135] describes raising a track with the bucket (unverified: read only in summary).
+- No manual found here permits or forbids turning the undercarriage while propped. The [Hitachi ZX135US-5B manual][zx135] describes raising a track with the bucket (its p. 217 was read; see [Turning environment](#turning-environment)).
 - Turning on the spot before travelling is not checked against the slope.
 - The machine is assumed to have a boom lowering control device, an overload warning and hose burst valves, which CPA requires above 1 t rated capacity. The simulated machine models none of them.
 - The bucket's angle on the ground when propping is not checked, nor are collisions with other loads, objects or the ground between samples.
@@ -1205,7 +1210,9 @@ python -m hma.train score --out ../runs/prop/score --smoke
 python -m hma.train train --out ../runs/turn --task turn --smoke
 python -m hma.train score --out ../runs/turn/score --task turn --smoke
 python -m hma.train play --task turn
-``` To watch a trained checkpoint and the baseline side by side on one seed:
+```
+
+To watch a trained checkpoint and the baseline side by side on one seed:
 
 ```
 python -m hma.train play --checkpoint ../runs/prop/checkpoint

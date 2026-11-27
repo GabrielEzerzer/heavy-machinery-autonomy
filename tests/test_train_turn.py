@@ -10,14 +10,17 @@ from hma.hydraulics import NOMINAL, Hydraulics
 from hma.machine import inverse_kinematics, load_scene
 from hma.machine.contact import set_friction
 from hma.machine.ground import Ground, apply_ground
+from hma.machine.mass import GAUGE
 from hma.machine.model import STEEL_FRICTION
 from hma.train import footing
+from hma.train.play import summary
 from hma.train.scene import PropScene
 from hma.train.task import DEV_BASE, PropPath, TurnSettings
 from hma.train.turn import ACTIONS, TRACK_SPEED, TurnController, TurnScene
 
 SEED = DEV_BASE + 3
 VALVES = 4
+SPREAD = 0.33
 
 
 def run(scene, actions):
@@ -149,14 +152,14 @@ def spin(scene):
     return commands
 
 
-def test_a_spin_turn_with_the_bucket_in_the_air_fails_and_ends_as_lost():
+def test_a_spin_turn_with_the_bucket_in_the_air_fails_and_ends_as_stray():
     scene = TurnScene(1, "nominal", "direct")
     scene.reset(0, SEED)
     info = finish(scene, spin(scene))
-    assert info["cause"] == "lost"
+    assert info["cause"] == "stray"
     assert not info["passed"]
 
-    no_ends = replace(TurnSettings(), lost_tilt=-1.0, slide_limit=math.inf, overshoot=math.inf)
+    no_ends = replace(TurnSettings(), stray_end=math.inf, slide_limit=math.inf, overshoot=math.inf)
     blind = TurnScene(1, "nominal", "direct", no_ends)
     blind.reset(0, SEED)
     info = finish(blind, spin(blind))
@@ -167,6 +170,16 @@ def test_a_spin_turn_with_the_bucket_in_the_air_fails_and_ends_as_lost():
     assert not info["passed"]
     assert any(reason.startswith("hold share") for reason in reasons)
     assert any(reason.startswith("bucket slid") for reason in reasons)
+    assert any(reason.startswith("tracks travelled") for reason in reasons)
+    assert summary("spin", info, blind).startswith("spin: fail (hold share")
+
+
+def test_a_failed_propping_episode_prints_its_reasons():
+    scene = PropScene(1, "nominal", "direct")
+    scene.reset(0, DEV_BASE)
+    info = finish(scene, lambda t: np.array([[0.0, 1.0, 0.0, 0.0]]))
+    assert info["cause"] == "tilt"
+    assert summary("pushed", info, scene).startswith("pushed: fail (early end: tilt")
 
 
 def test_a_turn_on_the_swing_alone_is_not_counted_as_a_turn_of_the_belts():
@@ -189,8 +202,104 @@ def test_a_turn_on_the_swing_alone_is_not_counted_as_a_turn_of_the_belts():
     assert any(reason.startswith("heading more than") for reason in scene.reasons(info))
 
 
-def test_losing_the_prop_mid_turn_ends_the_episode():
+def test_a_turn_held_back_until_the_ramp_down_fails():
     scene = TurnScene(1, "nominal", "direct")
+    scene.reset(0, SEED)
+    start, end = scene.tasks[0].turn_span
+    controller = scene.controllers[0]
+
+    def commands(t):
+        out = scene.baseline()
+        if start <= t < end:
+            out[0, 0] = 0.0
+            out[0, VALVES:] = 0.0
+        elif t >= end:
+            late = controller(t - (end - start), np.zeros(4), np.zeros((4, 2)))
+            out[0, 0] = late[0] if t < 2 * end - start else out[0, 0]
+            out[0, VALVES:] = late[VALVES:]
+        return out
+
+    info = finish(scene, commands)
+    assert info["turn_slide"] < scene.settings.turn_slide
+    assert info["cause"] == "stray"
+    assert not info["passed"]
+
+
+def test_the_belt_rule_reads_the_drive_wheels_not_the_track_commands():
+    scene = TurnScene(1, "nominal", "direct")
+    scene.reset(0, DEV_BASE)
+    task = scene.tasks[0]
+    start, end = task.turn_span
+    sign = math.copysign(1.0, task.heading)
+    commanded = 0.0
+
+    def commands(t):
+        nonlocal commanded
+        out = scene.baseline()
+        if start <= t < end:
+            out[0, 0] = 0.0
+            out[0, VALVES:] = (-sign, sign)
+        commanded += scene.period * (out[0, VALVES + 1] - out[0, VALVES]) * TRACK_SPEED / GAUGE
+        return out
+
+    info = finish(scene, commands)
+    assert abs(info["belt_heading"] - commanded) > math.radians(1.0)
+    assert not info["passed"]
+
+
+def test_random_residual_commands_survive_the_rest_and_place_phases():
+    scene = TurnScene(1, "nominal")
+    scene.reset(0, DEV_BASE)
+    rng = np.random.default_rng(7)
+    start = scene.tasks[0].turn_span[0]
+    while scene.k[0] * scene.period < start:
+        _, _, done, info = scene.step(rng.normal(0.0, SPREAD, (1, ACTIONS)))
+        assert not done[0], info[0]
+
+
+def test_driving_both_tracks_forward_after_set_down_fails():
+    def drive(scene):
+        centre = scene.tasks[0].recentre_span[0]
+
+        def commands(t):
+            out = scene.baseline()
+            if t >= centre:
+                out[0, VALVES:] = 1.0
+            return out
+
+        return commands
+
+    scene = TurnScene(1, "nominal", "direct")
+    scene.reset(0, SEED)
+    info = finish(scene, drive(scene))
+    assert info["cause"] == "stray"
+    assert not info["passed"]
+    blind = TurnScene(1, "nominal", "direct", replace(TurnSettings(), stray_end=math.inf))
+    blind.reset(0, SEED)
+    info = finish(blind, drive(blind))
+    assert info["cause"] is None and info["stray_travel"] > 1.0
+    assert not info["passed"]
+    assert any(reason.startswith("tracks travelled") for reason in blind.reasons(info))
+
+
+def test_turning_observations_stay_finite_and_in_bounds_under_random_actions():
+    scene = TurnScene(2, "machines", "direct")
+    seen = [scene.reset(0, SEED), scene.reset(1, SEED + 1)]
+    rng = np.random.default_rng(5)
+    for k in range(120):
+        obs, _, done, _ = scene.step(rng.uniform(-1.0, 1.0, (2, ACTIONS)))
+        seen += list(obs)
+        for i in np.flatnonzero(done):
+            seen.append(scene.reset(i, SEED + 10 + k))
+    seen = np.array(seen)
+    assert np.all(np.isfinite(seen))
+    assert np.all((seen >= TurnScene.obs_low) & (seen <= TurnScene.obs_high))
+
+
+@pytest.mark.parametrize(("settings", "cause"), [
+    (TurnSettings(), "slide"), (replace(TurnSettings(), slide_limit=math.inf), "stray")])
+def test_losing_the_prop_mid_turn_ends_the_episode(settings, cause):
+    scene = TurnScene(1, "nominal", "direct", settings)
     scene.reset(0, SEED)
     start, end = scene.tasks[0].turn_span
 
@@ -201,7 +310,7 @@ def test_losing_the_prop_mid_turn_ends_the_episode():
         return out
 
     info = finish(scene, commands)
-    assert info["cause"] == "lost"
+    assert info["cause"] == cause
     assert not info["passed"]
     assert start + 1.0 < scene.k[0] * scene.period < end
 

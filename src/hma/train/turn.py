@@ -1,6 +1,6 @@
 """The turning scene: a PropScene whose machines prop on the bucket, counter-rotate their tracks to
 a new heading while propped, set down and re-centre the upper structure; its six commands, sensed
-heading, pass rule and early ends, and the scripted baseline it is measured against."""
+heading, drive-wheel travel, pass rule and early ends, and the scripted baseline."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import numpy as np
 from hma.hydraulics import BaseController
 from hma.hydraulics.layer import JOINTS, SWING
 from hma.machine.mass import GAUGE
+from hma.machine.tracks import WHEEL_RADIUS, drives
 from hma.train.scene import (
     CAUSES,
     CONTROL_HZ,
@@ -37,9 +38,10 @@ RECENTRE_PUSH = math.radians(1.0)
 RECENTRE_DONE = math.radians(0.3)
 TURN_FIELDS = (
     ("track", 2, 1.0, -1.0, 1.0),
-    ("yaw_rate", 1, 2.0, -5.0, 5.0),
+    ("yaw_rate", 1, 2.0, -10.0, 10.0),
     ("heading_to_go", 1, math.pi / 2, -2.0, 2.0),
     ("heading_reference", len(PREVIEW), math.pi / 2, -1.0, 1.0),
+    ("recentre", len(PREVIEW), 1.0, 0.0, 1.0),
 )
 TURN_SCALE = np.concatenate([np.full(f[1], f[2]) for f in TURN_FIELDS])
 TURN_FRAME = FRAME + len(TURN_SCALE)
@@ -87,9 +89,9 @@ class TurnScene(PropScene):
     actions = ACTIONS
     frame = TURN_FRAME
     obs_low, obs_high = TURN_LOW, TURN_HIGH
-    causes = (*CAUSES, "slide", "overshoot", "lost")
+    causes = (*CAUSES, "slide", "overshoot", "stray")
     episode_arrays = (*EPISODE_ARRAYS, "heading0", "heading_est", "head_total", "turn_tip",
-                      "turn_started", "turn_slide", "peak_roll", "belt_heading")
+                      "turn_started", "turn_slide", "peak_roll", "belt_heading", "stray_travel")
     settings_type = TurnSettings
 
     def __init__(self, n: int, rung: str = "nominal", mode: str = "residual",
@@ -99,6 +101,7 @@ class TurnScene(PropScene):
                              "machines rungs; rough ground is not built for it yet")
         super().__init__(n, rung, mode, settings)
         self._travel = self.layer._travel
+        self._wheels = drives(self.model).dofs
         self.heading0 = np.zeros(n)
         self.heading_est = np.zeros(n)
         self.head_total = np.zeros(n)
@@ -107,6 +110,7 @@ class TurnScene(PropScene):
         self.turn_slide = np.zeros(n)
         self.peak_roll = np.zeros(n)
         self.belt_heading = np.zeros(n)
+        self.stray_travel = np.zeros((n, 2))
 
     def _draw(self, seed: int, surface) -> TurnTask:
         return draw_turn_task(seed, self.settings, self.pivot, self.period)
@@ -126,6 +130,7 @@ class TurnScene(PropScene):
         self.turn_slide[index] = 0.0
         self.peak_roll[index] = 0.0
         self.belt_heading[index] = 0.0
+        self.stray_travel[index] = 0.0
 
     def _sense(self, index: int, sensed, gyro: np.ndarray) -> None:
         if self.k[index] > 0:
@@ -136,8 +141,9 @@ class TurnScene(PropScene):
         t = self.k[index] * self.period
         extra = np.concatenate([self.sent[index, JOINTS:],
                                 [gyro[2] - sensed.velocities[index, SWING],
-                                 task.heading - self.heading_est[index]],
-                                [task.heading_at(t + ahead) for ahead in PREVIEW]])
+                                 _wrap(task.heading - self.heading_est[index])],
+                                [task.heading_at(t + ahead) for ahead in PREVIEW],
+                                [float(t + ahead >= task.recentre_span[0]) for ahead in PREVIEW]])
         return np.concatenate([super()._frame(index, sensed, gyro, accel, tilt),
                                extra / TURN_SCALE])
 
@@ -149,40 +155,47 @@ class TurnScene(PropScene):
         tasks = self.tasks
         self._head_ref = np.array([[task.heading_at(t) for t in row]
                                    for task, row in zip(tasks, times, strict=True)])
-        spans = np.array([task.turn_span for task in tasks])
-        self._in_turn = (times >= spans[:, :1]) & (times < spans[:, 1:])
+        marks = np.array([(*task.turn_span, task.recentre_span[0]) for task in tasks])
+        self._in_turn = (times >= marks[:, :1]) & (times < marks[:, 1:2])
+        self._centring = times >= marks[:, 2:]
         self._goal = np.array([task.heading for task in tasks])
-        spin = (commands[:, JOINTS + 1] - commands[:, JOINTS]) / 2.0 * TRACK_SPEED
-        self._turning = np.abs(spin) > self.settings.turning
-        self._head_sum = np.zeros(self.n)
-        self._lost = np.zeros(self.n, bool)
+        self._tracked = np.zeros(self.n)
+        self._stray_before = self.stray_travel.copy()
         self._over = np.zeros(self.n, bool)
 
     def _watch(self, step: int, rot: np.ndarray, pitch: np.ndarray, roll: np.ndarray) -> None:
         s = self.settings
         heading = _wrap(_heading(rot) - self.heading0)
         error = np.abs(heading - self._head_ref[:, step])
-        self._head_sum += error
         self.head_total += error
+        swing = np.abs(_wrap(self.data.qpos[self._swing_q]))
+        self._tracked += error + np.where(self._centring[:, step], swing, 0.0)
         self.peak_roll = np.maximum(self.peak_roll, np.abs(roll))
-        belts = self.data.actuator_velocity[self._travel]
+        belts = self.data.qvel[self._wheels] * WHEEL_RADIUS
         self.belt_heading += self.dt * (belts[:, 1] - belts[:, 0]) / GAUGE
         inside = self._in_turn[:, step]
+        stray = ~(inside & (pitch >= s.propped))
+        self.stray_travel += np.where(stray[:, None], belts * self.dt, 0.0)
         tip = self.data.site_xpos[self._tips, :2]
         first = inside & ~self.turn_started
         self.turn_tip[first] = tip[first]
         self.turn_started |= inside
         moved = np.linalg.norm(tip - self.turn_tip, axis=1)
         self.turn_slide = np.where(inside, np.maximum(self.turn_slide, moved), self.turn_slide)
-        self._lost |= self._turning & (np.abs(pitch) < s.lost_tilt)
-        self._over |= (heading - self._goal) * np.sign(self._goal) > s.overshoot
+        toward = heading * np.sign(self._goal)
+        self._over |= (toward - np.abs(self._goal) > s.overshoot) | (toward < -s.overshoot)
 
     def _error(self, tilt_error: np.ndarray, done_steps: int) -> np.ndarray:
-        return tilt_error + self._head_sum / max(done_steps, 1)
+        stray = np.abs(self.stray_travel - self._stray_before).sum(1) / GAUGE
+        return tilt_error + self._tracked / max(done_steps, 1) + stray
+
+    def _stray(self) -> np.ndarray:
+        return np.abs(self.stray_travel).sum(1)
 
     def _ends(self) -> dict[str, np.ndarray]:
-        return {"slide": self.turn_slide > self.settings.slide_limit, "overshoot": self._over,
-                "lost": self._lost}
+        s = self.settings
+        return {"slide": self.turn_slide > s.slide_limit, "overshoot": self._over,
+                "stray": self._stray() > s.stray_end}
 
     def _turn_reasons(self, info: dict) -> list[str]:
         s = self.settings
@@ -193,7 +206,10 @@ class TurnScene(PropScene):
                   (info["peak_roll"] > s.peak_roll,
                    f"roll above {math.degrees(s.peak_roll):.0f} deg"),
                   (abs(info["heading"] - info["belt_heading"]) > s.belts,
-                   f"heading more than {math.degrees(s.belts):.1f} deg from what the belts turned"),
+                   f"heading more than {math.degrees(s.belts):.1f} deg from what the drive wheels "
+                   "turned"),
+                  (info["stray_travel"] > s.stray_pass,
+                   f"tracks travelled more than {s.stray_pass} m outside the propped turn"),
                   (abs(info["swing_left"]) > s.centred,
                    f"upper structure more than {math.degrees(s.centred):.0f} deg off the tracks"))
         return [reason for failed, reason in checks if failed]
@@ -210,6 +226,7 @@ class TurnScene(PropScene):
             "heading_tracking": float(self.head_total[index]
                                       / max(int(self.steps_total[index]), 1)),
             "belt_heading": float(self.belt_heading[index]),
+            "stray_travel": float(self._stray()[index]),
             "turn_slide": float(self.turn_slide[index]), "peak_roll": float(self.peak_roll[index]),
             "swing_left": float(_wrap(self.data.qpos[self._swing_q[index]])),
         })

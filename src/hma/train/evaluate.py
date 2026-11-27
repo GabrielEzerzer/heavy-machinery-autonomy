@@ -16,7 +16,6 @@ from pathlib import Path
 
 import numpy as np
 
-from hma.hydraulics.layer import JOINTS
 from hma.train.scene import PropScene, warm_compiled_step
 from hma.train.task import DEV_BASE, HELD_OUT_BASE, Settings, TurnTask, training_seed
 from hma.train.turn import TurnScene
@@ -130,15 +129,24 @@ def score(rung: str, mode: str, seeds: list[int], machines: int, procs: int,
     return sorted(rows, key=lambda r: (r["controller"], order[r["seed"]]))
 
 
-def _summary(rows: list[dict]) -> str:
+def _turning(rows: list[dict]) -> bool:
+    return bool(rows) and "heading_error" in rows[0]
+
+
+def _heading_error(rows: list[dict]) -> float:
+    return math.degrees(float(np.mean([abs(r["heading_error"]) for r in rows])))
+
+
+def _summary(rows: list[dict], turning: bool = False) -> str:
     if not rows:
-        return "| 0 | - | - | - | - |"
+        return "| 0 | - | - | - | - |" + (" - |" if turning else "")
     passed = 100.0 * np.mean([r["passed"] for r in rows])
     share = float(np.mean([r["hold_share"] for r in rows]))
     error = math.degrees(float(np.mean([r["tilt_error"] for r in rows])))
+    heading = f" {_heading_error(rows):.2f} |" if turning else ""
     causes = Counter(r["cause"] for r in rows if r["cause"])
     ends = ", ".join(f"{c} {causes[c]}" for c in CAUSES if causes[c]) or "none"
-    return f"| {len(rows)} | {passed:.0f}% | {share:.2f} | {error:.2f} | {ends} |"
+    return f"| {len(rows)} | {passed:.0f}% | {share:.2f} | {error:.2f} |{heading} {ends} |"
 
 
 def _mean_and_error(values: np.ndarray) -> str:
@@ -157,18 +165,26 @@ def paired(rows: list[dict], reference: str = "baseline") -> list[str]:
         share = np.array([c["hold_share"] - b["hold_share"] for b, c in pairs])
         error = np.degrees([c["tilt_error"] - b["tilt_error"] for b, c in pairs])
         flips = Counter((b["passed"], c["passed"]) for b, c in pairs)
+        turning = _turning(rows)
+        heading = np.degrees([abs(c["heading_error"]) - abs(b["heading_error"])
+                              for b, c in pairs]) if turning else None
+        headed = (f"; change in final heading error {_mean_and_error(heading)} deg"
+                  if turning else "")
         lines += [f"### {controller} against {reference}, seed by seed", "",
                   f"{len(pairs)} seeds. Change in hold share in band "
-                  f"{_mean_and_error(share)}; change in tilt error {_mean_and_error(error)} deg "
-                  "(mean ± standard error of the paired differences). Passes gained "
+                  f"{_mean_and_error(share)}; change in tilt error {_mean_and_error(error)} deg"
+                  f"{headed} (mean ± standard error of the paired differences). Passes gained "
                   f"{flips[(False, True)]}, lost {flips[(True, False)]}.", "",
                   f"| seed | pass ({reference}, {controller}) | hold share in band | "
-                  "tilt error (deg) |", "|---|---|---|---|"]
+                  "tilt error (deg) |" + (" final heading error (deg) |" if turning else ""),
+                  "|---|---|---|---|" + ("---|" if turning else "")]
         for b, c in pairs:
+            column = (f" {math.degrees(abs(b['heading_error'])):.2f}, "
+                      f"{math.degrees(abs(c['heading_error'])):.2f} |" if turning else "")
             lines.append(f"| {b['seed']} | {'yes' if b['passed'] else 'no'}, "
                          f"{'yes' if c['passed'] else 'no'} | {b['hold_share']:.2f}, "
                          f"{c['hold_share']:.2f} | {math.degrees(b['tilt_error']):.2f}, "
-                         f"{math.degrees(c['tilt_error']):.2f} |")
+                         f"{math.degrees(c['tilt_error']):.2f} |" + column)
         lines.append("")
     return lines
 
@@ -181,13 +197,15 @@ def table(rows: list[dict]) -> str:
     lines = []
     for controller in sorted({r["controller"] for r in rows}):
         mine = [r for r in rows if r["controller"] == controller]
+        turning = _turning(mine)
+        columns = ("| episodes | pass | hold share in band | tilt error (deg) | "
+                   + ("final heading error (deg) | " if turning else "") + "early ends |")
+        rule = "|---|---|---|---|---|---|" + ("---|" if turning else "")
         lines += [f"### {controller}, rung {mine[0]['rung']}", "",
                   f"Scene size {mine[0]['scene_size']} machines; each seed keeps the slot its "
                   "place in the seed list gives it.", "",
-                  "| group | episodes | pass | hold share in band | tilt error (deg) | "
-                  "early ends |", "|---|---|---|---|---|---|", "| all " + _summary(mine), ""]
-        lines += ["| drawn parameter (range) | episodes | pass | hold share in band | "
-                  "tilt error (deg) | early ends |", "|---|---|---|---|---|---|"]
+                  "| group " + columns, rule, "| all " + _summary(mine, turning), ""]
+        lines += ["| drawn parameter (range) " + columns, rule]
         for name in DRAWN:
             if name not in mine[0]:
                 continue
@@ -200,7 +218,7 @@ def table(rows: list[dict]) -> str:
                 picked = [r for r, keep in zip(mine, (values >= edges[k]) & upper, strict=True)
                           if keep]
                 label = f"{name} {edges[k]:.3g} to {edges[k + 1]:.3g}"
-                lines.append(f"| {label} " + _summary(picked))
+                lines.append(f"| {label} " + _summary(picked, turning))
         lines.append("")
         lines += rules(mine)
     return "\n".join(lines + paired(rows))
@@ -217,8 +235,11 @@ def rules(rows: list[dict]) -> list[str]:
              f"{max(r['turn_slide'] for r in rows):.3f} m. Peak roll: largest "
              f"{math.degrees(max(r['peak_roll'] for r in rows)):.2f} deg. Upper structure left "
              f"off the tracks: largest {math.degrees(max(abs(r['swing_left']) for r in rows)):.2f}"
-             " deg. Heading away from what the belts turned: largest "
-             f"{np.degrees(max(abs(r['heading'] - r['belt_heading']) for r in rows)):.2f} deg.",
+             " deg. Heading away from what the drive wheels turned: largest "
+             f"{np.degrees(max(abs(r['heading'] - r['belt_heading']) for r in rows)):.2f} deg. "
+             "Track travel outside the propped turn: median "
+             f"{np.median([r['stray_travel'] for r in rows]):.4f} m, largest "
+             f"{max(r['stray_travel'] for r in rows):.4f} m.",
              "", "| rule | episodes failing |", "|---|---|"]
     lines += [f"| {reason} | {count} |" for reason, count in sorted(counts.items())]
     return lines + [""]
@@ -243,18 +264,12 @@ def throughput(rung: str, procs: int, machines: int, seconds: float, seed: int =
     try:
         envs.reset()
         rng = np.random.default_rng(seed)
-
-        def commands() -> np.ndarray:
-            out = rng.uniform(-1.0, 1.0, (envs.num_envs, envs.actions))
-            out[:, JOINTS:] = 0.0
-            return out
-
         for _ in range(3):
-            envs.step_async(commands())
+            envs.step_async(rng.uniform(-1.0, 1.0, (envs.num_envs, envs.actions)))
             envs.step_wait()
         decisions, wall0 = 0, time.perf_counter()
         while time.perf_counter() - wall0 < seconds:
-            envs.step_async(commands())
+            envs.step_async(rng.uniform(-1.0, 1.0, (envs.num_envs, envs.actions)))
             envs.step_wait()
             decisions += 1
         wall = time.perf_counter() - wall0

@@ -189,8 +189,9 @@ class TurnSettings(Settings):
     peak_roll: float = math.radians(2.0)
     centred: float = math.radians(2.0)
     overshoot: float = math.radians(5.0)
-    lost_tilt: float = math.radians(1.0)
-    turning: float = 0.02
+    propped: float = math.radians(1.0)
+    stray_pass: float = 0.05
+    stray_end: float = 0.25
 
 
 @dataclass(frozen=True)
