@@ -1,6 +1,6 @@
-"""Command line: python -m hma.train train|score|throughput --out DIR. Train runs PPO over scenes in
-worker processes with checkpoints and resume; score runs a checkpoint and the baseline over the
-development seeds; throughput times control steps per process. Run with --help for options."""
+"""Command line: python -m hma.train train|score|throughput --out DIR, or play. Train runs PPO in
+worker processes with checkpoints and resume; score runs a checkpoint and the baseline over the dev
+seeds; throughput times control steps; play shows one episode in the viewer. See --help."""
 
 from __future__ import annotations
 
@@ -227,6 +227,19 @@ def score(args) -> None:
     print(path.read_text(encoding="utf-8"))
 
 
+def play(args) -> None:
+    from hma.train.play import watch
+
+    if not args.checkpoint:
+        watch(args.rung, args.seed)
+        return
+    from hma.train.evaluate import load_policy
+
+    config = read_config(Path(args.checkpoint))
+    watch(args.rung, args.seed, load_policy(Path(args.checkpoint)), config["mode"],
+          Settings(scale=config["scale"]))
+
+
 def throughput(args) -> None:
     from hma.train.evaluate import throughput as run
 
@@ -275,12 +288,17 @@ def main(argv: list[str] | None = None) -> None:
     score_args.add_argument("--dev-size", type=int, default=64)
     speed_args = commands.choices["throughput"]
     speed_args.add_argument("--seconds", type=float, default=30.0, help="time to step for")
+    play_args = commands.add_parser("play", help="watch the baseline and a checkpoint on one seed")
+    play_args.add_argument("--checkpoint", help="a checkpoint directory (default: baseline twice)")
+    play_args.add_argument("--rung", choices=sorted(RUNGS), default="nominal")
+    play_args.add_argument("--seed", type=int, default=dev_seeds(1)[0],
+                           help="a development seed; held-out seeds are refused")
     args = parser.parse_args(argv)
-    if args.smoke:
+    if getattr(args, "smoke", False):
         for key, value in SMOKE.items():
             if hasattr(args, key):
                 setattr(args, key, value)
-    {"train": train, "score": score, "throughput": throughput}[args.command](args)
+    {"train": train, "score": score, "throughput": throughput, "play": play}[args.command](args)
 
 
 if __name__ == "__main__":
