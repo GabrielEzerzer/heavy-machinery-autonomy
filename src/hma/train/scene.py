@@ -282,7 +282,10 @@ class PropScene:
     def _stand(self, index: int, seed: int, machine, friction: float) -> tuple:
         side = float(BOOM_PIVOT[1])
         for attempt in range(PROP_DRAWS):
-            ground = draw_ground(seed, attempt)
+            try:
+                ground = draw_ground(seed, attempt)
+            except RuntimeError:
+                continue
             if (footing.slope_deg(ground) > LIMITS.bucket_ground_slope_deg
                     or not footing.even_stance(ground)):
                 continue
