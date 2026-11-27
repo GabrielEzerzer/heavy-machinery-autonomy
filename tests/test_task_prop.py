@@ -13,7 +13,7 @@ import pytest
 from conftest import task_json
 from hma.task import DEMO_SCENE
 from hma.task.__main__ import main, run_plan
-from hma.task.checks import Plan
+from hma.task.checks import LIMITS, Plan
 from hma.task.prop import LIFT_M, PITCH, RAMP_S, TARGET, CannotRun, prop_task
 from hma.task.scene import Pose, Scene, Zone
 from hma.task.spec import TaskType
@@ -35,8 +35,12 @@ def box(x0, x1, height=0.0, slope=0.0):
     return Zone("Z", "zone", ((x0, -2.0), (x1, -2.0), (x1, 2.0), (x0, 2.0)), height, slope, 0.0)
 
 
-def prop_source(instruction, scene):
-    return task_json(task_type="prop", hold_s=5)
+def prop_source(hold_s=5):
+    return lambda instruction, scene: task_json(task_type="prop", hold_s=hold_s)
+
+
+def test_the_checks_look_for_a_prop_point_only_where_the_controller_trained():
+    assert LIMITS.prop_radius_m == Settings().prop_x
 
 
 def test_the_fixed_values_lie_inside_the_ranges_the_controller_trained_on():
@@ -81,24 +85,36 @@ def test_without_run_the_command_never_opens_the_viewer(capsys, tmp_path):
     def never(*args):
         raise AssertionError("the viewer opened")
 
-    code = main([INSTRUCTION, "--cache", str(tmp_path)], source=prop_source,
+    code = main([INSTRUCTION, "--cache", str(tmp_path)], source=prop_source(),
                 confirm=lambda plan: True, show=never)
     assert code == 0 and capsys.readouterr().out.rstrip().endswith(
         "APPROVED: prop the machine on its bucket, hold 5 s, set down")
 
 
-@pytest.mark.parametrize(("extra", "reason"), [
-    ([], "CANNOT RUN: The bucket would press 6.60 m ahead"),
-    (["--machine-seed", str(HELD_OUT_BASE)], "CANNOT RUN: held-out seeds are never played"),
+@pytest.mark.parametrize(("hold_s", "extra", "reason"), [
+    (20, [], "CANNOT RUN: A hold of 20 s is outside the 3 to 10 s"),
+    (5, ["--machine-seed", str(HELD_OUT_BASE)], "CANNOT RUN: held-out seeds are never played"),
 ])
-def test_a_plan_that_cannot_run_opens_no_window_and_exits_non_zero(capsys, tmp_path, extra,
-                                                                    reason):
+def test_a_plan_that_cannot_run_opens_no_window_and_exits_non_zero(capsys, tmp_path, hold_s,
+                                                                    extra, reason):
     opened = []
-    code = main([INSTRUCTION, "--run", "--cache", str(tmp_path), *extra], source=prop_source,
-                confirm=lambda plan: True, show=lambda *args: opened.append(args))
+    code = main([INSTRUCTION, "--run", "--cache", str(tmp_path), *extra],
+                source=prop_source(hold_s), confirm=lambda plan: True,
+                show=lambda *args: opened.append(args))
     out = capsys.readouterr().out
     assert code == 3 and not opened
     assert "APPROVED" in out and reason in out
+
+
+def test_the_demo_instruction_goes_from_approval_to_a_task_in_the_viewer(capsys, tmp_path):
+    shown = []
+    code = main([INSTRUCTION, "--run", "--cache", str(tmp_path)], source=prop_source(),
+                confirm=lambda plan: True, show=lambda *args: shown.append(args) or (None, None))
+    out = capsys.readouterr().out
+    ((rung, seed, checkpoint, task),) = shown
+    assert code == 0 and (rung, seed, checkpoint) == ("nominal", DEV_BASE, None)
+    assert task.prop_x == pytest.approx(4.3) and task.hold == 5.0
+    assert "Running: the bucket presses 4.30 m ahead" in out
 
 
 def test_a_runnable_plan_runs_both_machines_to_the_end_and_prints_both_outcomes(capsys):
