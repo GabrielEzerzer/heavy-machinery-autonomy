@@ -115,6 +115,13 @@ def reward(s: Settings, error, change, roll, slide, landing, shortfall) -> np.nd
             - w["set_down"] * np.clip(shortfall, 0.0, 1.0))
 
 
+def warm_compiled_step() -> None:
+    model = load_scene(1)
+    layer = Hydraulics(model, mujoco.MjData(model), [NOMINAL], CONTROL_HZ)
+    layer.reset(0, NOMINAL)
+    layer.step()
+
+
 class PropScene:
     def __init__(self, n: int, rung: str = "nominal", mode: str = "residual",
                  settings: Settings | None = None):

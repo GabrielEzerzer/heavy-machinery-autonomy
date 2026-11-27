@@ -10,7 +10,7 @@ import numpy as np
 from gymnasium import spaces
 from stable_baselines3.common.vec_env import VecEnv
 
-from hma.train.scene import OBS_HIGH, OBS_LOW, PropScene
+from hma.train.scene import OBS_HIGH, OBS_LOW, PropScene, warm_compiled_step
 from hma.train.task import Settings, training_seed
 
 
@@ -123,6 +123,7 @@ def _worker(pipe, args) -> None:
 class ProcVecEnv(VecEnv):
     def __init__(self, scenes: int, n: int, rung: str, mode: str, seed: int,
                  settings: Settings | None = None):
+        warm_compiled_step()
         context = mp.get_context("spawn")
         self.n = n
         self.pipes, self.processes = [], []

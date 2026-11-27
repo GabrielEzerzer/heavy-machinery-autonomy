@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from hma.train.scene import CAUSES, PropScene
+from hma.train.scene import CAUSES, PropScene, warm_compiled_step
 from hma.train.task import DEV_BASE, HELD_OUT_BASE, Settings, training_seed
 
 DRAWN = ("target", "ramp_up", "hold", "ramp_down", "prop_x", "pitch", "friction", "slope",
@@ -108,6 +108,7 @@ def score(rung: str, mode: str, seeds: list[int], machines: int, procs: int,
     if procs <= 1 or len(groups) == 1:
         parts = list(map(run_group, *args))
     else:
+        warm_compiled_step()
         with ProcessPoolExecutor(min(procs, len(groups)), mp_context=get_context("spawn")) as pool:
             parts = list(pool.map(run_group, *args))
     rows = [row for part in parts for row in part]
