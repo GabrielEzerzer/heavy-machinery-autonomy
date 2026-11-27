@@ -95,6 +95,7 @@ def test_a_solver_failure_ends_only_its_own_machine_and_cuts_the_rest_short(kind
     for _ in range(before):
         obs = scene.step(np.zeros((3, 4)))[0]
     error = scene.err_total / scene.steps_total
+    speed = np.linalg.norm(scene._part_velocity(), axis=1).max(1)
     if kind == "acceleration":
         scene.data.xfrc_applied[scene.model.body(machine_prefix(1) + "bucket").id, 2] = 1e30
     else:
@@ -107,6 +108,7 @@ def test_a_solver_failure_ends_only_its_own_machine_and_cuts_the_rest_short(kind
         assert info[i]["cause"] is None and info[i]["truncated"] and info[i]["cut_short"]
         assert not info[i]["passed"]
         assert info[i]["tilt_error"] == error[i]
+        assert info[i]["front_speed"] == speed[i]
 
 
 def test_a_machine_that_goes_non_finite_without_a_warning_ends_alone_and_keeps_a_finite_view():

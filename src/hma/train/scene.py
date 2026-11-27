@@ -452,6 +452,7 @@ class PropScene:
         rot = _matrices(data.qpos[base_q[:, None] + np.arange(3, 7)])
         pitch = _tilts(np.einsum("nk,nkj->nj", self.stance, rot))[0]
         bucket, front = self.apart == 0, self.front_prev.copy()
+        motion = self._part_velocity(rot)
         done_steps = self.steps
         for step in range(self.steps):
             self.layer.step()
@@ -502,7 +503,8 @@ class PropScene:
             self.front_prev = front
             if resting[:, step].any():
                 load_sum += np.where(resting[:, step, None], self._front_load(), 0.0)
-            self.corner_prev = self._approach(self._part_velocity(rot))
+            motion = self._part_velocity(rot)
+            self.corner_prev = self._approach(motion)
         self.landing = np.maximum(self.landing, fresh)
         self.recent[:, :-1] = self.recent[:, 1:]
         self.recent[:, -1] = fresh
@@ -544,7 +546,6 @@ class PropScene:
             flags = {"unstable": failed[i], "contact": forbidden[i], "strike": struck[i],
                      "tilt": worst_tilt[i] > s.tilt_limit, "roll": worst_roll[i] > s.roll_limit}
             causes.append(None if cut[i] else next((c for c in CAUSES if flags[c]), None))
-        motion = self._part_velocity()
         obs = np.zeros((n, HISTORY * FRAME))
         terminated = np.zeros(n, bool)
         infos: list[dict] = [{} for _ in range(n)]
