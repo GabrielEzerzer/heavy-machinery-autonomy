@@ -50,7 +50,7 @@ class Settings:
     roll_limit: float = math.radians(10.0)
     sigma: float = math.radians(3.0)
     floor: float = 0.2
-    weights: dict = field(default_factory=lambda: {"change": 0.03, "roll": 0.03, "slide": 0.03,
+    weights: dict = field(default_factory=lambda: {"change": 2.0, "roll": 0.03, "slide": 0.03,
                                                    "landing": 0.05, "set_down": 0.05})
     roll_scale: float = math.radians(5.0)
     slide_scale: float = 0.05
