@@ -405,6 +405,11 @@ class PropScene:
                 warning.number = 0
         return seen
 
+    def tilt(self, index: int) -> tuple[float, float]:
+        quat = self.data.qpos[self._base_q[index] + 3:self._base_q[index] + 7]
+        up = self.stance[index] @ _matrices(quat[None])[0]
+        return self.tasks[index].tilt(self.k[index] * self.period), float(_tilts(up[None])[0][0])
+
     def baseline(self) -> np.ndarray:
         sensed = self.layer.observe()
         out = np.zeros((self.n, JOINTS))
