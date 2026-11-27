@@ -122,9 +122,10 @@ def watch(rung: str, seed: int, policy=None, mode: str = "residual",
         start, frames = time.perf_counter(), 0
         while viewer.is_running():
             running = None in outcomes
+            if running:
+                scenes, outcomes = next(steps)
             with viewer.lock():
                 if running:
-                    scenes, outcomes = next(steps)
                     copy()
                 viewer.user_scn.ngeom = 0
                 draw_hydraulics(display.model, display.data, viewer.user_scn)
