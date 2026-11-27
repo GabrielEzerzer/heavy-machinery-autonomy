@@ -61,7 +61,7 @@ FRAME_HIGH = np.concatenate([np.full(f[1], f[4]) for f in FIELDS])
 OBS_LOW = np.tile(FRAME_LOW, HISTORY)
 OBS_HIGH = np.tile(FRAME_HIGH, HISTORY)
 SCALE = np.concatenate([np.full(f[1], f[2]) for f in FIELDS])
-EPISODE_ARRAYS = ("k", "steps_total", "stance", "est0", "sent", "history", "up", "v_prev",
+EPISODE_ARRAYS = ("k", "steps_total", "stance", "est0", "sent", "smooth", "history", "up", "v_prev",
                   "gyro_bias", "accel_bias", "imu_on", "tip_prev", "apart", "front_prev",
                   "corner_prev", "touched", "rest_load", "rest_count", "landing", "recent",
                   "end_load", "end_steps", "in_band", "hold_steps", "err_total", "done",
@@ -204,6 +204,7 @@ class PropScene:
         self.stance = np.tile([0.0, 0.0, 1.0], (n, 1))
         self.est0 = np.zeros((n, 2))
         self.sent = np.zeros((n, JOINTS))
+        self.smooth = np.zeros((n, JOINTS))
         self.history = np.zeros((n, HISTORY, FRAME))
         self.up = np.zeros((n, 3))
         self.v_prev = np.zeros((n, 3))
@@ -343,6 +344,7 @@ class PropScene:
         self.k[index] = 0
         self.steps_total[index] = 0
         self.sent[index] = 0.0
+        self.smooth[index] = 0.0
         self.tip_prev[index] = self.data.site_xpos[self._tips[index]]
         self.apart[index] = self._hop + 1
         self.front_prev[index] = self._contacts()[1][index]
@@ -437,7 +439,8 @@ class PropScene:
             raise ValueError("every machine must be reset before the scene steps")
         commands = np.clip(actions, -1.0, 1.0)
         if self.mode == "residual":
-            commands = np.clip(self.baseline() + self.settings.scale * commands, -1.0, 1.0)
+            self.smooth += self.settings.smoothing * (commands - self.smooth)
+            commands = np.clip(self.baseline() + self.settings.scale * self.smooth, -1.0, 1.0)
         self.layer.act(commands)
         n, dt, data, s = self.n, self.dt, self.data, self.settings
         times = (self.k[:, None] * self.steps + np.arange(1, self.steps + 1)) * dt

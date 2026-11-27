@@ -62,6 +62,7 @@ class Settings:
     window: float = 0.5
     still: float = 0.02
     scale: float = 0.3
+    smoothing: float = 0.28
 
 
 @dataclass(frozen=True)
