@@ -39,6 +39,8 @@ class Settings:
     rest: float = 4.0
     place: float = 2.5
     ramp: tuple[float, float] = (3.0, 6.0)
+    ramp_down: tuple[float, float] = (6.0, 10.0)
+    settle: float = 1.5
     hold: tuple[float, float] = (3.0, 10.0)
     final: float = 3.0
     prop_x: tuple[float, float] = (3.5, 6.5)
@@ -78,10 +80,11 @@ class Task:
     rest: float
     place: float
     final: float
+    settle: float = 0.0
 
     @property
     def length(self) -> float:
-        return self.rest + self.ramp_up + self.hold + self.ramp_down + self.final
+        return self.rest + self.ramp_up + self.hold + self.ramp_down + self.settle + self.final
 
     @property
     def hold_span(self) -> tuple[float, float]:
@@ -154,7 +157,7 @@ def draw_task(seed: int, settings: Settings, pivot: tuple[float, float, float],
             target=float(rng.uniform(*settings.target)),
             ramp_up=float(rng.uniform(*settings.ramp)),
             hold=float(rng.uniform(*settings.hold)),
-            ramp_down=float(rng.uniform(*settings.ramp)),
+            ramp_down=float(rng.uniform(*settings.ramp_down)),
             prop_x=prop_x,
             start_z=ground + float(rng.uniform(*settings.lift)),
             pitch=float(rng.uniform(*settings.pitch)),
@@ -162,6 +165,7 @@ def draw_task(seed: int, settings: Settings, pivot: tuple[float, float, float],
             rest=settings.rest,
             place=settings.place,
             final=settings.final,
+            settle=settings.settle,
         )
         if reachable(PropPath(task, pivot), period) and reachable(
                 PropPath(task, pivot, ground), period):
