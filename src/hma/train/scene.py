@@ -321,7 +321,10 @@ class PropScene:
         self.controllers[index] = BaseController(PropPath(task, self.pivot), CONTROL_HZ)
 
     def reset(self, index: int, seed: int, task: Task | None = None) -> np.ndarray:
-        self._write(index, seed, task)
+        if task is None:
+            self._write(index, seed)
+        else:
+            self._write(index, seed, task)
         mujoco.mj_forward(self.model, self.data)
         rng = self._imu_rngs[index] = np.random.default_rng((seed, 11))
         on = self.imu_on[index] = float(RUNGS[self.rung].machines)
