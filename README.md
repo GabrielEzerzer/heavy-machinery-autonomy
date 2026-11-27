@@ -549,7 +549,7 @@ The gain is set by the corner where every range is at its worst at once: 0.6 s d
 
 `hma.train` is the training environment for propping. The machine pushes its bucket into the ground ahead and lifts the front of its tracks, so that the tilt follows a reference over time; then it sets them down again. `PropScene` holds several machines in one MuJoCo scene, and one hydraulics layer steps them together. Each machine runs its own episode on its own ground, built, stood and settled through `hma.machine.ground` and stepped through `Hydraulics.step`, which runs `tracks.step` and its power cap on every physics step. The travel valves stay shut for the whole episode, so the travel brakes hold the tracks (see *Brakes* below).
 
-**Which step the figures come from.** The hydraulics step is compiled ([issue 50](../../issues/50)). These figures in this section were measured again on the compiled step: the baseline scores, the landing speeds and set-down loads quoted with them, the per-seed sensitivity, the throughput table, the warm start's cost, the time shares and the 32-core estimate. Every other figure here was measured with the step as NumPy code, before it was compiled. The two steps agree to round-off (see *Compiled against NumPy* under Machine on the ground), and on the 64 development seeds of each rung the baseline gives the same outcome on every seed with both.
+**Which step the figures come from.** The hydraulics step is compiled ([issue 50](../../issues/50)). These figures in this section were measured again on the compiled step: the baseline scores, the landing speeds and set-down loads quoted with them, the per-seed sensitivity, the throughput table, the warm start's cost, the time shares and the 32-processor figures. Every other figure here was measured with the step as NumPy code, before it was compiled. The two steps agree to round-off (see *Compiled against NumPy* under Machine on the ground), and on the 64 development seeds of each rung the baseline gives the same outcome on every seed with both.
 
 **Episode contract.** One seed draws one episode. When machine *i* resets, the scene makes these draws in order, each from its own random stream:
 
@@ -761,7 +761,7 @@ python -m hma.train play --checkpoint ../runs/prop/checkpoint --rung nominal --s
 
 `play` opens the viewer on one episode at real time, the baseline on the far left and the checkpoint on the near right, both on `--seed` (the first development seed by default; held-out seeds are refused). It takes the mode and correction scale from the checkpoint's `config.json`; without `--checkpoint` both machines run the baseline. Each controller runs in its own one-machine scene, because a scene cannot step while one of its machines has ended; a finished machine is not stepped again, so it stands still where its episode ended. A two-machine scene built from the same seed shows both. When both episodes have ended it prints each one's pass or fail and why, its hold share in band, its tilt error and its landing speed, and the viewer stays open until it is closed. On `nominal` seeds 10,000,000, 10,000,001, 10,000,003 and 10,000,004 these match the `score` rows from scenes of eight machines: the same pass, early end, hold share and decisions; the tilt error, landing speed and set-down load differ by under 10⁻⁷.
 
-**On 32 cores.** First size the run, then train for an hour, then score:
+**On 32 processors.** First size the run, then train for an hour, then score:
 
 ```
 python -m hma.train throughput --out ../runs/speed32 --rung nominal --procs 30 --machines 8 --seconds 60
@@ -771,7 +771,7 @@ python -m hma.train score --out ../runs/prop32/score --rung nominal --checkpoint
 
 Numba compiles the hydraulics step the first time it runs and keeps it in a cache beside the source (`__pycache__`); compiling took 98.5 s on the laptop. Training, `score` with more than one process and `throughput` compile the step, or load it from the cache, in the parent process before they start the workers, so every worker loads it from the cache. With the hydraulics cache cleared, the parent took 107 s to start the workers and a worker's first decision took 0.54 s; with the workers left to compile it themselves, a worker's first decision took 121 s. On a new install the first command above spends up to two minutes compiling, and the commands after it start at once.
 
-Thirty worker processes of eight machines give 240 machines and leave two cores for the learner, which runs on two maths threads while every worker keeps one. An update takes 300 steps from each machine, 72,000 samples, in four mini-batches of 18,000. The throughput run takes under two minutes and writes `../runs/speed32/throughput.md`. If a core of the 32-core machine runs like one of the laptop's in the table below, it should report about 77 control steps/s per process and 2,300 in all, or somewhat less with the learner's threads competing; this is an estimate from the `machines` rung on the compiled step, not measured on 32 cores. At that rate one update's 72,000 samples take about 31 s to collect. The update itself took 5.9 s on two of the laptop's cores (see *Where the time goes*), and the workers wait while it runs, so an hour of training collects about 7 million control steps. Training prints the processes, samples per update, batch and learner threads, and writes:
+Thirty worker processes of eight machines give 240 machines and leave two processors for the learner, which runs on two maths threads while every worker keeps one. An update takes 300 steps from each machine, 72,000 samples, in four mini-batches of 18,000. The throughput run takes under two minutes and writes `../runs/speed32/throughput.md`. On a rented machine with 32 virtual processors (16 cores of an AMD EPYC 7B13, two threads each) it reported 1,005 control steps/s on the `nominal` rung and 1,020 on `machines`, 33.5 and 34.0 per process: less than half of what the laptop's 77 per process in the table below would suggest, which fits two worker processes sharing each core. With the update included, the hour of training on `nominal` collected 2.95 million control steps and two hours on `machines` collected 5.38 million. Training prints the processes, samples per update, batch and learner threads, and writes:
 
 - `../runs/prop32/curve.csv`: one row per rollout in which episodes finished, with the control steps so far, seconds, episodes, mean return, pass rate, tilt error, early-end share and the share of time spent collecting rather than updating;
 - `../runs/prop32/checkpoint/`: `model.zip`, `normalize.pkl`, `scenes.pkl`, `starts.pkl` and `config.json` (with the scale and the steps so far), every 10 rollouts and at the end.
@@ -784,6 +784,7 @@ Training uses PPO from Stable-Baselines3, with these settings:
 - observation normalisation;
 - in `residual` mode, a command of the baseline's command plus 0.3 times the policy's action, clipped to [-1, 1] (`--scale`, kept in the checkpoint); in `direct` mode the action is the command;
 - a starting action spread (the standard deviation of the policy's sampled actions) of 0.02 divided by the scale in `residual` mode (0.067 at the default scale) and 1.0 in `direct` mode, set with `--spread`;
+- with `--hold N`, [state-dependent exploration][gsde]: the noise is a linear function of the policy's last hidden layer whose weights are redrawn every N decisions and at the start of each rollout, so between redraws (0.8 s at `--hold 8`) the exploration is a fixed function of what the policy sees and no longer fresh noise at every decision. `--spread` then sets the starting spread of those weights, not of the action: at `--spread 0.06` the weights' spread was about 0.04 after 1.4 million steps. Off by default; kept in the checkpoint;
 - 300 steps from each machine per update (`--n-steps`), more than the longest episode (290 decisions), so every machine ends at least one episode in every rollout, and mini-batches of a quarter of an update's samples (`--batch`);
 - one scene per worker process, one maths thread in each worker, and `--threads` maths threads for the learner (1 by default).
 
@@ -830,7 +831,7 @@ Eight machines per scene stays the recommended size. Compiling the step gains mo
 | the environment's Python per decision: sensors, filter, reward, contacts, early ends and the baseline (2.3% and 1.7%) | 17% | 13% |
 | resets of finished machines, of which the settle's MuJoCo steps 7.0% and 7.9% | 9.7% | 23% |
 
-A `ground` reset draws grounds until one allows a prop, which is why its resets cost more. The learner runs in its own process. In a training run with one worker process of eight machines and 300 steps per machine, collecting the 2,400 samples took 30.8 s and the update 0.41 s, 1.3% of the two. With the 32-core settings, an update of 72,000 samples in mini-batches of 18,000, timed alone on random samples, took 10.6 s on one maths thread and 5.9 s on two.
+A `ground` reset draws grounds until one allows a prop, which is why its resets cost more. The learner runs in its own process. In a training run with one worker process of eight machines and 300 steps per machine, collecting the 2,400 samples took 30.8 s and the update 0.41 s, 1.3% of the two. With the 32-processor settings, an update of 72,000 samples in mini-batches of 18,000, timed alone on random samples, took 10.6 s on one maths thread and 5.9 s on two.
 
 **Baseline scores.** The baseline in `residual` mode with zero commands, on the 64 development seeds, scene size 8:
 
@@ -845,6 +846,25 @@ The hold share in band is the mean over episodes of the share of the hold spent 
 The baseline never reads the tilt, and it assumes level, rigid ground, on the `ground` rung too. A pass rate measured against it is therefore not a comparison against a controller with tilt feedback.
 
 On the nominal machine it fails most often on short ramps (45% pass with ramps up of 3.0 to 4.1 s, against 91% with 4.1 to 4.8 s and 73% with 4.8 to 6.0 s). By where the tip goes down, 91% pass with it 3.6 to 4.8 m ahead, 55% at 4.8 to 5.7 m and 59% at 5.7 to 6.5 m. All 20 nominal failures miss the hold band, 18 of them never within it at any step of the hold, one of them also landing at 0.357 m/s, and every nominal episode ends set down. On drawn machines 4 of 64 pass on each rung, too few to compare thirds of a parameter, so the per-seed comparison against the baseline is the measure there. On `machines`, 50 of the 64 episodes miss the hold band, 17 land at 0.3 m/s or faster, and 23 of the 63 that run to the end fail the set-down condition, 22 of them with the bucket still on the ground (pressing with 1.5 to 31.4 kN). On `ground` the figures are 51, 15 and 23 (22 with the bucket on the ground, 1.7 to 32.9 kN). The tilt end on both is seed 10,000,020.
+
+**Trained controllers so far.** Each row is one training run with one seed, scored on the 64 development seeds of the rung it trained on, scene size 8, in `residual` mode with 30 worker processes of eight machines. None has been scored on held-out seeds, so these say what trains, not how well a controller generalises.
+
+| Rung | Exploration | Scale | Control steps | Pass | Hold share in band | Tilt error | Landings at 0.3 m/s or more |
+|---|---|---|---|---|---|---|---|
+| `nominal` | baseline | | | 69% (44) | 0.70 | 1.39° | 1 |
+| `nominal` | default (spread 0.067) | 0.3 | 2,946,240 | 94% (60) | 0.93 | 0.46° | 0 |
+| `machines` | baseline | | | 6% (4) | 0.24 | 3.58° | 17 |
+| `machines` | default (spread 0.067) | 0.3 | 5,380,800 | 9% (6) | 0.30 | 3.43° | 18 |
+| `machines` | `--spread 0.33` | 0.3 | 1,383,120 | 16% (10) | 0.31 | 3.16° | 18 |
+| `machines` | `--spread 0.33` | 0.6 | 1,400,400 | 12% (8) | 0.62 | 1.70° | 32 |
+| `machines` | `--hold 8 --spread 0.06` | 0.3 | 1,393,680 | 36% (23) | 0.92 | 0.96° | 37 |
+| `machines` | `--hold 8 --spread 0.06` | 0.6 | 1,361,520 | 30% (19) | 0.97 | 0.73° | 42 |
+
+On the nominal machine the default settings train: against the baseline seed by seed, the hold share in band rose by 0.237 ± 0.051 and the tilt error fell by 0.933 ± 0.105° (mean ± standard error of the paired differences), with 16 passes gained and none lost. The same controller does not carry over to drawn machines: scored on the `machines` rung it passes 4 of 64, like the baseline.
+
+On drawn machines the default exploration learned little in 5.4 million steps: against the baseline the tilt error fell by 0.148 ± 0.051° and the hold share in band rose by 0.067 ± 0.038. Its noise moves a valve command by about 0.02 and is redrawn every 0.1 s, and a drawn valve has a dead zone of up to 0.25 of the command and up to a second of delay and lag, so most of that noise never moves the machine. Wider noise learns slowly. Noise held for 0.8 s learns the hold in 1.4 million steps: against the baseline, the hold share in band rose by 0.683 ± 0.055 and the tilt error fell by 2.619 ± 0.217° at scale 0.3.
+
+Those controllers hold well and land badly. They take the bucket off the ground part-way through the set-down and let the front of the tracks fall, which the reward barely charges for ([issue 80](../../issues/80)); the median landing at `--hold 8`, scale 0.3, is 0.35 m/s against the baseline's 0.09 m/s. Of its 32 episodes that hold for 80% of the time and still fail, 29 fail on landing speed.
 
 **Limits.**
 
@@ -960,6 +980,7 @@ What is assumed or missing:
 [zx135]: https://manualslib.com/manual/2050171/Hitachi-Zaxis-135us-5b.html?page=217
 
 [nh]: https://www.research-collection.ethz.ch/server/api/core/bitstreams/cb538c33-9f47-4539-b238-2ef6372e62d2/content
+[gsde]: https://arxiv.org/abs/2005.05719
 [eh]: https://www.research-collection.ethz.ch/server/api/core/bitstreams/b00c6c58-12a1-49af-a587-16872fe608a9/content
 [heap]: https://arxiv.org/abs/2106.05059
 [sp]: https://arxiv.org/abs/2410.05093
