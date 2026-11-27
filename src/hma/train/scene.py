@@ -112,7 +112,7 @@ def reward(s: Settings, error, change, roll, slide, landing, shortfall) -> np.nd
               - w["roll"] * np.minimum(np.asarray(roll) / s.roll_scale, 1.0)
               - w["slide"] * np.minimum(np.asarray(slide) / s.slide_scale, 1.0)
               - w["set_down"] * np.clip(shortfall, 0.0, 1.0))
-    return earned * np.exp(-(np.asarray(landing) / s.landing) ** 2)
+    return earned * np.exp(-(np.asarray(landing) / s.gentle) ** 2)
 
 
 def warm_compiled_step() -> None:
@@ -579,7 +579,7 @@ class PropScene:
                 earned[i] = 0.0
             elif end:
                 earned[i] += (s.weights["finish"] * (1.0 - shortfall[i])
-                              * math.exp(-(self.landing[i] / s.landing) ** 2))
+                              * math.exp(-(self.landing[i] / s.gentle) ** 2))
             if causes[i] is not None or cut[i] or end:
                 terminated[i] = True
                 self.done[i] = True
