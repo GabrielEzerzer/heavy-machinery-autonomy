@@ -1,8 +1,10 @@
-# Command line: python -m hma.task "put the pallet of kerbstones at the near marker"
+# Command line: python -m hma.task "put the pallet of kerbstones at the near marker" [--run]
 # Prints the specification and every check, asks the operator, then prints the plan or the refusal.
+# With --run an approved prop plan becomes a propping task shown in the viewer, baseline beside it.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from collections.abc import Callable
 
@@ -37,15 +39,50 @@ def print_report(report: CheckReport, from_cache: bool, seconds: float | None) -
         print(f"Warning: {warning}")
 
 
+def run_plan(plan: Plan, args: argparse.Namespace, show: Callable | None) -> int:
+    from hma.task.prop import CannotRun, prop_task
+    from hma.train.play import watch_checkpoint
+    from hma.train.task import HELD_OUT_BASE, dev_seeds
+
+    seed = dev_seeds(1)[0] if args.machine_seed is None else args.machine_seed
+    if seed >= HELD_OUT_BASE:
+        print("CANNOT RUN: held-out seeds are never played; give a development seed.")
+        return 3
+    try:
+        task = prop_task(plan, DEMO_SCENE, seed)
+    except CannotRun as err:
+        print(f"CANNOT RUN: {err}")
+        return 3
+    print(
+        f"Running: the bucket presses {task.prop_x:.2f} m ahead; tilt "
+        f"{math.degrees(task.target):g} degrees, ramp up {task.ramp_up:g} s, hold {task.hold:g} s, "
+        f"ramp down {task.ramp_down:g} s; {args.rung} rung, machine seed {seed}; "
+        f"baseline beside {args.checkpoint or 'the baseline'}."
+    )
+    outcomes = (show or watch_checkpoint)(args.rung, seed, args.checkpoint, task)
+    if None in outcomes:
+        print("The viewer was closed before the episode ended.")
+    return 0
+
+
 def main(
     argv: list[str] | None = None,
     source: PlanSource | None = None,
     confirm: Callable[[Plan], bool] = ask_operator,
+    show: Callable | None = None,
 ) -> int:
     parser = argparse.ArgumentParser(prog="python -m hma.task")
     parser.add_argument("instruction", help="plain-English instruction")
     parser.add_argument("--cache", help="folder of cached plans (default: a user cache folder)")
     parser.add_argument("--model", help="model name for the Codex CLI (default: its own setting)")
+    parser.add_argument("--run", action="store_true",
+                        help="after approval, show the plan in the viewer (propping only)")
+    parser.add_argument("--checkpoint",
+                        help="with --run: a trained propping checkpoint (default: baseline twice)")
+    parser.add_argument("--rung", choices=("nominal", "machines"), default="nominal",
+                        help="with --run: one nominal machine, or one drawn from --machine-seed")
+    parser.add_argument("--machine-seed", type=int,
+                        help="with --run: a development seed (default: the first one)")
     args = parser.parse_args(argv)
 
     print(f"Instruction: {args.instruction}")
@@ -69,7 +106,7 @@ def main(
         print(f"  6. {result.name}: {'pass' if result.passed else 'FAIL'} - {result.reason}")
     if report.approved:
         print(f"APPROVED: {report.plan.describe()}")
-        return 0
+        return run_plan(report.plan, args, show) if args.run else 0
     refusal = report.refusal
     print(f"REFUSED at {refusal.name}: {refusal.reason}" if refusal else "REFUSED")
     return 1

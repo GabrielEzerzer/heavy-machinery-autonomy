@@ -59,7 +59,7 @@ class Limits:
     hold_s: tuple[float, float] = (1.0, 60.0)
     carry_height_m: float = 0.3
     min_move_m: float = 0.5
-    prop_radius_m: tuple[float, float] = (2.5, 8.5)
+    prop_radius_m: tuple[float, float] = (3.5, 6.5)
     sample_step_m: float = 0.25
     turn_step_deg: float = 5.0
 

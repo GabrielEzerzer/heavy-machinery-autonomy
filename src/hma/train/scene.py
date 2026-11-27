@@ -302,22 +302,29 @@ class PropScene:
                 return ground, task, height
         raise RuntimeError(f"no ground drawn from seed {seed} gives a propping task")
 
-    def _write(self, index: int, seed: int) -> None:
+    def _write(self, index: int, seed: int, task: Task | None = None) -> None:
         machine = self.machine_for(index, seed)
         if RUNGS[self.rung].ground:
+            if task is not None:
+                raise ValueError("a given task runs only on level ground: the nominal and "
+                                 "machines rungs")
             friction = draw_friction(seed)
             ground, task, height = self._stand(index, seed, machine, friction)
         else:
             friction, ground, height = STEEL_FRICTION[0], LEVEL, 0.0
             self._apply(index, ground, friction)
-            task = draw_task(seed, self.settings, self.pivot, lambda x, y: 0.0, self.period)
+            if task is None:
+                task = draw_task(seed, self.settings, self.pivot, lambda x, y: 0.0, self.period)
             self.layer.reset(index, machine, self._start(task))
         self.seeds[index], self.tasks[index], self.machines[index] = seed, task, machine
         self.grounds[index], self.frictions[index], self.heights[index] = ground, friction, height
         self.controllers[index] = BaseController(PropPath(task, self.pivot), CONTROL_HZ)
 
-    def reset(self, index: int, seed: int) -> np.ndarray:
-        self._write(index, seed)
+    def reset(self, index: int, seed: int, task: Task | None = None) -> np.ndarray:
+        if task is None:
+            self._write(index, seed)
+        else:
+            self._write(index, seed, task)
         mujoco.mj_forward(self.model, self.data)
         rng = self._imu_rngs[index] = np.random.default_rng((seed, 11))
         on = self.imu_on[index] = float(RUNGS[self.rung].machines)

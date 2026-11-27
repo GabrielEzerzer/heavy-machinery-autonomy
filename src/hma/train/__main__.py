@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
+from hma.train.evaluate import read_config
 from hma.train.task import RUNGS, Settings, dev_seeds
 
 REPO = Path(__file__).resolve().parents[3]
@@ -130,10 +131,6 @@ def latest_checkpoint(checkpoint: Path) -> Path | None:
     return None
 
 
-def read_config(path: Path) -> dict:
-    return json.loads((path / "config.json").read_text(encoding="utf-8"))
-
-
 def resume_seed(seed: int, timesteps: int) -> int:
     return int(np.random.SeedSequence([seed, timesteps]).generate_state(1)[0])
 
@@ -234,16 +231,9 @@ def score(args) -> None:
 
 
 def play(args) -> None:
-    from hma.train.play import watch
+    from hma.train.play import watch_checkpoint
 
-    if not args.checkpoint:
-        watch(args.rung, args.seed)
-        return
-    from hma.train.evaluate import load_policy
-
-    config = read_config(Path(args.checkpoint))
-    watch(args.rung, args.seed, load_policy(Path(args.checkpoint)), config["mode"],
-          Settings(scale=config["scale"]))
+    watch_checkpoint(args.rung, args.seed, args.checkpoint)
 
 
 def throughput(args) -> None:

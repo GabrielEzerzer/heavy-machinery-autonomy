@@ -5,6 +5,7 @@ drawn parameter and compared seed by seed against the baseline. Held-out seeds a
 from __future__ import annotations
 
 import csv
+import json
 import math
 import pickle
 import time
@@ -41,6 +42,10 @@ def episode_row(scene, slot: int, info: dict, controller: str) -> dict:
         "sensor_latency": machine.sensor_latency, "counterweight": machine.counterweight,
         "link_mass": float(np.mean(machine.link_mass)), "seal_friction": machine.seal_friction,
     }
+
+
+def read_config(path: Path) -> dict:
+    return json.loads((path / "config.json").read_text(encoding="utf-8"))
 
 
 def load_policy(checkpoint: Path):

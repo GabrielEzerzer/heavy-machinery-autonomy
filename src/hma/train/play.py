@@ -1,6 +1,6 @@
 """One propping episode in the interactive viewer: the baseline and a trained controller on the same
-seed, side by side. Each runs in its own one-machine scene and is not stepped again once its episode
-ends; a two-machine scene drawn from the same seed shows both."""
+seed, side by side, on the task drawn from the seed or on a given one. Each runs in its own
+one-machine scene and is not stepped again once its episode ends; a two-machine scene shows both."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import math
 import threading
 import time
 from collections.abc import Iterator
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -16,19 +17,20 @@ from hma.hydraulics.layer import JOINTS
 from hma.machine.model import MACHINE_SPACING, machine_prefix
 from hma.machine.render import apply_look, default_camera, draw_hydraulics, view_option
 from hma.train.scene import PropScene
-from hma.train.task import HELD_OUT_BASE, Settings
+from hma.train.task import HELD_OUT_BASE, Settings, Task
 
 LABELS = ("baseline", "trained")
 SIZES = {int(mujoco.mjtJoint.mjJNT_FREE): 7, int(mujoco.mjtJoint.mjJNT_BALL): 4}
 
 
 def episodes(rung: str, seed: int, policy=None, mode: str = "residual",
-             settings: Settings | None = None) -> Iterator[tuple[list[PropScene], list]]:
+             settings: Settings | None = None,
+             task: Task | None = None) -> Iterator[tuple[list[PropScene], list]]:
     if seed >= HELD_OUT_BASE:
         raise ValueError("held-out seeds are never played")
     scenes = [PropScene(1, rung), PropScene(1, rung, mode, settings)]
     policies = [None, policy]
-    obs = [scene.reset(0, seed)[None] for scene in scenes]
+    obs = [scene.reset(0, seed, task)[None] for scene in scenes]
     outcomes: list[dict | None] = [None, None]
     yield scenes, outcomes
     while None in outcomes:
@@ -98,14 +100,14 @@ def texts(scenes: list[PropScene], outcomes: list) -> list[tuple]:
 
 
 def watch(rung: str, seed: int, policy=None, mode: str = "residual",
-          settings: Settings | None = None) -> list[dict]:
+          settings: Settings | None = None, task: Task | None = None) -> list[dict]:
     import mujoco.viewer
 
-    steps = episodes(rung, seed, policy, mode, settings)
+    steps = episodes(rung, seed, policy, mode, settings, task)
     scenes, outcomes = next(steps)
     display = PropScene(2, rung)
     for slot in range(2):
-        display.reset(slot, seed)
+        display.reset(slot, seed, task)
     copy = mirror(display, scenes)
     copy()
     before = set(threading.enumerate())
@@ -141,3 +143,14 @@ def watch(rung: str, seed: int, policy=None, mode: str = "residual",
     for thread in set(threading.enumerate()) - before:
         thread.join()
     return outcomes
+
+
+def watch_checkpoint(rung: str, seed: int, checkpoint: str | None = None,
+                     task: Task | None = None) -> list[dict]:
+    if not checkpoint:
+        return watch(rung, seed, task=task)
+    from hma.train.evaluate import load_policy, read_config
+
+    config = read_config(Path(checkpoint))
+    return watch(rung, seed, load_policy(Path(checkpoint)), config["mode"],
+                 Settings(scale=config["scale"]), task)
