@@ -237,6 +237,25 @@ def test_every_ground_task_stands_evenly_presses_on_one_flat_surface_and_is_in_r
         assert scene.rest_count[0] == 1 and (scene.rest_load[0] > 0.0).all(), seed
 
 
+def test_a_ground_draw_that_does_not_fit_the_field_is_drawn_again(monkeypatch):
+    from hma.train import scene as scene_module
+
+    draw, failed, drawn = scene_module.draw_ground, [], []
+
+    def first_does_not_fit(seed, attempt=0):
+        if attempt == 0:
+            failed.append(seed)
+            raise RuntimeError("a drawn feature does not fit in the field")
+        drawn.append(draw(seed, attempt))
+        return drawn[-1]
+
+    scene = PropScene(1, "ground")
+    monkeypatch.setattr(scene_module, "draw_ground", first_does_not_fit)
+    scene.reset(0, SEED)
+    assert failed == [SEED]
+    assert scene.grounds[0] is drawn[-1]
+
+
 def test_the_score_does_not_depend_on_the_number_of_processes():
     seeds = dev_seeds(2)
     alone = evaluate.score("nominal", "residual", seeds, 1, 1, None)
