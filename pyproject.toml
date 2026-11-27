@@ -32,6 +32,7 @@ packages = ["src/hma"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["train_extra: needs the training extra (gymnasium and Stable-Baselines3)"]
 
 [tool.ruff]
 line-length = 100
