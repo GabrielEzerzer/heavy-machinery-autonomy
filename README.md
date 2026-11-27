@@ -754,9 +754,12 @@ python -m hma.train train --out ../runs/prop --rung nominal --procs 4 --machines
 python -m hma.train train --out ../runs/prop --resume
 python -m hma.train score --out ../runs/prop/score --rung nominal --checkpoint ../runs/prop/checkpoint
 python -m hma.train throughput --out ../runs/speed --rung machines --procs 4 --machines 8
+python -m hma.train play --checkpoint ../runs/prop/checkpoint --rung nominal --seed 10000001
 ```
 
 `--smoke` makes any command run for seconds. `--out` must lie outside the repository. `throughput` starts `--procs` worker processes with a scene of `--machines` each, steps them with random commands for `--seconds` (30 by default) and reports the control steps per second over all of them, per process and per scene.
+
+`play` opens the viewer on one episode at real time, the baseline on the far left and the checkpoint on the near right, both on `--seed` (the first development seed by default; held-out seeds are refused). It takes the mode and correction scale from the checkpoint's `config.json`; without `--checkpoint` both machines run the baseline. Each controller runs in its own one-machine scene, because a scene cannot step while one of its machines has ended; a finished machine is not stepped again, so it stands still where its episode ended. A two-machine scene built from the same seed shows both. When both episodes have ended it prints each one's pass or fail and why, its hold share in band, its tilt error and its landing speed, and the viewer stays open until it is closed. On `nominal` seeds 10,000,000, 10,000,001, 10,000,003 and 10,000,004 these match the `score` rows from scenes of eight machines: the same pass, early end, hold share and decisions; the tilt error, landing speed and set-down load differ by under 10⁻⁷.
 
 **On 32 cores.** First size the run, then train for an hour, then score:
 
@@ -1020,7 +1023,13 @@ python -m hma.train train --out ../runs/prop --smoke
 python -m hma.train score --out ../runs/prop/score --smoke
 ```
 
-`--smoke` runs for seconds; drop it for a full run. [Propping environment](#propping-environment) lists the options.
+`--smoke` runs for seconds; drop it for a full run. [Propping environment](#propping-environment) lists the options. To watch a trained checkpoint and the baseline side by side on one seed:
+
+```
+python -m hma.train play --checkpoint ../runs/prop/checkpoint
+```
+
+Without `--checkpoint` both machines run the baseline.
 
 `pytest -q` runs the tests. The tests marked `train_extra` need the training extra; without it they are skipped with that as the reason. CI installs the CPU build of PyTorch and both extras, so it runs them; locally, install them with `pip install -e ".[train,dev]"`:
 
