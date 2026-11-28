@@ -239,7 +239,9 @@ def rules(rows: list[dict]) -> list[str]:
              f"{np.degrees(max(abs(r['heading'] - r['belt_heading']) for r in rows)):.2f} deg. "
              "Track travel outside the propped turn: median "
              f"{np.median([r['stray_travel'] for r in rows]):.4f} m, largest "
-             f"{max(r['stray_travel'] for r in rows):.4f} m.",
+             f"{max(r['stray_travel'] for r in rows):.4f} m net; median "
+             f"{np.median([r['stray_distance'] for r in rows]):.4f} m, largest "
+             f"{max(r['stray_distance'] for r in rows):.4f} m covered.",
              "", "| rule | episodes failing |", "|---|---|"]
     lines += [f"| {reason} | {count} |" for reason, count in sorted(counts.items())]
     return lines + [""]

@@ -192,6 +192,7 @@ class TurnSettings(Settings):
     propped: float = math.radians(1.0)
     stray_pass: float = 0.05
     stray_end: float = 0.25
+    distance_pass: float = 0.25
 
 
 @dataclass(frozen=True)

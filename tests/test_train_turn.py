@@ -282,6 +282,26 @@ def test_driving_both_tracks_forward_after_set_down_fails():
     assert any(reason.startswith("tracks travelled") for reason in blind.reasons(info))
 
 
+def test_shuffling_the_tracks_back_and_forth_after_set_down_fails():
+    scene = TurnScene(1, "nominal", "direct")
+    scene.reset(0, SEED)
+    start = scene.tasks[0].recentre_span[0] + 3.0
+
+    def commands(t):
+        out = scene.baseline()
+        if start <= t < start + 2.0:
+            out[0, VALVES:] = 0.3 if int((t - start) / 0.2 + 1e-9) % 2 == 0 else -0.3
+        return out
+
+    info = finish(scene, commands)
+    reasons = scene.reasons(info)
+    assert info["cause"] is None
+    assert info["stray_travel"] < TurnSettings().stray_pass
+    assert info["stray_distance"] > TurnSettings().distance_pass
+    assert not info["passed"]
+    assert any(reason.startswith("tracks covered") for reason in reasons)
+
+
 def test_turning_observations_stay_finite_and_in_bounds_under_random_actions():
     scene = TurnScene(2, "machines", "direct")
     seen = [scene.reset(0, SEED), scene.reset(1, SEED + 1)]
@@ -322,6 +342,7 @@ def test_the_scripted_turn_passes_on_a_nominal_seed():
     assert info["passed"], scene.reasons(info)
     assert abs(info["heading_error"]) < math.radians(1.5)
     assert abs(info["heading"] - info["belt_heading"]) < math.radians(0.5)
+    assert info["stray_distance"] < TurnSettings().distance_pass / 10
 
 
 def test_the_turn_refuses_rough_ground_and_keeps_the_prop_spaces():
