@@ -105,14 +105,15 @@ def _wrap(angle: np.ndarray) -> np.ndarray:
     return np.arctan2(np.sin(angle), np.cos(angle))
 
 
-def reward(s: Settings, error, change, roll, slide, landing, shortfall) -> np.ndarray:
+def reward(s: Settings, error, change, roll, slide, landing, shortfall, rush=0.0) -> np.ndarray:
     w = s.weights
     return (s.floor + (1.0 - s.floor) * np.exp(-np.asarray(error) / s.sigma)
             - w["change"] * np.minimum(change, 1.0)
             - w["roll"] * np.minimum(np.asarray(roll) / s.roll_scale, 1.0)
             - w["slide"] * np.minimum(np.asarray(slide) / s.slide_scale, 1.0)
             - w["landing"] * np.minimum(np.asarray(landing) / s.landing, 1.0)
-            - w["set_down"] * np.clip(shortfall, 0.0, 1.0))
+            - w["set_down"] * np.clip(shortfall, 0.0, 1.0)
+            - w["rush"] * np.minimum(np.asarray(rush) / s.rush_scale, 1.0))
 
 
 def warm_compiled_step() -> None:
@@ -471,6 +472,7 @@ class PropScene:
         worst_tilt = np.zeros(n)
         worst_roll = np.zeros(n)
         slide = np.zeros(n)
+        rush_sum = np.zeros(n)
         forbidden = np.zeros(n, bool)
         struck = np.zeros(n, bool)
         failed = np.zeros(n, bool)
@@ -539,6 +541,9 @@ class PropScene:
                 load_sum += np.where(resting[:, step, None], self._front_load(), 0.0)
             motion = self._part_velocity(rot)
             self.corner_prev = self._approach(motion)
+            allowed = s.descent[0] + s.descent[1] * np.maximum(pitch, 0.0)
+            rush_sum += np.where(front.any(1), 0.0,
+                                 np.maximum(self.corner_prev.max(1) - allowed, 0.0))
             self._watch(step, rot, pitch, roll)
         self.landing = np.maximum(self.landing, fresh)
         self.recent[:, :-1] = self.recent[:, 1:]
@@ -572,7 +577,7 @@ class PropScene:
         earned = reward(s, self._error(mean_err, done_steps), change,
                         roll_sum / max(done_steps, 1), slide,
                         self.recent.max(1),
-                        shortfall)
+                        shortfall, rush_sum / max(done_steps, 1))
         for i in range(n):
             failed[i] |= not (np.all(np.isfinite(data.qpos[self._own_q[i]]))
                               and np.all(np.isfinite(self.layer._pressure[i])))
