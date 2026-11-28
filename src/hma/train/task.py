@@ -1,6 +1,6 @@
 """The propping and turning tasks: settings, rungs, seeded draws, the tilt and heading references
 against time, and the baseline's tip path: put down, held where it touched while the tracks roll
-about their rear wheel to give the reference tilt, then lifted back along the same vertical path."""
+about their rear wheel to give the reference tilt, held down through the wait, then lifted back."""
 
 from __future__ import annotations
 
@@ -40,6 +40,8 @@ class Settings:
     place: float = 2.5
     ramp: tuple[float, float] = (3.0, 6.0)
     hold: tuple[float, float] = (3.0, 10.0)
+    ramp_down: tuple[float, float] = (6.0, 10.0)
+    wait: float = 1.5
     final: float = 3.0
     prop_x: tuple[float, float] = (3.5, 6.5)
     lift: tuple[float, float] = (0.5, 1.5)
@@ -49,7 +51,8 @@ class Settings:
     sigma: float = math.radians(3.0)
     floor: float = 0.2
     weights: dict = field(default_factory=lambda: {"change": 0.03, "roll": 0.03, "slide": 0.03,
-                                                   "landing": 0.05, "set_down": 0.05})
+                                                   "landing": 0.05, "set_down": 0.05,
+                                                   "rush": 1.0})
     roll_scale: float = math.radians(5.0)
     slide_scale: float = 0.05
     hop: float = 0.025
@@ -60,6 +63,12 @@ class Settings:
     window: float = 0.5
     still: float = 0.02
     scale: float = 0.3
+    smoothing: float = 0.28
+    descent: tuple[float, float] = (0.15, 3.5)
+    rush_scale: float = 0.3
+
+
+UNFILTERED = 1.0
 
 
 @dataclass(frozen=True)
@@ -75,11 +84,12 @@ class Task:
     attempts: int
     rest: float
     place: float
+    wait: float
     final: float
 
     @property
     def length(self) -> float:
-        return self.rest + self.ramp_up + self.hold + self.ramp_down + self.final
+        return self.rest + self.ramp_up + self.hold + self.ramp_down + self.wait + self.final
 
     @property
     def hold_span(self) -> tuple[float, float]:
@@ -152,13 +162,14 @@ def draw_task(seed: int, settings: Settings, pivot: tuple[float, float, float],
             target=float(rng.uniform(*settings.target)),
             ramp_up=float(rng.uniform(*settings.ramp)),
             hold=float(rng.uniform(*settings.hold)),
-            ramp_down=float(rng.uniform(*settings.ramp)),
+            ramp_down=float(rng.uniform(*settings.ramp_down)),
             prop_x=prop_x,
             start_z=ground + float(rng.uniform(*settings.lift)),
             pitch=float(rng.uniform(*settings.pitch)),
             attempts=attempt + 1,
             rest=settings.rest,
             place=settings.place,
+            wait=settings.wait,
             final=settings.final,
         )
         if reachable(PropPath(task, pivot), period) and reachable(
@@ -176,6 +187,7 @@ class TurnSettings(Settings):
     rest: float = 3.0
     ramp: tuple[float, float] = (3.0, 5.0)
     ramp_down: tuple[float, float] = (4.0, 6.0)
+    wait: float = 0.0
     final: float = 1.0
     prop_x: tuple[float, float] = (4.0, 6.5)
     heading: tuple[float, float] = (math.radians(5.0), math.radians(22.0))
@@ -213,7 +225,7 @@ class TurnTask(Task):
 
     @property
     def recentre_span(self) -> tuple[float, float]:
-        start = self.rest + self.ramp_up + self.hold + self.ramp_down + self.place
+        start = self.rest + self.ramp_up + self.hold + self.ramp_down + self.wait + self.place
         return start, start + self.recentre
 
     def heading_at(self, t: float) -> float:
@@ -244,6 +256,7 @@ def draw_turn_task(seed: int, settings: TurnSettings, pivot: tuple[float, float,
             attempts=attempt + 1,
             rest=settings.rest,
             place=settings.place,
+            wait=settings.wait,
             final=settings.place + recentre + settings.final,
             heading=size * float(rng.choice((-1.0, 1.0))),
             settle=settle,

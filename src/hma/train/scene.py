@@ -25,7 +25,7 @@ from hma.machine.model import (
 )
 from hma.task.checks import LIMITS
 from hma.train import footing
-from hma.train.task import RUNGS, PropPath, Settings, Task, draw_task, reachable
+from hma.train.task import RUNGS, UNFILTERED, PropPath, Settings, Task, draw_task, reachable
 
 CONTROL_HZ = 10.0
 PREVIEW = (0.0, 0.5, 1.0)
@@ -61,8 +61,8 @@ FRAME_HIGH = np.concatenate([np.full(f[1], f[4]) for f in FIELDS])
 OBS_LOW = np.tile(FRAME_LOW, HISTORY)
 OBS_HIGH = np.tile(FRAME_HIGH, HISTORY)
 SCALE = np.concatenate([np.full(f[1], f[2]) for f in FIELDS])
-EPISODE_ARRAYS = ("k", "steps_total", "stance", "est0", "sent", "history", "up", "v_prev",
-                  "gyro_bias", "accel_bias", "imu_on", "tip_prev", "apart", "front_prev",
+EPISODE_ARRAYS = ("k", "steps_total", "stance", "est0", "sent", "smooth", "history", "up",
+                  "v_prev", "gyro_bias", "accel_bias", "imu_on", "tip_prev", "apart", "front_prev",
                   "corner_prev", "touched", "rest_load", "rest_count", "landing", "recent",
                   "end_load", "end_steps", "in_band", "hold_steps", "err_total", "done",
                   "active")
@@ -105,14 +105,15 @@ def _wrap(angle: np.ndarray) -> np.ndarray:
     return np.arctan2(np.sin(angle), np.cos(angle))
 
 
-def reward(s: Settings, error, change, roll, slide, landing, shortfall) -> np.ndarray:
+def reward(s: Settings, error, change, roll, slide, landing, shortfall, rush) -> np.ndarray:
     w = s.weights
     return (s.floor + (1.0 - s.floor) * np.exp(-np.asarray(error) / s.sigma)
             - w["change"] * np.minimum(change, 1.0)
             - w["roll"] * np.minimum(np.asarray(roll) / s.roll_scale, 1.0)
             - w["slide"] * np.minimum(np.asarray(slide) / s.slide_scale, 1.0)
             - w["landing"] * np.minimum(np.asarray(landing) / s.landing, 1.0)
-            - w["set_down"] * np.clip(shortfall, 0.0, 1.0))
+            - w["set_down"] * np.clip(shortfall, 0.0, 1.0)
+            - w["rush"] * np.minimum(np.asarray(rush) / s.rush_scale, 1.0))
 
 
 def warm_compiled_step() -> None:
@@ -211,6 +212,7 @@ class PropScene:
         self.stance = np.tile([0.0, 0.0, 1.0], (n, 1))
         self.est0 = np.zeros((n, 2))
         self.sent = np.zeros((n, self.actions))
+        self.smooth = np.zeros((n, self.actions))
         self.history = np.zeros((n, HISTORY, self.frame))
         self.up = np.zeros((n, 3))
         self.v_prev = np.zeros((n, 3))
@@ -356,6 +358,7 @@ class PropScene:
         self.k[index] = 0
         self.steps_total[index] = 0
         self.sent[index] = 0.0
+        self.smooth[index] = 0.0
         self.tip_prev[index] = self.data.site_xpos[self._tips[index]]
         self.apart[index] = self._hop + 1
         self.front_prev[index] = self._contacts()[1][index]
@@ -452,7 +455,10 @@ class PropScene:
             raise ValueError("every machine must be reset before the scene steps")
         commands = np.clip(actions, -1.0, 1.0)
         if self.mode == "residual":
-            commands = np.clip(self.baseline() + self.settings.scale * commands, -1.0, 1.0)
+            smoothing = self.settings.smoothing
+            self.smooth = (commands if smoothing == UNFILTERED
+                           else self.smooth + smoothing * (commands - self.smooth))
+            commands = np.clip(self.baseline() + self.settings.scale * self.smooth, -1.0, 1.0)
         self._send(commands)
         n, dt, data, s = self.n, self.dt, self.data, self.settings
         times = (self.k[:, None] * self.steps + np.arange(1, self.steps + 1)) * dt
@@ -468,6 +474,7 @@ class PropScene:
         worst_tilt = np.zeros(n)
         worst_roll = np.zeros(n)
         slide = np.zeros(n)
+        rush_sum = np.zeros(n)
         forbidden = np.zeros(n, bool)
         struck = np.zeros(n, bool)
         failed = np.zeros(n, bool)
@@ -536,6 +543,9 @@ class PropScene:
                 load_sum += np.where(resting[:, step, None], self._front_load(), 0.0)
             motion = self._part_velocity(rot)
             self.corner_prev = self._approach(motion)
+            allowed = s.descent[0] + s.descent[1] * np.maximum(pitch, 0.0)
+            rush_sum += np.where(front.any(1), 0.0,
+                                 np.maximum(self.corner_prev.max(1) - allowed, 0.0))
             self._watch(step, rot, pitch, roll)
         self.landing = np.maximum(self.landing, fresh)
         self.recent[:, :-1] = self.recent[:, 1:]
@@ -569,7 +579,7 @@ class PropScene:
         earned = reward(s, self._error(mean_err, done_steps), change,
                         roll_sum / max(done_steps, 1), slide,
                         self.recent.max(1),
-                        shortfall)
+                        shortfall, rush_sum / max(done_steps, 1))
         for i in range(n):
             failed[i] |= not (np.all(np.isfinite(data.qpos[self._own_q[i]]))
                               and np.all(np.isfinite(self.layer._pressure[i])))

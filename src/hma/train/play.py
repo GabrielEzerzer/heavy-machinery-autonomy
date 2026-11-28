@@ -154,4 +154,5 @@ def watch_checkpoint(rung: str, seed: int, checkpoint: str | None = None,
     if trained != kind:
         raise ValueError(f"the checkpoint was trained on the {trained} task, not {kind}")
     return watch(rung, seed, load_policy(Path(checkpoint)), config["mode"],
-                 TASKS[kind].settings_type(scale=config["scale"]), task, kind)
+                 TASKS[kind].settings_type(scale=config["scale"], smoothing=config["smoothing"]),
+                 task, kind)

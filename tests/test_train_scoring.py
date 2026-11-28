@@ -331,13 +331,15 @@ def test_the_reward_stays_in_its_bounds_and_each_end_term_only_lowers_it():
     n = 20_000
     terms = {"error": rng.exponential(0.1, n), "change": rng.uniform(0.0, 1.0, n),
              "roll": rng.exponential(0.1, n), "slide": rng.exponential(0.05, n),
-             "landing": rng.exponential(0.3, n), "shortfall": rng.uniform(0.0, 1.0, n)}
+             "landing": rng.exponential(0.3, n), "shortfall": rng.uniform(0.0, 1.0, n),
+             "rush": rng.exponential(0.2, n)}
     earned = reward(s, **terms)
     lowest = s.floor - sum(s.weights.values())
-    assert lowest > 0.0
+    assert lowest == pytest.approx(-0.99)
     assert np.all((earned >= lowest - 1e-12) & (earned <= 1.0))
-    assert reward(s, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) == pytest.approx(1.0)
-    for name in ("landing", "shortfall"):
+    assert earned.min() < 0.0
+    assert reward(s, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) == pytest.approx(1.0)
+    for name in ("landing", "shortfall", "rush"):
         cleared = reward(s, **{**terms, name: np.zeros(n)})
         assert np.all(cleared >= earned)
         assert np.all(cleared[terms[name] > 0.0] > earned[terms[name] > 0.0])
@@ -384,6 +386,65 @@ def test_the_baseline_lifts_the_tip_back_along_the_path_it_put_it_down_on():
         placed, pitch_placed = path(task.place - u)
         assert np.allclose(up, placed, atol=1e-12) and pitch_up == pitch_placed
     assert path(task.length)[0][2] == pytest.approx(task.start_z)
+
+
+RUSH_SEED = DEV_BASE + 0
+
+
+def test_a_falling_front_is_charged_and_a_baseline_set_down_or_a_resting_front_is_not(
+        monkeypatch):
+    import hma.train.scene as scene_module
+
+    charged, real = [], scene_module.reward
+
+    def capture(s, error, change, roll, slide, landing, shortfall, rush):
+        charged.append(np.array(rush, float))
+        return real(s, error, change, roll, slide, landing, shortfall, rush)
+
+    monkeypatch.setattr(scene_module, "reward", capture)
+    scene = PropScene(2, "nominal", mode="direct")
+    scene.reset(0, RUSH_SEED)
+    scene.reset(1, RUSH_SEED)
+    task = scene.tasks[0]
+    drop = round(sum(task.hold_span) / 2 / scene.period)
+    rest = drop + 30
+    released, down = np.zeros(4), []
+    infos, k = [None, None], 0
+    while None in infos:
+        actions = scene.baseline()
+        if k >= drop:
+            actions[1] = released
+            actions[1, 1] = -1.0 if k < drop + 10 else 0.0
+        _, _, done, info = scene.step(actions)
+        down.append(scene.front_prev[1].any())
+        for i in np.flatnonzero(done):
+            infos[i] = info[i]
+        k += 1
+    charged = np.array(charged)
+    baseline, dropped = infos
+    assert baseline["landing"] < 0.3 and baseline["front_down"]
+    assert np.all(charged[:, 0] == 0.0)
+    assert dropped["landing"] >= 0.3
+    assert charged[drop:rest, 1].max() > Settings().rush_scale
+    assert all(down[rest:]) and np.all(charged[rest:, 1] == 0.0)
+    assert np.all(charged[:drop, 1] == 0.0)
+
+
+def test_the_wait_is_in_the_length_and_the_bucket_stays_down_through_it():
+    pivot = footing.rear_pivot()
+    task = draw_task(SEED, Settings(), pivot, lambda x, y: 0.0, 0.1)
+    assert task.wait == Settings().wait > 0.0
+    assert Settings().ramp_down[0] <= task.ramp_down <= Settings().ramp_down[1]
+    assert task.length == pytest.approx(task.rest + task.ramp_up + task.hold + task.ramp_down
+                                        + task.wait + task.final)
+    path = PropPath(task, pivot)
+    landed = task.rest + task.ramp_up + task.hold + task.ramp_down + 1e-9
+    pressed, pitch = path(landed)
+    for t in np.linspace(landed, task.length - task.final, 16):
+        tip, at = path(float(t))
+        assert task.tilt(float(t)) == 0.0
+        assert np.allclose(tip, pressed, atol=1e-12) and at == pitch
+    assert path(task.length - task.final + task.place / 2)[0][2] > pressed[2] + 0.1
 
 
 def test_a_full_scale_action_opens_a_valve_past_the_widest_drawn_dead_zone():

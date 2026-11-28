@@ -17,7 +17,14 @@ from pathlib import Path
 import numpy as np
 
 from hma.train.scene import PropScene, warm_compiled_step
-from hma.train.task import DEV_BASE, HELD_OUT_BASE, Settings, TurnTask, training_seed
+from hma.train.task import (
+    DEV_BASE,
+    HELD_OUT_BASE,
+    UNFILTERED,
+    Settings,
+    TurnTask,
+    training_seed,
+)
 from hma.train.turn import TurnScene
 
 DRAWN = ("target", "ramp_up", "hold", "ramp_down", "prop_x", "pitch", "friction", "slope",
@@ -51,7 +58,8 @@ def episode_row(scene, slot: int, info: dict, controller: str) -> dict:
 
 
 def read_config(path: Path) -> dict:
-    return json.loads((path / "config.json").read_text(encoding="utf-8"))
+    return {"smoothing": UNFILTERED,
+            **json.loads((path / "config.json").read_text(encoding="utf-8"))}
 
 
 def load_policy(checkpoint: Path):

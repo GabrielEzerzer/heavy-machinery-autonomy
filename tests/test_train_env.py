@@ -1,3 +1,4 @@
+import math
 import pickle
 from dataclasses import replace
 
@@ -16,12 +17,14 @@ from hma.train.scene import OBS_HIGH, OBS_LOW, PropScene
 from hma.train.task import (
     DEV_BASE,
     HELD_OUT_BASE,
+    UNFILTERED,
     PropPath,
     Settings,
     dev_seeds,
     held_out_seeds,
     training_seed,
 )
+from hma.train.turn import TurnScene
 
 SEED = DEV_BASE + 3
 BRAKED = DEV_BASE + 30
@@ -88,6 +91,7 @@ def test_save_restore_and_replay_is_bit_for_bit():
     scene.reset(0, SEED)
     scene.reset(1, SEED + 1)
     run(scene, actions[:20])
+    assert np.all(scene.smooth != 0.0)
     scene.data.userdata[:] = (0.1, -0.2, 3e3, 0.0, 0.0, 5e2)
     saved = pickle.loads(pickle.dumps(scene.snapshot()))
     straight = run(scene, actions[20:])
@@ -99,9 +103,45 @@ def test_save_restore_and_replay_is_bit_for_bit():
     assert same(straight, run(other, actions[20:]))
     assert np.array_equal(scene.data.qpos, other.data.qpos)
     assert np.array_equal(scene.data.userdata, other.data.userdata)
+    assert np.array_equal(scene.smooth, other.smooth)
     written = model_arrays(other.model)
     for name, value in model_arrays(scene.model).items():
         assert np.array_equal(value, written[name], equal_nan=True), name
+
+
+@pytest.mark.parametrize("kind, smoothing", [(PropScene, Settings().smoothing),
+                                             (TurnScene, Settings().smoothing),
+                                             (PropScene, UNFILTERED)])
+def test_a_step_in_the_action_reaches_the_valves_through_the_filter(kind, smoothing):
+    assert -0.1 / math.log(1.0 - Settings().smoothing) == pytest.approx(0.3, abs=0.01)
+    scene = kind(1, "nominal", settings=replace(kind.settings_type(), smoothing=smoothing))
+    scene.reset(0, SEED)
+    baselines, sent = [], []
+    plain, send = scene.baseline, scene._send
+    scene.baseline = lambda: baselines.append(plain()) or baselines[-1]
+    scene._send = lambda commands: sent.append(np.copy(commands)) or send(commands)
+    run(scene, [np.full((1, scene.actions), 0.5)] * 6)
+    scale = scene.settings.scale
+    assert len(sent) == len(baselines) == 6
+    for k, (b, u) in enumerate(zip(baselines, sent, strict=True), 1):
+        if smoothing == UNFILTERED:
+            assert np.array_equal(u, np.clip(b + scale * 0.5, -1.0, 1.0))
+        else:
+            reached = 1.0 - (1.0 - smoothing) ** k
+            assert np.allclose(u, np.clip(b + scale * 0.5 * reached, -1.0, 1.0), rtol=0.0,
+                               atol=1e-12)
+
+
+def test_a_reset_clears_its_own_filter_state_and_leaves_its_neighbours():
+    scene = PropScene(2, "nominal")
+    scene.reset(0, SEED)
+    scene.reset(1, SEED + 1)
+    run(scene, [np.full((2, 4), 0.5)] * 3)
+    assert np.all(scene.smooth != 0.0)
+    kept = scene.smooth[0].copy()
+    scene.reset(1, SEED + 2)
+    assert np.array_equal(scene.smooth[0], kept)
+    assert np.all(scene.smooth[1] == 0.0)
 
 
 @pytest.mark.parametrize("rung, machines, decisions", [("ground", 3, 60), ("nominal", 2, 120)])
@@ -151,10 +191,11 @@ def test_observations_stay_finite_and_in_bounds_under_random_actions(machine):
     scene = Corner(machine, 2, "ground", mode="direct")
     seen = [scene.reset(0, SEED), scene.reset(1, SEED + 1)]
     rng = np.random.default_rng(5)
+    lowest = Settings().floor - sum(Settings().weights.values())
     for k in range(120):
         obs, reward, done, info = scene.step(rng.uniform(-1.0, 1.0, (2, 4)))
         seen += list(obs)
-        assert np.all((reward >= 0.0) & (reward <= 1.0))
+        assert np.all((reward >= lowest) & (reward <= 1.0))
         for i in np.flatnonzero(done):
             seen.append(scene.reset(i, SEED + 10 + k))
     seen = np.array(seen)
@@ -273,7 +314,7 @@ def test_an_untrained_residual_policy_sends_the_baseline_plus_its_scaled_action(
     from hma.train.__main__ import COMMAND_NOISE, EGLI_HUTTER, SPREAD, build_model
     from hma.train.vec import SceneVecEnv
 
-    scale = Settings().scale
+    scale, smoothing = Settings().scale, Settings().smoothing
     assert SPREAD["residual"] * scale == pytest.approx(COMMAND_NOISE)
     env = SceneVecEnv(1, "nominal", "residual", 0, seeds=[DEV_BASE + 4])
     venv = VecNormalize(env, norm_obs=True, norm_reward=False, gamma=EGLI_HUTTER["gamma"])
@@ -283,8 +324,9 @@ def test_an_untrained_residual_policy_sends_the_baseline_plus_its_scaled_action(
     plain, act = scene.baseline, scene.layer.act
     scene.baseline = lambda: baselines.append(plain()) or baselines[-1]
     scene.layer.act = lambda commands: sent.append(np.copy(commands)) or act(commands)
-    obs, largest, actions = venv.reset(), 0.0, []
+    obs, largest, actions, starts = venv.reset(), 0.0, [], []
     for deterministic in (True, False):
+        starts.append(len(actions))
         while True:
             action = model.predict(obs, deterministic=deterministic)[0]
             if deterministic:
@@ -295,8 +337,11 @@ def test_an_untrained_residual_policy_sends_the_baseline_plus_its_scaled_action(
                 break
     assert largest <= 0.02
     assert len(sent) == len(baselines) == len(actions) > 300
-    for b, a, u in zip(baselines, actions, sent, strict=True):
-        assert np.array_equal(u, np.clip(b + scale * a, -1.0, 1.0))
+    smooth = np.zeros(4)
+    for k, (b, a, u) in enumerate(zip(baselines, actions, sent, strict=True)):
+        smooth = np.zeros(4) if k in starts else smooth
+        smooth = smooth + smoothing * (a[0] - smooth)
+        assert np.array_equal(u, np.clip(b + scale * smooth, -1.0, 1.0))
 
 
 def test_period_means_clip_each_pressure_sample_before_averaging():

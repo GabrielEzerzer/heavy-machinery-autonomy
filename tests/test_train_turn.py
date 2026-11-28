@@ -101,6 +101,7 @@ def test_save_restore_and_replay_mid_turn_is_bit_for_bit():
     actions = valve_noise(3, (start + 30, 2)) * 0.2
     run(scene, actions[:start])
     assert scene.turn_started.any()
+    assert scene.smooth.shape == (2, ACTIONS) and np.all(scene.smooth[:, :VALVES] != 0.0)
     saved = pickle.loads(pickle.dumps(scene.snapshot()))
     straight = run(scene, actions[start:])
     other = TurnScene(2, "nominal")
@@ -112,6 +113,7 @@ def test_save_restore_and_replay_mid_turn_is_bit_for_bit():
     assert np.array_equal(scene.data.qpos, other.data.qpos)
     assert np.array_equal(scene.heading_est, other.heading_est)
     assert np.array_equal(scene.turn_slide, other.turn_slide)
+    assert np.array_equal(scene.smooth, other.smooth)
 
 
 def test_resetting_one_machine_leaves_its_turning_neighbour_bit_for_bit():
@@ -365,3 +367,18 @@ def test_a_checkpoint_keeps_its_task_and_old_checkpoints_read_as_propping():
         pick_task(Namespace(task="turn", rung="nominal"), {})
     with pytest.raises(SystemExit, match="level ground"):
         pick_task(Namespace(task="turn", rung="ground"))
+
+
+def test_a_checkpoint_without_a_filter_constant_reads_as_unfiltered(tmp_path):
+    import json
+
+    from hma.train.evaluate import read_config
+    from hma.train.task import UNFILTERED, Settings
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"mode": "residual", "scale": 0.3}), encoding="utf-8")
+    assert read_config(tmp_path)["smoothing"] == UNFILTERED == 1.0
+    path.write_text(json.dumps({"scale": 0.3, "smoothing": 0.28}), encoding="utf-8")
+    assert read_config(tmp_path)["smoothing"] == 0.28 == Settings().smoothing
+    assert TurnSettings().smoothing == Settings().smoothing
+    assert TurnSettings().wait == 0.0 and TurnSettings().ramp_down == (4.0, 6.0)

@@ -14,7 +14,7 @@ from conftest import task_json
 from hma.task import DEMO_SCENE
 from hma.task.__main__ import main, run_plan
 from hma.task.checks import LIMITS, Plan
-from hma.task.prop import LIFT_M, PITCH, RAMP_S, TARGET, CannotRun, prop_task
+from hma.task.prop import LIFT_M, PITCH, RAMP_DOWN_S, RAMP_S, TARGET, CannotRun, prop_task
 from hma.task.scene import Pose, Scene, Zone
 from hma.task.spec import TaskType
 from hma.train.play import episodes, summary
@@ -45,8 +45,8 @@ def test_the_checks_look_for_a_prop_point_only_where_the_controller_trained():
 
 def test_the_fixed_values_lie_inside_the_ranges_the_controller_trained_on():
     s = Settings()
-    for value, (lo, hi) in ((TARGET, s.target), (RAMP_S, s.ramp), (PITCH, s.pitch),
-                            (LIFT_M, s.lift)):
+    for value, (lo, hi) in ((TARGET, s.target), (RAMP_S, s.ramp), (RAMP_DOWN_S, s.ramp_down),
+                            (PITCH, s.pitch), (LIFT_M, s.lift)):
         assert lo <= value <= hi
 
 
@@ -54,7 +54,8 @@ def test_a_prop_plan_becomes_a_task_with_its_distance_and_hold():
     task = prop_task(replace(PROP, prop_xy=(4.2, 0.0), hold_s=7.5), DEMO_SCENE, SEED)
     assert (task.prop_x, task.hold, task.seed) == (4.2, 7.5, SEED)
     assert (task.target, task.ramp_up, task.ramp_down, task.pitch, task.start_z) == (
-        TARGET, RAMP_S, RAMP_S, PITCH, LIFT_M)
+        TARGET, RAMP_S, RAMP_DOWN_S, PITCH, LIFT_M)
+    assert task.wait == Settings().wait
 
 
 @pytest.mark.parametrize(

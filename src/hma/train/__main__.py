@@ -25,8 +25,9 @@ NET = [128, 128]
 MINI_BATCHES = 4
 COMMAND_NOISE = 0.02
 SPREAD = {"residual": COMMAND_NOISE / Settings().scale, "direct": 1.0}
-CONFIG = ("rung", "mode", "procs", "machines", "seed", "spread", "scale", "hold", "task")
-ROLLOUT = {"prop": 300, "turn": 400}
+CONFIG = ("rung", "mode", "procs", "machines", "seed", "spread", "scale", "smoothing", "hold",
+          "task")
+ROLLOUT = {"prop": 350, "turn": 400}
 SMOKE = {"procs": 2, "machines": 2, "n_steps": 16, "steps": 256, "dev_size": 4, "seconds": 2.0}
 
 
@@ -204,6 +205,7 @@ def train(args) -> None:
         trim_curve(out / "curve.csv", config["timesteps"])
     else:
         args.task = pick_task(args)
+        args.smoothing = TASKS[args.task].settings_type().smoothing
     if args.n_steps is None:
         args.n_steps = ROLLOUT[args.task]
     args.hold = args.hold or 0
@@ -212,7 +214,8 @@ def train(args) -> None:
     if args.spread is None:
         args.spread = COMMAND_NOISE / args.scale if args.mode == "residual" else SPREAD[args.mode]
     envs = ProcVecEnv(args.procs, args.machines, args.rung, args.mode, args.seed,
-                      TASKS[args.task].settings_type(scale=args.scale), args.task)
+                      TASKS[args.task].settings_type(scale=args.scale, smoothing=args.smoothing),
+                      args.task)
     print(f"workers: {envs.pids}", flush=True)
     try:
         if resume:
@@ -250,7 +253,8 @@ def score(args) -> None:
     if args.checkpoint:
         rows += run(args.rung, config["mode"], seeds, args.machines, args.procs,
                     str(Path(args.checkpoint).resolve()),
-                    TASKS[task].settings_type(scale=config["scale"]), task)
+                    TASKS[task].settings_type(scale=config["scale"],
+                                              smoothing=config["smoothing"]), task)
     path = write(rows, out, f"score_{args.rung}" if task == "prop" else f"score_{task}_{args.rung}")
     print(path.read_text(encoding="utf-8"))
 
