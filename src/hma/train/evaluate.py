@@ -16,13 +16,16 @@ from pathlib import Path
 
 import numpy as np
 
-from hma.train.scene import CAUSES, PropScene, warm_compiled_step
-from hma.train.task import DEV_BASE, HELD_OUT_BASE, Settings, training_seed
+from hma.train.scene import PropScene, warm_compiled_step
+from hma.train.task import DEV_BASE, HELD_OUT_BASE, Settings, TurnTask, training_seed
+from hma.train.turn import TurnScene
 
 DRAWN = ("target", "ramp_up", "hold", "ramp_down", "prop_x", "pitch", "friction", "slope",
          "grade_along", "grade_across", "features", "press_height", "delay", "lag", "deadband",
-         "sensor_latency", "counterweight", "link_mass", "seal_friction")
-DEGREES = {"target", "pitch", "slope"}
+         "sensor_latency", "counterweight", "link_mass", "seal_friction", "step", "settle",
+         "turn", "recentre")
+DEGREES = {"target", "pitch", "slope", "step"}
+CAUSES = TurnScene.causes
 FILLER = DEV_BASE - 1
 ROUNDS = 4
 
@@ -41,6 +44,9 @@ def episode_row(scene, slot: int, info: dict, controller: str) -> dict:
         "lag": float(np.mean(machine.lag)), "deadband": float(np.mean(machine.deadband)),
         "sensor_latency": machine.sensor_latency, "counterweight": machine.counterweight,
         "link_mass": float(np.mean(machine.link_mass)), "seal_friction": machine.seal_friction,
+        **({"step": task.heading, "settle": task.settle, "turn": task.turn,
+            "recentre": task.recentre, "failed": "; ".join(scene.reasons(info))}
+           if isinstance(task, TurnTask) else {}),
     }
 
 
@@ -69,7 +75,8 @@ def _run_round(scene: PropScene, pending: dict[int, int], round_: int, policy,
                     for slot in range(scene.n)])
     live, rows = set(pending), []
     while live:
-        actions = policy(obs.astype(np.float32)) if policy else np.zeros((scene.n, 4))
+        actions = (policy(obs.astype(np.float32)) if policy
+                   else np.zeros((scene.n, scene.actions)))
         obs, _, done, infos = scene.step(np.asarray(actions, float))
         for slot in np.flatnonzero(done):
             slot = int(slot)
@@ -84,7 +91,7 @@ def _run_round(scene: PropScene, pending: dict[int, int], round_: int, policy,
 
 
 def run_group(rung: str, mode: str, seeds: list[int], machines: int, checkpoint: str | None,
-              settings: Settings | None = None) -> list[dict]:
+              settings: Settings | None = None, task: str = "prop") -> list[dict]:
     policy = None
     if checkpoint:
         import torch
@@ -92,7 +99,7 @@ def run_group(rung: str, mode: str, seeds: list[int], machines: int, checkpoint:
         torch.set_num_threads(1)
         policy = load_policy(Path(checkpoint))
     controller = "policy" if checkpoint else "baseline"
-    scene = PropScene(machines, rung, mode, settings)
+    scene = {"prop": PropScene, "turn": TurnScene}[task](machines, rung, mode, settings)
     pending, rows = dict(enumerate(seeds)), []
     for round_ in range(ROUNDS):
         rows += _run_round(scene, pending, round_, policy, controller)
@@ -102,14 +109,15 @@ def run_group(rung: str, mode: str, seeds: list[int], machines: int, checkpoint:
 
 
 def score(rung: str, mode: str, seeds: list[int], machines: int, procs: int,
-          checkpoint: str | None, settings: Settings | None = None) -> list[dict]:
+          checkpoint: str | None, settings: Settings | None = None,
+          task: str = "prop") -> list[dict]:
     if any(seed >= HELD_OUT_BASE for seed in seeds):
         raise ValueError("held-out seeds are never scored")
     if len(set(seeds)) != len(seeds):
         raise ValueError("each seed is scored once")
     groups = [seeds[k:k + machines] for k in range(0, len(seeds), machines)]
     args = [[rung] * len(groups), [mode] * len(groups), groups, [machines] * len(groups),
-            [checkpoint] * len(groups), [settings] * len(groups)]
+            [checkpoint] * len(groups), [settings] * len(groups), [task] * len(groups)]
     if procs <= 1 or len(groups) == 1:
         parts = list(map(run_group, *args))
     else:
@@ -121,15 +129,24 @@ def score(rung: str, mode: str, seeds: list[int], machines: int, procs: int,
     return sorted(rows, key=lambda r: (r["controller"], order[r["seed"]]))
 
 
-def _summary(rows: list[dict]) -> str:
+def _turning(rows: list[dict]) -> bool:
+    return bool(rows) and "heading_error" in rows[0]
+
+
+def _heading_error(rows: list[dict]) -> float:
+    return math.degrees(float(np.mean([abs(r["heading_error"]) for r in rows])))
+
+
+def _summary(rows: list[dict], turning: bool = False) -> str:
     if not rows:
-        return "| 0 | - | - | - | - |"
+        return "| 0 | - | - | - | - |" + (" - |" if turning else "")
     passed = 100.0 * np.mean([r["passed"] for r in rows])
     share = float(np.mean([r["hold_share"] for r in rows]))
     error = math.degrees(float(np.mean([r["tilt_error"] for r in rows])))
+    heading = f" {_heading_error(rows):.2f} |" if turning else ""
     causes = Counter(r["cause"] for r in rows if r["cause"])
     ends = ", ".join(f"{c} {causes[c]}" for c in CAUSES if causes[c]) or "none"
-    return f"| {len(rows)} | {passed:.0f}% | {share:.2f} | {error:.2f} | {ends} |"
+    return f"| {len(rows)} | {passed:.0f}% | {share:.2f} | {error:.2f} |{heading} {ends} |"
 
 
 def _mean_and_error(values: np.ndarray) -> str:
@@ -148,18 +165,26 @@ def paired(rows: list[dict], reference: str = "baseline") -> list[str]:
         share = np.array([c["hold_share"] - b["hold_share"] for b, c in pairs])
         error = np.degrees([c["tilt_error"] - b["tilt_error"] for b, c in pairs])
         flips = Counter((b["passed"], c["passed"]) for b, c in pairs)
+        turning = _turning(rows)
+        heading = np.degrees([abs(c["heading_error"]) - abs(b["heading_error"])
+                              for b, c in pairs]) if turning else None
+        headed = (f"; change in final heading error {_mean_and_error(heading)} deg"
+                  if turning else "")
         lines += [f"### {controller} against {reference}, seed by seed", "",
                   f"{len(pairs)} seeds. Change in hold share in band "
-                  f"{_mean_and_error(share)}; change in tilt error {_mean_and_error(error)} deg "
-                  "(mean ± standard error of the paired differences). Passes gained "
+                  f"{_mean_and_error(share)}; change in tilt error {_mean_and_error(error)} deg"
+                  f"{headed} (mean ± standard error of the paired differences). Passes gained "
                   f"{flips[(False, True)]}, lost {flips[(True, False)]}.", "",
                   f"| seed | pass ({reference}, {controller}) | hold share in band | "
-                  "tilt error (deg) |", "|---|---|---|---|"]
+                  "tilt error (deg) |" + (" final heading error (deg) |" if turning else ""),
+                  "|---|---|---|---|" + ("---|" if turning else "")]
         for b, c in pairs:
+            column = (f" {math.degrees(abs(b['heading_error'])):.2f}, "
+                      f"{math.degrees(abs(c['heading_error'])):.2f} |" if turning else "")
             lines.append(f"| {b['seed']} | {'yes' if b['passed'] else 'no'}, "
                          f"{'yes' if c['passed'] else 'no'} | {b['hold_share']:.2f}, "
                          f"{c['hold_share']:.2f} | {math.degrees(b['tilt_error']):.2f}, "
-                         f"{math.degrees(c['tilt_error']):.2f} |")
+                         f"{math.degrees(c['tilt_error']):.2f} |" + column)
         lines.append("")
     return lines
 
@@ -172,14 +197,18 @@ def table(rows: list[dict]) -> str:
     lines = []
     for controller in sorted({r["controller"] for r in rows}):
         mine = [r for r in rows if r["controller"] == controller]
+        turning = _turning(mine)
+        columns = ("| episodes | pass | hold share in band | tilt error (deg) | "
+                   + ("final heading error (deg) | " if turning else "") + "early ends |")
+        rule = "|---|---|---|---|---|---|" + ("---|" if turning else "")
         lines += [f"### {controller}, rung {mine[0]['rung']}", "",
                   f"Scene size {mine[0]['scene_size']} machines; each seed keeps the slot its "
                   "place in the seed list gives it.", "",
-                  "| group | episodes | pass | hold share in band | tilt error (deg) | "
-                  "early ends |", "|---|---|---|---|---|---|", "| all " + _summary(mine), ""]
-        lines += ["| drawn parameter (range) | episodes | pass | hold share in band | "
-                  "tilt error (deg) | early ends |", "|---|---|---|---|---|---|"]
+                  "| group " + columns, rule, "| all " + _summary(mine, turning), ""]
+        lines += ["| drawn parameter (range) " + columns, rule]
         for name in DRAWN:
+            if name not in mine[0]:
+                continue
             values = np.array([_value(r, name) for r in mine])
             if np.ptp(values) == 0:
                 continue
@@ -189,9 +218,33 @@ def table(rows: list[dict]) -> str:
                 picked = [r for r, keep in zip(mine, (values >= edges[k]) & upper, strict=True)
                           if keep]
                 label = f"{name} {edges[k]:.3g} to {edges[k + 1]:.3g}"
-                lines.append(f"| {label} " + _summary(picked))
+                lines.append(f"| {label} " + _summary(picked, turning))
         lines.append("")
+        lines += rules(mine)
     return "\n".join(lines + paired(rows))
+
+
+def rules(rows: list[dict]) -> list[str]:
+    if "failed" not in rows[0]:
+        return []
+    counts = Counter(reason for r in rows for reason in r["failed"].split("; ") if reason)
+    errors = np.degrees([abs(r["heading_error"]) for r in rows])
+    lines = [f"Failures by rule; an episode can fail several. Final heading error: median "
+             f"{np.median(errors):.2f} deg, largest {errors.max():.2f} deg. Turn slide: median "
+             f"{np.median([r['turn_slide'] for r in rows]):.3f} m, largest "
+             f"{max(r['turn_slide'] for r in rows):.3f} m. Peak roll: largest "
+             f"{math.degrees(max(r['peak_roll'] for r in rows)):.2f} deg. Upper structure left "
+             f"off the tracks: largest {math.degrees(max(abs(r['swing_left']) for r in rows)):.2f}"
+             " deg. Heading away from what the drive wheels turned: largest "
+             f"{np.degrees(max(abs(r['heading'] - r['belt_heading']) for r in rows)):.2f} deg. "
+             "Track travel outside the propped turn: median "
+             f"{np.median([r['stray_travel'] for r in rows]):.4f} m, largest "
+             f"{max(r['stray_travel'] for r in rows):.4f} m net; median "
+             f"{np.median([r['stray_distance'] for r in rows]):.4f} m, largest "
+             f"{max(r['stray_distance'] for r in rows):.4f} m covered.",
+             "", "| rule | episodes failing |", "|---|---|"]
+    lines += [f"| {reason} | {count} |" for reason, count in sorted(counts.items())]
+    return lines + [""]
 
 
 def write(rows: list[dict], out: Path, name: str) -> Path:
@@ -205,19 +258,20 @@ def write(rows: list[dict], out: Path, name: str) -> Path:
     return path
 
 
-def throughput(rung: str, procs: int, machines: int, seconds: float, seed: int = 0) -> dict:
+def throughput(rung: str, procs: int, machines: int, seconds: float, seed: int = 0,
+               task: str = "prop") -> dict:
     from hma.train.vec import ProcVecEnv
 
-    envs = ProcVecEnv(procs, machines, rung, "residual", seed)
+    envs = ProcVecEnv(procs, machines, rung, "residual", seed, task=task)
     try:
         envs.reset()
         rng = np.random.default_rng(seed)
         for _ in range(3):
-            envs.step_async(rng.uniform(-1.0, 1.0, (envs.num_envs, 4)))
+            envs.step_async(rng.uniform(-1.0, 1.0, (envs.num_envs, envs.actions)))
             envs.step_wait()
         decisions, wall0 = 0, time.perf_counter()
         while time.perf_counter() - wall0 < seconds:
-            envs.step_async(rng.uniform(-1.0, 1.0, (envs.num_envs, 4)))
+            envs.step_async(rng.uniform(-1.0, 1.0, (envs.num_envs, envs.actions)))
             envs.step_wait()
             decisions += 1
         wall = time.perf_counter() - wall0

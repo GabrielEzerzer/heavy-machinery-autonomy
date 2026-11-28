@@ -1,6 +1,6 @@
-"""The propping task: settings, rungs, seeded draws, the tilt reference against time, and the
-baseline's tip path: put down, held where it touched while the tracks roll about their rear wheel
-on level rigid ground to give the reference tilt, then lifted back along the same vertical path."""
+"""The propping and turning tasks: settings, rungs, seeded draws, the tilt and heading references
+against time, and the baseline's tip path: put down, held where it touched while the tracks roll
+about their rear wheel to give the reference tilt, then lifted back along the same vertical path."""
 
 from __future__ import annotations
 
@@ -165,3 +165,91 @@ def draw_task(seed: int, settings: Settings, pivot: tuple[float, float, float],
                 PropPath(task, pivot, ground), period):
             return task
     raise ValueError(f"no reachable propping task found for seed {seed}")
+
+
+TURN_SHAPE = 1.875
+
+
+@dataclass(frozen=True)
+class TurnSettings(Settings):
+    target: tuple[float, float] = (math.radians(5.0), math.radians(10.0))
+    rest: float = 3.0
+    ramp: tuple[float, float] = (3.0, 5.0)
+    ramp_down: tuple[float, float] = (4.0, 6.0)
+    final: float = 1.0
+    prop_x: tuple[float, float] = (4.0, 6.5)
+    heading: tuple[float, float] = (math.radians(5.0), math.radians(22.0))
+    rate: tuple[float, float] = (math.radians(4.5), math.radians(7.0))
+    settle: tuple[float, float] = (0.5, 1.5)
+    recentre: tuple[float, float] = (6.0, 10.0)
+    heading_band: float = math.radians(1.5)
+    belts: float = math.radians(1.5)
+    turn_slide: float = 0.15
+    slide_limit: float = 0.3
+    peak_roll: float = math.radians(2.0)
+    centred: float = math.radians(2.0)
+    overshoot: float = math.radians(5.0)
+    propped: float = math.radians(1.0)
+    stray_pass: float = 0.05
+    stray_end: float = 0.25
+    distance_pass: float = 0.25
+
+
+@dataclass(frozen=True)
+class TurnTask(Task):
+    heading: float
+    settle: float
+    turn: float
+    recentre: float
+
+    @property
+    def turn_span(self) -> tuple[float, float]:
+        start = self.rest + self.ramp_up + self.settle
+        return start, start + self.turn
+
+    @property
+    def hold_span(self) -> tuple[float, float]:
+        return self.turn_span
+
+    @property
+    def recentre_span(self) -> tuple[float, float]:
+        start = self.rest + self.ramp_up + self.hold + self.ramp_down + self.place
+        return start, start + self.recentre
+
+    def heading_at(self, t: float) -> float:
+        return self.heading * _ease(t - self.turn_span[0], self.turn)
+
+    def heading_rate(self, t: float) -> float:
+        s = min(max((t - self.turn_span[0]) / self.turn, 0.0), 1.0)
+        return self.heading * 30.0 * s * s * (1.0 - s) ** 2 / self.turn
+
+
+def draw_turn_task(seed: int, settings: TurnSettings, pivot: tuple[float, float, float],
+                   period: float) -> TurnTask:
+    for attempt in range(MAX_ATTEMPTS):
+        rng = np.random.default_rng((seed, 13, attempt))
+        settle = float(rng.uniform(*settings.settle))
+        size = float(rng.uniform(*settings.heading))
+        turn = TURN_SHAPE * size / float(rng.uniform(*settings.rate))
+        recentre = float(rng.uniform(*settings.recentre))
+        task = TurnTask(
+            seed=seed,
+            target=float(rng.uniform(*settings.target)),
+            ramp_up=float(rng.uniform(*settings.ramp)),
+            hold=settle + turn,
+            ramp_down=float(rng.uniform(*settings.ramp_down)),
+            prop_x=float(rng.uniform(*settings.prop_x)),
+            start_z=float(rng.uniform(*settings.lift)),
+            pitch=float(rng.uniform(*settings.pitch)),
+            attempts=attempt + 1,
+            rest=settings.rest,
+            place=settings.place,
+            final=settings.place + recentre + settings.final,
+            heading=size * float(rng.choice((-1.0, 1.0))),
+            settle=settle,
+            turn=turn,
+            recentre=recentre,
+        )
+        if reachable(PropPath(task, pivot), period):
+            return task
+    raise ValueError(f"no reachable turning task found for seed {seed}")

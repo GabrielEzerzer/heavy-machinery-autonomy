@@ -122,7 +122,7 @@ def test_a_runnable_plan_runs_both_machines_to_the_end_and_prints_both_outcomes(
         *_, (scenes, outcomes) = episodes(rung, seed, task=task)
         for label, scene, info in zip(("baseline", "trained"), scenes, outcomes, strict=True):
             assert scene.tasks[0] is task
-            print(summary(label, info, scene.settings))
+            print(summary(label, info, scene))
         return outcomes
 
     args = argparse.Namespace(machine_seed=None, rung="nominal", checkpoint=None)
